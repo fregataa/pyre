@@ -34,7 +34,7 @@ fn record_bridge_handler_entry_traceback<Sym: WalkSym>(
     exc: OpRef,
     exc_concrete: ConcreteValue,
     position: usize,
-) {
+) -> Result<(), DispatchError> {
     // The handler is part of the trace, so once this bridge runs compiled it
     // catches the exception itself and the frame never surfaces an error the
     // interpreter's `handle_exception` could record a node from — hence the
@@ -44,9 +44,10 @@ fn record_bridge_handler_entry_traceback<Sym: WalkSym>(
     // recorders journal their own attach, so a walk that is later discarded
     // does not leave the node behind for the metainterp's own delivery to
     // record on top of.
-    let emit_runtime = !record_prepend_application_traceback(wc, exc, exc_concrete, position);
+    let emit_runtime = !record_prepend_application_traceback(wc, exc, exc_concrete, position)?;
     record_inline_application_traceback(wc, exc, exc_concrete, position, true, emit_runtime);
     record_top_level_application_traceback(wc, exc, exc_concrete, position, true, emit_runtime);
+    Ok(())
 }
 
 /// `executioncontext.py:91-107 leave` for a frame the bridge resumed into
@@ -515,7 +516,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
                 value_op,
                 ConcreteValue::Ref(exc_edge_concrete),
                 position,
-            );
+            )?;
             // Reconstruct the handler-entry operand stack + push the exc box on
             // the new TOS (mirrors the mid-walk SubRaise catch routing).
             vstack_enter_exception_handler(&mut wc, catch_target, value_op);
@@ -550,7 +551,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
                     seed.exc,
                     seed.exc_concrete,
                     position,
-                );
+                )?;
                 vstack_enter_exception_handler(&mut wc, catch_target, seed.exc);
                 catch_target
             } else {
@@ -577,7 +578,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
                 // holding whatever its entry wrote, and a `tb_frame.f_locals`
                 // or `sys._getframe()` on the way out reads every
                 // post-entry local as unbound.
-                if !recording_instruction_is_bare_reraise(&mut wc, position) {
+                if !recording_raise_keeps_existing_traceback(&mut wc, position) {
                     record_top_level_application_traceback(
                         &mut wc,
                         seed.exc,

@@ -247,7 +247,7 @@ pub fn skip_python_trivia_forward(code: &pyre_interpreter::CodeObject, mut py_pc
 /// `parent` marks the second row as a split of the first so the reader does not
 /// sum them.
 #[rustfmt::skip]
-pub const SPEC_FOLD_ROWS: [(&str, &str, &str); 55] = [
+pub const SPEC_FOLD_ROWS: [(&str, &str, &str); 56] = [
     // (label, site, parent)
     ("truth_int",                 "residual_call", "-"),
     ("truth_bool",                "residual_call", "-"),
@@ -304,6 +304,7 @@ pub const SPEC_FOLD_ROWS: [(&str, &str, &str); 55] = [
     ("subscr_specialised_pair",   "specialize",    "subscr"),
     ("builtin_divmod_long_int",   "specialize",    "builtin_divmod"),
     ("zip_two_tuple_iters",       "specialize",    "for_iter_next"),
+    ("instance_next",             "residual_call", "-"),
 ];
 
 const SPEC_FOLD_COUNT: usize = SPEC_FOLD_ROWS.len();
@@ -327,6 +328,12 @@ static SPEC_SUPPRESSED: [std::sync::atomic::AtomicU64; SPEC_FOLD_COUNT] = {
 /// value means a typo at a call site; the summary reports it rather than
 /// silently dropping the row.
 static SPEC_UNKNOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static INSTANCE_NEXT_FORITER_ROUTE_GUARDS_KEYED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static INSTANCE_NEXT_FORITER_CALLEE_GUARDS_CAPTURED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static INSTANCE_NEXT_FORITER_CALLEE_GUARDS_KEYED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// `PYRE_FBW_SPEC_CENSUS`: per-fold consulted/fired tallies for the
 /// hand-written trace-time specializations.  Off by default; the gated branch
@@ -334,6 +341,23 @@ static SPEC_UNKNOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 pub(crate) fn fbw_spec_census_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_SPEC_CENSUS").is_some())
+}
+
+pub(crate) fn spec_census_record_instance_next_route_guard_keyed() {
+    if fbw_spec_census_enabled() {
+        INSTANCE_NEXT_FORITER_ROUTE_GUARDS_KEYED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn spec_census_record_instance_next_callee_guard(keyed: bool) {
+    if !fbw_spec_census_enabled() {
+        return;
+    }
+    let ordering = std::sync::atomic::Ordering::Relaxed;
+    INSTANCE_NEXT_FORITER_CALLEE_GUARDS_CAPTURED.fetch_add(1, ordering);
+    if keyed {
+        INSTANCE_NEXT_FORITER_CALLEE_GUARDS_KEYED.fetch_add(1, ordering);
+    }
 }
 
 const FBW_DEPTH_HIST_BUCKETS: usize = 32;
@@ -408,7 +432,7 @@ pub fn fbw_depth_census_summary() -> String {
 }
 
 /// Parse `PYRE_FBW_NO_SPECIALIZE` once into table-index bits and unknown
-/// selector tokens.  The reserved `all` token turns off these 55 rows and
+/// selector tokens.  The reserved `all` token turns off these 56 rows and
 /// nothing else: the `try_walker_fold_*` trio and the 11
 /// `try_walker_inline_*` descent entry points all stay live.
 fn spec_suppression() -> &'static (u64, Vec<String>) {
@@ -594,6 +618,12 @@ pub fn spec_census_summary() -> String {
         rows.len(),
         SPEC_UNKNOWN.load(ordering),
     );
+    summary.push_str(&format!(
+        "[spec-census] instance_next_foriter route_guards_keyed={} callee_guards_captured={} callee_guards_keyed={}\n",
+        INSTANCE_NEXT_FORITER_ROUTE_GUARDS_KEYED.load(ordering),
+        INSTANCE_NEXT_FORITER_CALLEE_GUARDS_CAPTURED.load(ordering),
+        INSTANCE_NEXT_FORITER_CALLEE_GUARDS_KEYED.load(ordering),
+    ));
     for (label, site, parent, consulted, fired, suppressed) in rows {
         summary.push_str(&format!(
             "[spec-census] fold={label} consulted={consulted} fired={fired} suppressed={suppressed} site={site} parent={parent}\n"

@@ -2940,16 +2940,14 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
         }
     };
     match walk_result {
-        DispatchOutcome::SubReturn {
-            result: Some(value),
-        } => {
-            let concrete = concrete_from_recorded_opref(ctx, value);
-            write_ref_reg(ctx, op.pc, dst, value, concrete)?;
-            Ok(Some((DispatchOutcome::Continue, op.next_pc)))
-        }
-        DispatchOutcome::SubReturn { result: None } => {
-            Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })
-        }
+        DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
+            Some(value) => {
+                let concrete = concrete_from_recorded_opref(ctx, value);
+                write_ref_reg(ctx, op.pc, dst, value, concrete)?;
+                Ok(Some((DispatchOutcome::Continue, op.next_pc)))
+            }
+            None => Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc }),
+        },
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 ctx.last_exc_value = Some(exc);
@@ -3125,6 +3123,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         constructor_result,
         None,
         false,
+        None,
     )
 }
 
@@ -3176,6 +3175,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     constructor_result: Option<(OpRef, ConcreteValue)>,
     intermediate_result: Option<&mut Option<(OpRef, ConcreteValue)>>,
     require_exact_int_result: bool,
+    instance_next_foriter_green_key: Option<u64>,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     // `_compute_flatcall` (`pycode.py:256-268`) leaves `fast_natural_arity`
     // HOPELESS for a `*args` / `**kwargs` / keyword-only callee.  The general
@@ -3557,7 +3557,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // A legacy, unseeded inline sub-walk inside a FOR_ITER body resumes a guard
     // at the caller's CALL boundary, so deopt re-executes the whole callee.
     // Replaying a live-heap mutation would double it, so a Dirty body stays on
-    // the residual call path.
+    // the residual call path.  The keyed instance-`__next__` route is excluded:
+    // it seeds the callee frame and resumes keyed guards through the multi-frame
+    // snapshot instead of replaying the caller boundary.
     //
     // A body whose only unproven ops are Python-level CALL residuals is
     // admitted too: this same gate re-runs for each callee the lever resolves
@@ -3566,9 +3568,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // deferred body commits nothing either.  Without that the whole nest
     // declines — `helper(i)` calling `add(i, 1, 2)` residualizes both calls
     // per iteration, though each body on its own is pure arithmetic.
+    let instance_next_seeded_route = instance_next_foriter_green_key.is_some();
+    // The keyed route bypasses the legacy caller-replay classification, but it
+    // does not inherit that route's DeferredCall admission.
     let mut foriter_deferred_admit = false;
     let mut foriter_dirty_bound = false;
-    if fbw_foriter_inflight_active() {
+    if fbw_foriter_inflight_active() && !instance_next_seeded_route {
         let safety = fbw_callee_body_replay_safety(
             body.code,
             &exact_numeric_args,
@@ -3864,14 +3869,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     } else {
         fbw_max_multiframe_depth()
     };
-    // FOR_ITER must re-execute its iterator protocol as one unit when a body
-    // guard fails.  Its Clean-only admission above makes caller-boundary
-    // replay safe, and keeping the callee frame unseeded makes the terminating
-    // branch resume at FOR_ITER so the residual maps IndexError to exhaustion.
-    let force_caller_boundary_resume =
-        call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::ForIterNext;
-    let try_multiframe = !force_caller_boundary_resume
-        && multiframe_eligible
+    // The instance-`__next__` FOR_ITER route uses the same seeded-frame shape
+    // as other CALL-entered inlines.  Its catch arm owns exception-to-exhaustion
+    // conversion, so neither replay safety nor an unseeded caller-boundary
+    // resume is part of that route's deopt discipline.
+    let try_multiframe = multiframe_eligible
         && inline_depth < effective_multiframe_depth
         && callee_fast_path_inlinable_allowing_forward_branch(
             body.code,
@@ -3888,8 +3890,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // descr_call` owns the discard of `__init__`'s result, and the flattened
     // frame shape cannot reconstruct that discard from a two-frame in-callee
     // guard pause.
-    let strict_seed = !force_caller_boundary_resume
-        && strict_inlinable
+    let strict_seed = strict_inlinable
         && inline_depth < fbw_max_multiframe_depth()
         && callee_code.cellvars.is_empty()
         && constructor_result.is_none();
@@ -3912,7 +3913,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     if foriter_dirty_bound && !try_multiframe {
         return resolved_inline_decline(op.pc, line!());
     }
-    if !strict_inlinable && !try_multiframe && !force_caller_boundary_resume {
+    if !strict_inlinable && !try_multiframe {
         // A non-self-recursive loop/branch callee that neither the strict nor
         // the multiframe fast path can serve declines to interpretation
         // (`FBW_DECLINED_KEYS`).  Self-recursive calls were already routed to
@@ -4897,6 +4898,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             fbw_mode: FbwWalkMode {
                 inline_subwalk: true,
                 inline_caller_py_pc,
+                instance_next_foriter_green_key,
+                instance_next_foriter_census_active: instance_next_seeded_route,
                 ..ctx.fbw_mode
             },
             session: ctx.session,
@@ -5371,94 +5374,20 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     };
 
     match outcome {
-        DispatchOutcome::SubReturn {
-            result: Some(value),
-        } => {
-            let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
-            if require_str_result
-                && !matches!(
-                    concrete_for_shadow,
-                    ConcreteValue::Ref(obj) if !obj.is_null() && unsafe { pyre_object::is_str(obj) }
-                )
-            {
-                // descroperation.py checks the app-level result before
-                // returning from `space.str` / `space.repr`. Re-run the
-                // original builtin call at the caller boundary so the
-                // interpreter raises its faithful TypeError; the inlined
-                // body has no committed concrete effect at this point.
-                latch_abort_call_resume(
-                    code,
-                    op,
-                    ctx,
-                    call_descr,
-                    is_top_inline,
-                    unjournaled_before_subwalk,
-                    executed_effects_before,
-                    abort_flush_call_jitcode_coord,
-                );
-                return Err(DispatchError::callee_inline_unsupported(op.pc));
-            }
-            if require_exact_int_result
-                && !matches!(
-                    concrete_for_shadow,
-                    ConcreteValue::Ref(obj)
-                        if walker_is_exact_machine_int_concrete(obj)
-                )
-            {
-                // `descroperation.py:608-620 _index` validates the app-level
-                // result before its caller continues, and a long, a bool or an
-                // int subclass are all legal there — only the machine-int
-                // arithmetic downstream cannot take them.  Decline instead of
-                // aborting: the caller rewinds the emission and falls through
-                // to its residual, which re-runs the whole builtin.  That is
-                // sound because the body is admitted only when re-running it
-                // observes and changes nothing (`exc_override_sample_safe`),
-                // and it keeps a legal program from killing the enclosing
-                // loop's trace, which `callee_inline_unsupported` would.
-                return resolved_inline_decline(op.pc, line!());
-            }
-            // `descr_call` discards `__init__`'s result after checking it is
-            // None and returns the instance instead (`check_init_returned_none`).
-            // A non-None result is a TypeError the inlined body cannot raise, so
-            // give the callee back to the interpreter, which re-runs the call and
-            // raises the faithful message.  Latch the CALL boundary first, like
-            // the invalid-`str`/`repr`-result path above: the sub-walk already
-            // executed the constructor body, so a plain abort would have the
-            // interpreter replay it and repeat any effect it performed.
-            let (value, concrete_for_shadow) = match constructor_result {
-                Some(instance) => {
-                    if !matches!(concrete_for_shadow,
-                        ConcreteValue::Ref(obj) if unsafe { pyre_object::is_none(obj) })
-                    {
-                        latch_abort_call_resume(
-                            code,
-                            op,
-                            ctx,
-                            call_descr,
-                            is_top_inline,
-                            unjournaled_before_subwalk,
-                            executed_effects_before,
-                            abort_flush_call_jitcode_coord,
-                        );
-                        return Err(DispatchError::callee_inline_unsupported(op.pc));
-                    }
-                    instance
-                }
-                None => (value, concrete_for_shadow),
-            };
-            if let Some(result) = intermediate_result {
-                // The caller stays pinned at its own CALL boundary, so a guard
-                // it emits after this hand-off resumes by re-entering that CALL
-                // and running the callee a second time, and its rewinding
-                // declines cut the trace without undoing what the body already
-                // did.  `FBW_EXECUTED_EFFECT_COUNT` is the odometer that
-                // answers whether that is survivable: "a nonzero count delta
-                // means the callee attempt cannot be discarded and re-executed
-                // without risking a double".  Abort rather than decline —
-                // `latch_abort_call_resume` deliberately declines to latch the
-                // CALL when effects ran, so the interpreter resumes past it
-                // instead of re-running the effects.
-                if fbw_executed_effect_count() != executed_effects_before {
+        DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
+            Some(value) => {
+                let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
+                if require_str_result
+                    && !matches!(
+                        concrete_for_shadow,
+                        ConcreteValue::Ref(obj) if !obj.is_null() && unsafe { pyre_object::is_str(obj) }
+                    )
+                {
+                    // descroperation.py checks the app-level result before
+                    // returning from `space.str` / `space.repr`. Re-run the
+                    // original builtin call at the caller boundary so the
+                    // interpreter raises its faithful TypeError; the inlined
+                    // body has no committed concrete effect at this point.
                     latch_abort_call_resume(
                         code,
                         op,
@@ -5471,24 +5400,98 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     );
                     return Err(DispatchError::callee_inline_unsupported(op.pc));
                 }
-                *result = Some((value, concrete_for_shadow));
-                return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
-            }
-            match dst_bank {
-                'r' => write_ref_reg(ctx, op.pc, dst, value, concrete_for_shadow)?,
-                'i' => write_int_reg(ctx, op.pc, dst, value, concrete_for_shadow)?,
-                'v' => {}
-                _ => return Ok(None),
-            }
-            Ok(Some((DispatchOutcome::Continue, op.next_pc)))
-        }
-        DispatchOutcome::SubReturn { result: None } => {
-            if dst_bank == 'v' {
+                if require_exact_int_result
+                    && !matches!(
+                        concrete_for_shadow,
+                        ConcreteValue::Ref(obj)
+                            if walker_is_exact_machine_int_concrete(obj)
+                    )
+                {
+                    // `descroperation.py:608-620 _index` validates the app-level
+                    // result before its caller continues, and a long, a bool or an
+                    // int subclass are all legal there — only the machine-int
+                    // arithmetic downstream cannot take them.  Decline instead of
+                    // aborting: the caller rewinds the emission and falls through
+                    // to its residual, which re-runs the whole builtin.  That is
+                    // sound because the body is admitted only when re-running it
+                    // observes and changes nothing (`exc_override_sample_safe`),
+                    // and it keeps a legal program from killing the enclosing
+                    // loop's trace, which `callee_inline_unsupported` would.
+                    return resolved_inline_decline(op.pc, line!());
+                }
+                // `descr_call` discards `__init__`'s result after checking it is
+                // None and returns the instance instead (`check_init_returned_none`).
+                // A non-None result is a TypeError the inlined body cannot raise, so
+                // give the callee back to the interpreter, which re-runs the call and
+                // raises the faithful message.  Latch the CALL boundary first, like
+                // the invalid-`str`/`repr`-result path above: the sub-walk already
+                // executed the constructor body, so a plain abort would have the
+                // interpreter replay it and repeat any effect it performed.
+                let (value, concrete_for_shadow) = match constructor_result {
+                    Some(instance) => {
+                        if !matches!(concrete_for_shadow,
+                        ConcreteValue::Ref(obj) if unsafe { pyre_object::is_none(obj) })
+                        {
+                            latch_abort_call_resume(
+                                code,
+                                op,
+                                ctx,
+                                call_descr,
+                                is_top_inline,
+                                unjournaled_before_subwalk,
+                                executed_effects_before,
+                                abort_flush_call_jitcode_coord,
+                            );
+                            return Err(DispatchError::callee_inline_unsupported(op.pc));
+                        }
+                        instance
+                    }
+                    None => (value, concrete_for_shadow),
+                };
+                if let Some(result) = intermediate_result {
+                    // The caller stays pinned at its own CALL boundary, so a guard
+                    // it emits after this hand-off resumes by re-entering that CALL
+                    // and running the callee a second time, and its rewinding
+                    // declines cut the trace without undoing what the body already
+                    // did.  `FBW_EXECUTED_EFFECT_COUNT` is the odometer that
+                    // answers whether that is survivable: "a nonzero count delta
+                    // means the callee attempt cannot be discarded and re-executed
+                    // without risking a double".  Abort rather than decline —
+                    // `latch_abort_call_resume` deliberately declines to latch the
+                    // CALL when effects ran, so the interpreter resumes past it
+                    // instead of re-running the effects.
+                    if fbw_executed_effect_count() != executed_effects_before {
+                        latch_abort_call_resume(
+                            code,
+                            op,
+                            ctx,
+                            call_descr,
+                            is_top_inline,
+                            unjournaled_before_subwalk,
+                            executed_effects_before,
+                            abort_flush_call_jitcode_coord,
+                        );
+                        return Err(DispatchError::callee_inline_unsupported(op.pc));
+                    }
+                    *result = Some((value, concrete_for_shadow));
+                    return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
+                }
+                match dst_bank {
+                    'r' => write_ref_reg(ctx, op.pc, dst, value, concrete_for_shadow)?,
+                    'i' => write_int_reg(ctx, op.pc, dst, value, concrete_for_shadow)?,
+                    'v' => {}
+                    _ => return Ok(None),
+                }
                 Ok(Some((DispatchOutcome::Continue, op.next_pc)))
-            } else {
-                Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })
             }
-        }
+            None => {
+                if dst_bank == 'v' {
+                    Ok(Some((DispatchOutcome::Continue, op.next_pc)))
+                } else {
+                    Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })
+                }
+            }
+        },
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 // The handler this routes to is part of the trace, so once the
@@ -5497,7 +5500,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // `handle_exception` could record a node from.  Emit the node
                 // at runtime as well as applying it for the recording pass.
                 let emit_runtime =
-                    !record_prepend_application_traceback(ctx, exc, exc_concrete, op.pc);
+                    !record_prepend_application_traceback(ctx, exc, exc_concrete, op.pc)?;
                 record_inline_exception_context(ctx.trace_ctx, exc, exc_concrete);
                 record_inline_application_traceback(
                     ctx,
@@ -6867,6 +6870,7 @@ pub(crate) fn try_walker_inline_index<Sym: WalkSym>(
         None,
         Some(&mut result),
         true,
+        None,
     )?;
     match (inlined, result) {
         (Some((DispatchOutcome::Continue, next_pc)), Some(result)) if next_pc == op.next_pc => {
@@ -6986,6 +6990,182 @@ pub(crate) fn try_walker_inline_subscr_getitem<Sym: WalkSym>(
         false,
         None,
     )
+}
+
+/// Inline a user instance's Python `__next__` directly under FOR_ITER.
+///
+/// The instance arm of `space.next` forwards the method's exception to the
+/// FOR_ITER catch arm.  The callee is resumed through a seeded multi-frame
+/// snapshot, and every route/callee guard is keyed so failure resumes in the
+/// blackhole without compiling the unsafe mid-callee exhaustion bridge.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    funcptr: OpRef,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor
+        || dst_bank != 'r'
+        || ctx.fbw_mode.inline_subwalk
+        || r_args.len() != 1
+    {
+        return Ok(None);
+    }
+
+    let Some(foriter_green_key) = walker_foriter_green_key(ctx, op.pc) else {
+        return Ok(None);
+    };
+    if ctx.trace_ctx.is_bridge_trace
+        && crate::trace::instance_next_foriter_bridge_demoted(foriter_green_key)
+    {
+        return Ok(None);
+    }
+
+    let iter_op = r_args[0];
+    let Some(iter_obj) = walker_concrete_ref_object(ctx, iter_op) else {
+        return Ok(None);
+    };
+    let Some((w_type, version_tag, w_next)) =
+        (unsafe { pyre_interpreter::baseobjspace::next_fast_path(iter_obj) })
+    else {
+        return Ok(None);
+    };
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(w_next) }) else {
+        return Ok(None);
+    };
+    if nparams != 1 {
+        return Ok(None);
+    }
+    let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
+        return Ok(None);
+    };
+    if body_facts.owns_loop_header || body_facts.has_exception_table {
+        return Ok(None);
+    }
+    // Preserve any deferred-call denial already attached to this callee.  The
+    // keyed route does not itself admit DeferredCall: its sub-walk leaves the
+    // deferred-inline guard unarmed.
+    if fbw_foriter_deferred_call_denied(w_code as usize) {
+        return Ok(None);
+    }
+
+    let body_coord = fbw_foriter_body_from_op_pc(ctx, op.pc)
+        .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
+    fbw_foriter_inflight_mark_attempt(body_coord);
+    let pre_emit_pos = ctx.trace_ctx.get_trace_position();
+
+    let _roots = pyre_object::gc_roots::push_roots();
+    let iter_root = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(iter_obj);
+    let type_root = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_type);
+    let next_root = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_next);
+    let code_root = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_code as pyre_object::PyObjectRef);
+
+    let iter_obj = pyre_object::gc_roots::shadow_stack_get(iter_root);
+    let w_type = pyre_object::gc_roots::shadow_stack_get(type_root);
+    let w_next = pyre_object::gc_roots::shadow_stack_get(next_root);
+    let w_code = pyre_object::gc_roots::shadow_stack_get(code_root) as *const ();
+    let iter_layout = unsafe { (*iter_obj).ob_type } as i64;
+    if !iter_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(iter_op) {
+        let type_const = ctx.trace_ctx.const_int(iter_layout);
+        let descr = majit_metainterp::make_resume_guard_descr_instance_next_foriter(
+            Some(OpCode::GuardClass),
+            foriter_green_key,
+        );
+        ctx.trace_ctx
+            .record_guard_with_descr(OpCode::GuardClass, &[iter_op, type_const], descr);
+        spec_census_record_instance_next_route_guard_keyed();
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    }
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(iter_op, iter_layout);
+
+    let next_const = ctx.trace_ctx.const_ref(w_next as i64);
+    let executed_effects_before = fbw_executed_effect_count();
+    let inline = try_walker_inline_resolved_user_call_inner(
+        ctx,
+        op,
+        code,
+        funcptr,
+        r_args,
+        call_descr,
+        dst_bank,
+        dst,
+        w_next,
+        next_const,
+        w_next,
+        vec![
+            ConcreteValue::Ref(w_next),
+            ConcreteValue::Null,
+            ConcreteValue::Ref(iter_obj),
+        ],
+        vec![iter_op],
+        vec![ConcreteValue::Ref(iter_obj)],
+        true,
+        None,
+        w_code,
+        nparams,
+        has_closure,
+        Some((iter_op, iter_obj, w_type, version_tag)),
+        None,
+        true,
+        false,
+        None,
+        None,
+        false,
+        Some(foriter_green_key),
+    );
+    let inline_resume_pc = match inline {
+        Ok(Some((DispatchOutcome::Continue, next))) => next,
+        outcome => {
+            // Rewinding the emission and falling through to the caller's
+            // residual re-runs the whole `__next__`.  The sibling decline that
+            // does the same states its precondition outright — "sound because
+            // the body is admitted only when re-running it observes and changes
+            // nothing" — and the legacy route can state it because
+            // `fbw_callee_body_replay_safety` proved the body `Clean` first.
+            // This keyed route deliberately bypasses that classification, so
+            // read the odometer instead: once the sub-walk has executed a
+            // concrete effect, `cut_trace_with_snapshots` cannot undo it (it
+            // truncates recorded ops and snapshots, nothing else) and the
+            // residual `next` compiles a loop that advances the iterator twice
+            // per iteration.  Surface the decline as an abort there, the same
+            // disposition every other caller of the inliner already takes.
+            if fbw_executed_effect_count() != executed_effects_before {
+                return Err(match outcome {
+                    Err(e) => e,
+                    _ => DispatchError::callee_inline_unsupported(op.pc),
+                });
+            }
+            ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            return Ok(None);
+        }
+    };
+    // `Continue` represents either a value return at `op.next_pc`, with `dst`
+    // holding the item, or a caught `SubRaise` routed to the caller's handler
+    // target, where `dst` was not written (`pyjitpl.py:2530-2558`).  Only the
+    // value-return shape can update the FOR_ITER item bookkeeping below.
+    if inline_resume_pc != op.next_pc {
+        return Ok(Some((DispatchOutcome::Continue, inline_resume_pc)));
+    }
+
+    let item_op = ctx.registers_r[dst];
+    let Some(concrete_item) = walker_concrete_ref_object(ctx, item_op) else {
+        return Err(DispatchError::callee_inline_unsupported(op.pc));
+    };
+    fbw_foriter_inflight_capture(concrete_item, body_coord);
+    ctx.vstack_last_ref = item_op;
+    Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
 
 /// Forward dunder selected by `try_dispatch_binary_special` for a non-inplace
@@ -7399,6 +7579,21 @@ pub(crate) fn allocate_callee_register_banks(
     (regs_r, regs_i, regs_f, concrete_r, concrete_i)
 }
 
+/// Apply the non-exceptional frame-exit state transition and return the
+/// callee's value for caller-side shape handling.
+///
+/// `pyjitpl.py:2503-2506 finishframe` clears `last_exc_value` before
+/// `popframe()`. Because the walker stores that state per frame, the caller's
+/// slot is the one that must observe the null after the callee returns.
+pub(crate) fn finish_inline_callee_return<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    result: Option<OpRef>,
+) -> Option<OpRef> {
+    ctx.last_exc_value = None;
+    ctx.last_exc_value_concrete = ConcreteValue::Null;
+    result
+}
+
 /// Seed a callee jitcode's register banks with positional args and walk
 /// its body, returning the callee's terminal [`DispatchOutcome`]
 /// (`SubReturn` / `SubRaise` / `Terminate` / `SwitchToBlackhole`).
@@ -7645,50 +7840,50 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
     let callee_outcome = callee_result?;
 
     match callee_outcome {
-        DispatchOutcome::SubReturn {
-            result: Some(value),
-        } => {
-            if dst_bank == 'v' {
-                // `inline_call_r_v/dR`
-                // (`bhimpl_inline_call_r_v` `blackhole.py`)
-                // expects a void-return callee. A `Some` return here is
-                // a codewriter shape mismatch.
-                return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc });
-            }
-            let dst = code[op.pc + 1 + 2 + arg_width] as usize;
-            // inline_call_* dst writeback — `value` is the callee's
-            // SubReturn OpRef.  The callee's matching concrete shadow
-            // was dropped at sub-walk exit; `concrete_of_opref` still
-            // sees through to `constants.get_value` for callees that
-            // return a constant (e.g. `LoadConst` tail), so route via
-            // the unified shadow channel.  Non-constant returns surface
-            // as the sentinel `GcRef(usize::MAX)` → Null fallback.
-            let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
-            match dst_bank {
-                'r' => {
-                    write_ref_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
+        DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
+            Some(value) => {
+                if dst_bank == 'v' {
+                    // `inline_call_r_v/dR`
+                    // (`bhimpl_inline_call_r_v` `blackhole.py`)
+                    // expects a void-return callee. A `Some` return here is
+                    // a codewriter shape mismatch.
+                    return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc });
                 }
-                'i' => {
-                    write_int_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
-                }
-                _ => unreachable!(
-                    "dispatch_inline_call_dr_kind dst_bank must be 'r', 'i' or 'v' (\
+                let dst = code[op.pc + 1 + 2 + arg_width] as usize;
+                // inline_call_* dst writeback — `value` is the callee's
+                // SubReturn OpRef.  The callee's matching concrete shadow
+                // was dropped at sub-walk exit; `concrete_of_opref` still
+                // sees through to `constants.get_value` for callees that
+                // return a constant (e.g. `LoadConst` tail), so route via
+                // the unified shadow channel.  Non-constant returns surface
+                // as the sentinel `GcRef(usize::MAX)` → Null fallback.
+                let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
+                match dst_bank {
+                    'r' => {
+                        write_ref_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
+                    }
+                    'i' => {
+                        write_int_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
+                    }
+                    _ => unreachable!(
+                        "dispatch_inline_call_dr_kind dst_bank must be 'r', 'i' or 'v' (\
                      codewriter does not emit dR>f shape today)"
-                ),
+                    ),
+                }
+                Ok((DispatchOutcome::Continue, op.next_pc))
             }
-            Ok((DispatchOutcome::Continue, op.next_pc))
-        }
-        DispatchOutcome::SubReturn { result: None } => {
-            if dst_bank == 'v' {
-                // `inline_call_r_v/dR` expects exactly this — callee
-                // exits via `void_return/`, no SubReturn writeback.
-                return Ok((DispatchOutcome::Continue, op.next_pc));
+            None => {
+                if dst_bank == 'v' {
+                    // `inline_call_r_v/dR` expects exactly this — callee
+                    // exits via `void_return/`, no SubReturn writeback.
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
+                // Same shape contract as `_r_r`: a `_r_<X>` variant promises
+                // a non-void result for the dst's `>X` slot. A void return
+                // reaching here is a codewriter shape mismatch.
+                Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })
             }
-            // Same shape contract as `_r_r`: a `_r_<X>` variant promises
-            // a non-void result for the dst's `>X` slot. A void return
-            // reaching here is a codewriter shape mismatch.
-            Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })
-        }
+        },
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 // The handler this routes to is part of the trace, so once the
@@ -7697,7 +7892,7 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
                 // `handle_exception` could record a node from.  Emit the node
                 // at runtime as well as applying it for the recording pass.
                 let emit_runtime =
-                    !record_prepend_application_traceback(ctx, exc, exc_concrete, op.pc);
+                    !record_prepend_application_traceback(ctx, exc, exc_concrete, op.pc)?;
                 record_inline_exception_context(ctx.trace_ctx, exc, exc_concrete);
                 record_inline_application_traceback(
                     ctx,
@@ -7854,36 +8049,38 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
     )?;
 
     match callee_outcome {
-        DispatchOutcome::SubReturn {
-            result: Some(value),
-        } => {
-            if dst_bank == 'v' {
-                return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc });
-            }
-            // dst register byte sits after descr (2B) + I-list (int_width)
-            // + R-list (ref_width) bytes.
-            let dst = code[op.pc + 1 + 2 + int_width + ref_width] as usize;
-            // See dispatch_inline_call_dr_kind: route the SubReturn
-            // OpRef through the unified shadow channel so constant
-            // return values propagate.
-            let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
-            match dst_bank {
-                'r' => {
-                    write_ref_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
+        DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
+            Some(value) => {
+                if dst_bank == 'v' {
+                    return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc });
                 }
-                'i' => {
-                    write_int_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
+                // dst register byte sits after descr (2B) + I-list (int_width)
+                // + R-list (ref_width) bytes.
+                let dst = code[op.pc + 1 + 2 + int_width + ref_width] as usize;
+                // See dispatch_inline_call_dr_kind: route the SubReturn
+                // OpRef through the unified shadow channel so constant
+                // return values propagate.
+                let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
+                match dst_bank {
+                    'r' => {
+                        write_ref_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
+                    }
+                    'i' => {
+                        write_int_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
+                    }
+                    _ => unreachable!(
+                        "dispatch_inline_call_dir_kind dst_bank must be 'r', 'i' or 'v'"
+                    ),
                 }
-                _ => unreachable!("dispatch_inline_call_dir_kind dst_bank must be 'r', 'i' or 'v'"),
+                Ok((DispatchOutcome::Continue, op.next_pc))
             }
-            Ok((DispatchOutcome::Continue, op.next_pc))
-        }
-        DispatchOutcome::SubReturn { result: None } => {
-            if dst_bank == 'v' {
-                return Ok((DispatchOutcome::Continue, op.next_pc));
+            None => {
+                if dst_bank == 'v' {
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
+                Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })
             }
-            Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })
-        }
+        },
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 // The handler this routes to is part of the trace, so once the
@@ -7892,7 +8089,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                 // `handle_exception` could record a node from.  Emit the node
                 // at runtime as well as applying it for the recording pass.
                 let emit_runtime =
-                    !record_prepend_application_traceback(ctx, exc, exc_concrete, op.pc);
+                    !record_prepend_application_traceback(ctx, exc, exc_concrete, op.pc)?;
                 record_inline_exception_context(ctx.trace_ctx, exc, exc_concrete);
                 record_inline_application_traceback(
                     ctx,
@@ -8020,49 +8217,48 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
     let callee_outcome = callee_result?;
 
     match callee_outcome {
-        DispatchOutcome::SubReturn {
-            result: Some(value),
-        } => {
-            if dst_bank == 'v' {
-                return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc });
-            }
-            let dst = code[op.pc + 1 + 2 + int_width + ref_width + float_width] as usize;
-            // See dispatch_inline_call_dr_kind: route the SubReturn
-            // OpRef through the unified shadow channel so constant
-            // return values propagate.
-            let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
-            match dst_bank {
-                'i' => {
-                    write_int_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
+        DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
+            Some(value) => {
+                if dst_bank == 'v' {
+                    return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc });
                 }
-                'r' => {
-                    write_ref_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
-                }
-                'f' => {
-                    let len = ctx.registers_f.len();
-                    let slot =
-                        ctx.registers_f
-                            .get_mut(dst)
-                            .ok_or(DispatchError::RegisterOutOfRange {
+                let dst = code[op.pc + 1 + 2 + int_width + ref_width + float_width] as usize;
+                // See dispatch_inline_call_dr_kind: route the SubReturn
+                // OpRef through the unified shadow channel so constant
+                // return values propagate.
+                let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
+                match dst_bank {
+                    'i' => {
+                        write_int_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
+                    }
+                    'r' => {
+                        write_ref_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
+                    }
+                    'f' => {
+                        let len = ctx.registers_f.len();
+                        let slot = ctx.registers_f.get_mut(dst).ok_or(
+                            DispatchError::RegisterOutOfRange {
                                 pc: op.pc,
                                 reg: dst,
                                 len,
                                 bank: "f",
-                            })?;
-                    *slot = value;
+                            },
+                        )?;
+                        *slot = value;
+                    }
+                    _ => unreachable!(
+                        "dispatch_inline_call_dirf_kind dst_bank must be 'i', 'r', 'f' or 'v'"
+                    ),
                 }
-                _ => unreachable!(
-                    "dispatch_inline_call_dirf_kind dst_bank must be 'i', 'r', 'f' or 'v'"
-                ),
+                Ok((DispatchOutcome::Continue, op.next_pc))
             }
-            Ok((DispatchOutcome::Continue, op.next_pc))
-        }
-        DispatchOutcome::SubReturn { result: None } => {
-            if dst_bank == 'v' {
-                return Ok((DispatchOutcome::Continue, op.next_pc));
+            None => {
+                if dst_bank == 'v' {
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
+                Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })
             }
-            Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })
-        }
+        },
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 // The handler this routes to is part of the trace, so once the
@@ -8071,7 +8267,7 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
                 // `handle_exception` could record a node from.  Emit the node
                 // at runtime as well as applying it for the recording pass.
                 let emit_runtime =
-                    !record_prepend_application_traceback(ctx, exc, exc_concrete, op.pc);
+                    !record_prepend_application_traceback(ctx, exc, exc_concrete, op.pc)?;
                 record_inline_exception_context(ctx.trace_ctx, exc, exc_concrete);
                 record_inline_application_traceback(
                     ctx,

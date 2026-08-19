@@ -1239,23 +1239,48 @@ pub fn on_live_marker(
     clear_dead_ref_registers_at_live_marker(bh, marker_pc);
 }
 
-/// Whether a JitCode exception exit came from the Python bare-reraise
-/// instruction path. `RAISE_VARARGS 0` and `RERAISE` both use
-/// RaiseWithExplicitTraceback and skip record_application_traceback.
-pub fn jitcode_pc_is_bare_reraise(jitcode_index: i32, offset: i32) -> bool {
+/// Whether an exception exit emitted for the Python instruction at `py_pc`
+/// re-raises a value that already carries this frame's traceback node, so
+/// `record_application_traceback` must be skipped.
+///
+/// `RAISE_VARARGS 0` and `RERAISE` both use RaiseWithExplicitTraceback.
+/// FOR_ITER's exception-match mismatch arm re-raises the value its own
+/// `catch_exception` caught — `pyopcode.py:1310` re-raises `e` untouched. It
+/// keeps this frame's existing node only when the `space.next` residual
+/// attached that node; an inlined `__next__` instead leaves the callee's node
+/// at the chain head.
+pub fn raise_at_py_pc_keeps_existing_traceback(raw_code: &CodeObject, py_pc: usize) -> bool {
+    match unsafe { pyre_interpreter::decode_instruction_at(raw_code, py_pc) } {
+        Some((Instruction::RaiseVarargs { .. }, op_arg)) => u32::from(op_arg) == 0,
+        Some((Instruction::Reraise { .. }, _)) | Some((Instruction::ForIter { .. }, _)) => true,
+        _ => false,
+    }
+}
+
+/// [`raise_at_py_pc_keeps_existing_traceback`] resolved from a jitcode
+/// coordinate.
+pub fn jitcode_pc_raise_keeps_existing_traceback(jitcode_index: i32, offset: i32) -> bool {
     let Some(raw_code) = raw_code_for_jitcode_index(jitcode_index) else {
         return false;
     };
-    let Some(py_pc) =
-        crate::py_coord::containing_py_pc_for_jitcode_pc_public(jitcode_index, offset)
+    let Some(py_pc) = crate::py_coord::exact_py_pc_for_jitcode_pc_public(jitcode_index, offset)
+        .or_else(|| crate::py_coord::containing_py_pc_for_jitcode_pc_public(jitcode_index, offset))
     else {
         return false;
     };
-    match unsafe { pyre_interpreter::decode_instruction_at(&*raw_code, py_pc as usize) } {
-        Some((Instruction::RaiseVarargs { .. }, op_arg)) => u32::from(op_arg) == 0,
-        Some((Instruction::Reraise { .. }, _)) => true,
-        _ => false,
-    }
+    raise_at_py_pc_keeps_existing_traceback(unsafe { &*raw_code }, py_pc as usize)
+}
+
+/// Whether the source function behind `jitcode_index` carries a Python
+/// `try`/`except` handler, read from `co_exceptiontable` (`pycode.py:145`) —
+/// the same table the codewriter's `decode_exception_catch_sites` builds its
+/// `catch_for_pc` map from.
+///
+/// `None` when the index resolves to no `CodeObject`: a native drain portal
+/// carries a null `code_ptr`.
+pub fn jitcode_source_has_exception_handler(jitcode_index: i32) -> Option<bool> {
+    let raw_code = raw_code_for_jitcode_index(jitcode_index)?;
+    Some(!unsafe { &*raw_code }.exceptiontable.is_empty())
 }
 
 /// `framework.py` `root_walker.walk_roots` hook for the boxed `Ref`
@@ -10199,6 +10224,8 @@ impl JitState for PyreJitState {
         // This is deferred until after `maps` is read (below) via a
         // re-adjustment of the semantic mirror length.
         let stack_only = bridge_valuestackdepth.saturating_sub(nlocals);
+        let resume_maps =
+            crate::state::bridge_semantic_maps_from_jitcode_pc(frame0.jitcode_index, frame0.pc);
         let bridge_reg_len = nlocals + stack_only;
         let mut bridge_registers_r = vec![OpRef::NONE; bridge_reg_len];
         // RPython parity: after A.1 the guard-recovery path calls
@@ -10245,9 +10272,13 @@ impl JitState for PyreJitState {
         // consume stage directly — matching `resume.py:1052-1055
         // rebuild_from_resumedata` → `consume_boxes(f.get_current_position_info(),
         // registers_i, registers_r, registers_f)`, which fills all three banks
-        // uniformly at the guard's resume position.
-        let seed_deferred_to_overlay =
-            crate::state::frame_pc_is_resolved_offset_at(frame0.jitcode_index, frame0.pc);
+        // uniformly at the guard's resume position.  A resolved `-live-`
+        // offset alone does not identify that branch shape: after-residual
+        // guards carry one too.  The branch is the shape whose guard-time
+        // pcdep depth is deeper than the resumed virtualizable stack; when the
+        // depths agree, the frame stream is authoritative and must be stamped
+        // directly even if the frame-array image is still pre-call.
+        let seed_deferred_to_overlay = resume_maps.stack_depth_at_pc > stack_only;
         let mut bridge_stamp_orphans = seed_deferred_to_overlay.then(Vec::new);
         let mut value_cursor = 0usize;
         for &reg_idx in &reg_indices.int {
@@ -10348,8 +10379,7 @@ impl JitState for PyreJitState {
         // `[0,nlocals)` prefix to identity colors (now retired). Invert each
         // live color to its slot via `semantic_ref_slot_for_reg_color` so the
         // mirror is correct under freely-colored locals.
-        let maps =
-            crate::state::bridge_semantic_maps_from_jitcode_pc(frame0.jitcode_index, frame0.pc);
+        let maps = resume_maps;
         // For a kept-stack branch guard, the vable's runtime
         // `valuestackdepth` reflects the merge-target depth (post
         // consumption) rather than the guard's deeper live depth. The
@@ -10778,9 +10808,50 @@ impl JitState for PyreJitState {
             bridge_array_len,
             &vable_array_values,
         );
+        // resume.py:1042-1057 `rebuild_from_resumedata` fills the live MIFrame
+        // register banks with `consume_boxes`; operand-stack boxes are the
+        // authoritative values at an after-residual guard.  The separately
+        // decoded virtualizable array can still contain the pre-call operand
+        // because the residual result has not passed through a frame-array
+        // write.  Locals and cells keep the vable-image authority established
+        // above: a register color at an interior resume point can hold a dead
+        // or stale local value.  Kept-stack branch guards retain their existing
+        // post-overlay path: their deeper pcdep stack is not the resumed
+        // virtualizable depth.
+        let mut bridge_array_items = vable_array_items.clone();
+        let mut bridge_array_values = live_array_values.clone();
+        bridge_array_values.resize(
+            bridge_array_len,
+            majit_ir::Value::Ref(majit_ir::GcRef::NULL),
+        );
+        if !seed_deferred_to_overlay {
+            let semantic_array_len = sym.registers_r.len().min(bridge_array_len);
+            if bridge_array_items.len() < semantic_array_len {
+                let null_ref = ctx.const_ref(pyre_object::PY_NULL as i64);
+                bridge_array_items.resize(semantic_array_len, null_ref);
+            }
+            for (slot, &opref) in sym
+                .registers_r
+                .iter()
+                .take(semantic_array_len)
+                .enumerate()
+                .skip(nlocals)
+            {
+                if opref.is_none() {
+                    continue;
+                }
+                bridge_array_items[slot] = opref;
+                if let Some(value) = ctx.box_value(opref) {
+                    if !matches!(value, majit_ir::Value::Void) {
+                        bridge_array_values[slot] = value;
+                        store_live_frame_array_slot(sym.concrete_vable_ptr as usize, slot, value);
+                    }
+                }
+            }
+        }
         sym.concrete_locals = (0..nlocals)
             .map(|i| {
-                live_array_values
+                bridge_array_values
                     .get(i)
                     .copied()
                     .map(concrete_value_from_ir_value)
@@ -10789,7 +10860,7 @@ impl JitState for PyreJitState {
             .collect();
         sym.concrete_stack = (0..stack_only)
             .map(|i| {
-                live_array_values
+                bridge_array_values
                     .get(nlocals + i)
                     .copied()
                     .map(concrete_value_from_ir_value)
@@ -10798,17 +10869,13 @@ impl JitState for PyreJitState {
             .collect();
         let mut concrete_values = Vec::with_capacity(vable_scalar_values.len() + bridge_array_len);
         concrete_values.extend_from_slice(&vable_scalar_values);
-        let taken_concrete = live_array_values.len().min(bridge_array_len);
-        concrete_values.extend_from_slice(&live_array_values[..taken_concrete]);
-        while concrete_values.len() < vable_scalar_values.len() + bridge_array_len {
-            concrete_values.push(majit_ir::Value::Ref(majit_ir::GcRef::NULL));
-        }
+        concrete_values.extend_from_slice(&bridge_array_values);
         crate::state::seed_virtualizable_boxes(
             ctx,
             sym.frame,
             vable_ref_value,
             &scalar_oprefs,
-            &vable_array_items,
+            &bridge_array_items,
             bridge_array_len,
             &concrete_values,
             sym.concrete_vable_ptr as *const u8,
@@ -13711,7 +13778,7 @@ mod tests {
     }
 
     #[test]
-    fn test_setup_bridge_sym_preserves_resumed_stack_tail() {
+    fn test_setup_bridge_sym_preserves_vable_locals_and_resumed_stack() {
         use majit_ir::resumedata::{RebuiltFrame, RebuiltValue};
         use majit_metainterp::jitcode::JitCodeBuilder;
         use pyre_interpreter::pyframe::PyFrame;
@@ -13757,9 +13824,9 @@ mod tests {
                 abort_permanent_py_pc_by_jit_pc: Vec::new(),
                 merge_entry_by_green: Vec::new(),
                 pcdep_by_jit_pc: vec![(0, Vec::new())],
-                depth_pred_by_jit_pc: vec![(0, 2)],
-                depth_trivia_marker_by_jit_pc: vec![(0, Some(2))],
-                depth_trivia_pred_by_jit_pc: vec![(0, Some(2))],
+                depth_pred_by_jit_pc: vec![(0, 1)],
+                depth_trivia_marker_by_jit_pc: vec![(0, Some(1))],
+                depth_trivia_pred_by_jit_pc: vec![(0, Some(1))],
                 depth_containing_by_jit_pc: Vec::new(),
                 depth_block_head_by_jit_pc: Vec::new(),
                 pcdep_trivia_marker_by_jit_pc: Vec::new(),
@@ -13804,8 +13871,9 @@ mod tests {
             Type::Ref, // debugdata
             Type::Ref, // w_globals
             Type::Ref, // local0
+            Type::Ref, // stale cell
             Type::Ref, // stack0
-            Type::Ref, // stack1
+            Type::Ref, // live cell from the vable image
         ];
         let mut ctx = TraceCtx::for_test_types(&input_types);
         // Slots 0 (frame) and 1 (ec) are both Ref-typed per `input_types`
@@ -13816,14 +13884,15 @@ mod tests {
         let mut sym = PyreSym::new_uninit(OpRef::input_arg_ref(0));
         sym.frame = OpRef::input_arg_ref(0);
         sym.execution_context = OpRef::input_arg_ref(1);
-        sym.nlocals = 1;
-        sym.valuestackdepth = 1;
+        sym.nlocals = 2;
+        sym.valuestackdepth = 2;
         sym.concrete_vable_ptr = frame_ptr as *mut u8;
 
         let local0 = w_int_new(41) as i64;
-        let stack0 = w_int_new(42) as i64;
-        let stack1 = w_int_new(43) as i64;
+        let stale_cell = w_int_new(42) as i64;
+        let stack0 = w_int_new(43) as i64;
         let globals = w_int_new(44) as i64;
+        let live_cell = w_int_new(45) as i64;
         let fail_values = [
             frame_ptr as i64,
             0,
@@ -13833,8 +13902,9 @@ mod tests {
             0,
             globals,
             local0,
+            stale_cell,
             stack0,
-            stack1,
+            live_cell,
         ];
         let fail_types = [
             Type::Ref,
@@ -13847,6 +13917,7 @@ mod tests {
             Type::Ref,
             Type::Ref,
             Type::Ref,
+            Type::Ref,
         ];
         let resume_data = majit_metainterp::ResumeDataResult {
             frames: vec![RebuiltFrame {
@@ -13854,11 +13925,16 @@ mod tests {
                 pc: 0,
                 py_pc: 0,
                 values: vec![
-                    RebuiltValue::Box(7, Type::Ref),
+                    RebuiltValue::Const(majit_ir::Const::Ref(majit_ir::GcRef::NULL)),
                     RebuiltValue::Box(8, Type::Ref),
                     RebuiltValue::Box(9, Type::Ref),
                 ],
             }],
+            // Exercise both authorities in one bridge setup.  The first local's
+            // register is a dead null and the second local/cell's register is a
+            // stale non-null object; both vable entries are live.  Conversely,
+            // the stack entry in the vable image is stale while the frame
+            // register contains the after-call result.
             virtualizable_values: vec![
                 RebuiltValue::Box(0, Type::Ref),
                 RebuiltValue::Box(2, Type::Int),
@@ -13867,8 +13943,8 @@ mod tests {
                 RebuiltValue::Box(5, Type::Ref),
                 RebuiltValue::Box(6, Type::Ref),
                 RebuiltValue::Box(7, Type::Ref),
-                RebuiltValue::Box(8, Type::Ref),
-                RebuiltValue::Box(9, Type::Ref),
+                RebuiltValue::Box(10, Type::Ref),
+                RebuiltValue::Box(7, Type::Ref),
             ],
             virtualref_values: Vec::new(),
             storage: None,
@@ -13896,12 +13972,45 @@ mod tests {
             vec![
                 OpRef::input_arg_ref(7),
                 OpRef::input_arg_ref(8),
-                OpRef::input_arg_ref(9)
+                OpRef::input_arg_ref(9),
             ]
         );
-        assert_eq!(sym.symbolic_local_types, vec![Type::Ref]);
-        assert_eq!(sym.symbolic_stack_types, vec![Type::Ref, Type::Ref]);
-        assert_eq!(sym.bridge_local_oprefs, Some(vec![OpRef::input_arg_ref(7)]));
+        assert_eq!(sym.symbolic_local_types, vec![Type::Ref, Type::Ref]);
+        assert_eq!(sym.symbolic_stack_types, vec![Type::Ref]);
+        assert_eq!(
+            sym.bridge_local_oprefs,
+            Some(vec![OpRef::input_arg_ref(7), OpRef::input_arg_ref(8)])
+        );
+        assert_eq!(
+            sym.concrete_locals,
+            vec![ConcreteValue::Int(41), ConcreteValue::Int(45)]
+        );
+        let array_base = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+        assert_eq!(
+            ctx.virtualizable_entry_at(array_base),
+            Some((
+                OpRef::input_arg_ref(7),
+                majit_ir::Value::Ref(majit_ir::GcRef(local0 as usize)),
+            )),
+        );
+        assert_eq!(
+            ctx.virtualizable_entry_at(array_base + 1),
+            Some((
+                OpRef::input_arg_ref(10),
+                majit_ir::Value::Ref(majit_ir::GcRef(live_cell as usize)),
+            )),
+        );
+        assert_eq!(
+            ctx.virtualizable_entry_at(array_base + 2),
+            Some((
+                OpRef::input_arg_ref(9),
+                majit_ir::Value::Ref(majit_ir::GcRef(stack0 as usize)),
+            )),
+        );
+        assert_eq!(
+            ctx.box_value(OpRef::input_arg_ref(9)),
+            Some(majit_ir::Value::Ref(majit_ir::GcRef(stack0 as usize))),
+        );
     }
 
     #[test]

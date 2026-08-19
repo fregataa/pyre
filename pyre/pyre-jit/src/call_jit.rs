@@ -721,18 +721,40 @@ pub(crate) extern "C" fn record_caught_blackhole_traceback(
     let Ok(opcode_position) = i32::try_from(opcode_position) else {
         return;
     };
-    if pyre_jit_trace::state::jitcode_pc_is_bare_reraise(jitcode_index, opcode_position) {
-        return;
-    }
+    let forwards_existing = pyre_jit_trace::state::jitcode_pc_raise_keeps_existing_traceback(
+        jitcode_index,
+        opcode_position,
+    );
     let frame_ptr = frame_value as *mut PyFrame;
     if frame_ptr.is_null() || exc_value == 0 {
         return;
     }
-    let last_instruction = pyre_jit_trace::py_coord::containing_py_pc_for_jitcode_pc_public(
+    // A forwarding raise keeps the chain it arrived with only when this frame
+    // attached the head. When the raise came out of an inlined callee, the
+    // head names the callee and this frame still owes one node. The ownership
+    // check preserves `pyopcode.py:147-148 handle_operation_error` as the
+    // one-node-per-frame-per-delivery authority.
+    if forwards_existing {
+        let owns_head = unsafe {
+            let head =
+                pyre_object::interp_exceptions::w_exception_get_traceback(exc_value as PyObjectRef);
+            !head.is_null()
+                && pyre_interpreter::pytraceback::is_pytraceback(head)
+                && pyre_interpreter::pytraceback::w_pytraceback_get_frame(head) == frame_ptr
+        };
+        if owns_head {
+            return;
+        }
+    }
+    let resolved = pyre_jit_trace::py_coord::containing_py_pc_for_jitcode_pc_public(
         jitcode_index,
         opcode_position,
-    )
-    .map_or(unsafe { (*frame_ptr).last_instr as i64 }, i64::from);
+    );
+    let exact =
+        pyre_jit_trace::py_coord::exact_py_pc_for_jitcode_pc_public(jitcode_index, opcode_position);
+    let last_instruction = exact
+        .or(resolved)
+        .map_or(unsafe { (*frame_ptr).last_instr as i64 }, i64::from);
     // One catch can be reached by two recorders: this hook, emitted into the
     // loop trace by the in-trace handler-entry arm, and the IR-virtual node the
     // bridge handler-entry arm builds when the exception edge deopts into a
@@ -819,10 +841,13 @@ pub(crate) extern "C" fn record_inline_traceback_for_recording(
     let Ok(opcode_position) = i32::try_from(opcode_position) else {
         return;
     };
-    // Inline frames follow the same RaiseWithExplicitTraceback rule as
-    // concrete blackhole frames: a bare reraise preserves the traceback
-    // already attached by the original raising instruction.
-    if pyre_jit_trace::state::jitcode_pc_is_bare_reraise(jitcode_index, opcode_position) {
+    // Inline frames follow the same rule as concrete blackhole frames: a raise
+    // that forwards an already-propagating exception preserves the traceback
+    // attached by the original raising instruction.
+    if pyre_jit_trace::state::jitcode_pc_raise_keeps_existing_traceback(
+        jitcode_index,
+        opcode_position,
+    ) {
         return;
     }
     if exc_value == 0 || w_code_value == 0 {
@@ -909,18 +934,12 @@ pub(crate) extern "C" fn record_discarded_level_traceback(
     if raw_code.is_null() {
         return;
     }
-    // Same RaiseWithExplicitTraceback rule the other two recorders follow: a
-    // bare reraise preserves the traceback the original raise attached.
-    let bare_reraise = match unsafe {
-        pyre_interpreter::decode_instruction_at(&*raw_code, last_instruction as usize)
-    } {
-        Some((pyre_interpreter::Instruction::RaiseVarargs { .. }, op_arg)) => {
-            u32::from(op_arg) == 0
-        }
-        Some((pyre_interpreter::Instruction::Reraise { .. }, _)) => true,
-        _ => false,
-    };
-    if bare_reraise {
+    // Same rule the other two recorders follow: a raise that forwards an
+    // already-propagating exception keeps the traceback it arrived with.
+    if pyre_jit_trace::state::raise_at_py_pc_keeps_existing_traceback(
+        unsafe { &*raw_code },
+        last_instruction as usize,
+    ) {
         return;
     }
     let w_globals = unsafe { pyre_interpreter::w_code_get_w_globals(w_code) };
@@ -2728,26 +2747,32 @@ pub fn blackhole_resume_via_rd_numb(
                         )
                     });
                     if !frame_ptr.is_null() {
-                        let last_instruction = jitcode_index
-                            .and_then(|index| {
-                                pyre_jit_trace::py_coord::containing_py_pc_for_jitcode_pc_public(
-                                    index,
+                        match jitcode_index {
+                            // Every indexed frame recorded during blackhole
+                            // propagation goes through the guarded recorder;
+                            // `pyopcode.py:147-148 handle_operation_error` is
+                            // upstream's single traceback attach point.
+                            Some(jitcode_index) => record_caught_blackhole_traceback(
+                                err.exc_object as i64,
+                                frame_ptr as i64,
+                                i64::from(jitcode_index),
+                                last_opcode_position as i64,
+                            ),
+                            None => {
+                                m73_lastinstr_audit(
+                                    "exit_guard_exc",
+                                    jitcode_index,
                                     last_opcode_position as i32,
-                                )
-                            })
-                            .map_or(unsafe { (*frame_ptr).last_instr as i64 }, i64::from);
-                        m73_lastinstr_audit(
-                            "exit_guard_exc",
-                            jitcode_index,
-                            last_opcode_position as i32,
-                            frame_ptr,
-                        );
-                        unsafe {
-                            pyre_interpreter::pytraceback::record_application_traceback(
-                                err.exc_object,
-                                frame_ptr,
-                                last_instruction,
-                            );
+                                    frame_ptr,
+                                );
+                                unsafe {
+                                    pyre_interpreter::pytraceback::record_application_traceback(
+                                        err.exc_object,
+                                        frame_ptr,
+                                        (*frame_ptr).last_instr as i64,
+                                    );
+                                }
+                            }
                         }
                     }
                     // `guard_exc` is now owned by the typed
@@ -2882,10 +2907,10 @@ pub fn blackhole_resume_via_rd_numb(
                 .get(last_opcode_position.saturating_sub(10)..=last_opcode_position + 1)
                 .unwrap_or(&[])
                 .to_vec();
-            let bare_reraise = bh_opcode_at
+            let keeps_existing_traceback = bh_opcode_at
                 .is_some_and(|opcode| opcode == majit_metainterp::jitcode::insns::BC_RERAISE)
                 || jitcode_index.is_some_and(|index| {
-                    pyre_jit_trace::state::jitcode_pc_is_bare_reraise(
+                    pyre_jit_trace::state::jitcode_pc_raise_keeps_existing_traceback(
                         index,
                         last_opcode_position as i32,
                     )
@@ -2894,8 +2919,8 @@ pub fn blackhole_resume_via_rd_numb(
             // BlackholeInterpreter frame at a time. Record each exiting
             // frame before advancing to nextblackholeinterp, matching
             // pytraceback.py record_application_traceback at every Python
-            // frame boundary. A bare reraise preserves the existing chain.
-            if !bare_reraise && !frame_ptr.is_null() {
+            // frame boundary. A forwarding raise preserves the existing chain.
+            if !keeps_existing_traceback && !frame_ptr.is_null() {
                 if let Some(jitcode_index) = jitcode_index {
                     record_caught_blackhole_traceback(
                         exc_value,
@@ -2928,7 +2953,8 @@ pub fn blackhole_resume_via_rd_numb(
                              last_opcode_position={last_opcode_position} opcode={:?} \
                              operand_reg={bh_raise_reg:?} registers_r.len={bh_regs_r_len} \
                              regs_holding_exception={:?} \
-                             code[-10..]={bh_code_window:?} bare_reraise={bare_reraise} \
+                             code[-10..]={bh_code_window:?} \
+                             keeps_existing_traceback={keeps_existing_traceback} \
                              guard_exc={guard_exc:x} py_pc={:?} entry_py_pc={:?} \
                              deadframe_types={deadframe_types:?} deadframe={deadframe:x?} \
                              registers_r={bh_regs_r:x?}",

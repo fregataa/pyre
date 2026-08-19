@@ -451,6 +451,46 @@ impl Trace {
         }
     }
 
+    /// Replace the descriptor on the last recorded operation.
+    pub fn set_last_op_descr(&mut self, descr: DescrRef) {
+        if let Some(op) = self.ops.last() {
+            op.setdescr(descr);
+        }
+    }
+
+    /// Opcode of the op [`set_last_op_descr`](Self::set_last_op_descr) would
+    /// stamp, for a caller that has to mint the descr subtype the opcode
+    /// requires.
+    pub fn last_op_opcode(&self) -> Option<OpCode> {
+        self.ops.last().map(|op| op.opcode)
+    }
+
+    /// Opcode of the op
+    /// [`set_guard_op_descr_from_end`](Self::set_guard_op_descr_from_end)
+    /// would stamp, selected by the same walk.
+    pub fn guard_op_opcode_from_end(&self, from_end: usize) -> Option<OpCode> {
+        self.ops
+            .iter()
+            .rev()
+            .filter(|op| op.opcode.is_guard())
+            .nth(from_end)
+            .map(|op| op.opcode)
+    }
+
+    /// Replace the descriptor on the guard `from_end` guards back from the
+    /// most recently recorded one.
+    pub fn set_guard_op_descr_from_end(&mut self, from_end: usize, descr: DescrRef) {
+        if let Some(op) = self
+            .ops
+            .iter()
+            .rev()
+            .filter(|op| op.opcode.is_guard())
+            .nth(from_end)
+        {
+            op.setdescr(descr);
+        }
+    }
+
     /// Opcode of the most recently recorded guard, if any.  Snapshot
     /// capture keys `after_residual_call` on the guard opcode itself
     /// (`pyjitpl.py:2599-2603 generate_guard`).

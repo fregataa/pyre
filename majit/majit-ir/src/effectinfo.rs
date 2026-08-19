@@ -935,7 +935,10 @@ pub enum PyreHelperKind {
     /// raise instead of declining to the trait.
     RaiseVarargs,
     /// `get_current_exception()` — the PUSH_EXC_INFO `prev = ec.sys_exc_value`
-    /// save residual (`() → Ref`, TLS read via `cpu.get_current_exception_fn`).
+    /// save residual, and the read a catch-covered bare `raise` uses to obtain
+    /// the exception it re-raises (`() → Ref`, TLS read via
+    /// `cpu.get_current_exception_fn`).  Only the save is followed by a store
+    /// and a matching POP_EXCEPT restore.
     /// The full-body walker recognises this tag to
     /// lower it to `GETFIELD_GC_R(ec, sys_exc_value)` so the exc-info save
     /// participates in the balanced save/restore the heap optimizer
@@ -958,6 +961,9 @@ pub enum PyreHelperKind {
     /// the in-flight iteration to the live frame instead of dropping it (the
     /// iterator advance is an irreversible side effect with no journal undo).
     ForIterNext,
+    /// `jit_exception_match(exc, match_class)` — the infallible Python-level
+    /// exception MRO test used by FOR_ITER's materialized catch arm.
+    ForIterExceptionMatch,
     /// `get_iter(obj)` — the GET_ITER residual (`iter(obj)`).  The full-body
     /// walker recognises exact machine-word `range` objects and emits the
     /// virtual `W_IntRangeIterator` allocation shape directly.
@@ -1054,9 +1060,11 @@ pub enum PyreHelperKind {
     MakeFunction,
     /// `bh_clear_in_flight_exception()` — the `[] -> void` residual emitted by
     /// PUSH_EXC_INFO to complete the caught-exception ownership transfer.  The
-    /// full-body walker recognises this tag to keep the executed-effect
-    /// odometer off it: the written slot is a GC-liveness root with no value
-    /// reader, so a non-committing walk has nothing to undo.
+    /// full-body walker applies the concrete clear during its authoritative
+    /// walk and emits no runtime IR: compiled traceback construction never
+    /// publishes this interpreter-only GC-liveness carrier.  Generic fallback
+    /// also keeps the executed-effect odometer off it because the slot has no
+    /// value reader and a non-committing walk has nothing to undo.
     ClearInFlightException,
 }
 

@@ -5366,7 +5366,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             ei.pyre_helper,
             majit_ir::PyreHelperKind::StoreName | majit_ir::PyreHelperKind::StoreGlobal
         )
-        && !jitcode_has_exception_handler(code)
+        && !walk_body_has_exception_handler(ctx, code)
     {
         if let (Some(&frame_opref), Some(&name_opref), Some(&value_opref)) =
             (r_args.first(), r_args.get(1), r_args.get(2))
@@ -5581,7 +5581,8 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
 
     // Range FOR_ITER is a C-level iterator advance.  Re-emit its field
     // updates so the opaque ForIterNext residual cannot invalidate optheap;
-    // other iterator families retain the residual and its Python semantics.
+    // The user-instance route below separately enters a Python `__next__`;
+    // remaining iterator families retain the residual and its Python semantics.
     // In particular, a generic W_SeqIterObject must stay residual: its PyPy
     // `W_SeqIterObject.descr_next` frame catches IndexError from `__getitem__`
     // and turns it into iterator exhaustion.  Inlining only `__getitem__`
@@ -5595,6 +5596,13 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         })? {
             write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, item_op)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
+        if let Some(inlined) = spec_gate("instance_next", || {
+            try_walker_specialize_instance_next(
+                ctx, op, code, funcptr, &r_args, call_descr, dst, dst_bank,
+            )
+        })? {
+            return Ok(inlined);
         }
     }
 
@@ -6002,7 +6010,8 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     }
     // B3 piece 3: lower the PUSH_EXC_INFO / POP_EXCEPT
     // exc-info-stack residuals to GETFIELD_GC_R / SETFIELD_GC on the EC's
-    // `sys_exc_value` slot. Recognised by the
+    // `sys_exc_value` slot, and consume the interpreter-only propagation-root
+    // clear without recording a runtime CallN. Recognised by the
     // codewriter-stamped `pyre_helper` tag (not a funcptr address — the
     // residual calls the cross-crate `cpu.{get,set}_current_exception_fn`
     // wrappers).  A balanced PUSH save + POP restore on the same descr-
@@ -6015,6 +6024,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             ei.pyre_helper,
             majit_ir::PyreHelperKind::GetCurrentException
                 | majit_ir::PyreHelperKind::SetCurrentException
+                | majit_ir::PyreHelperKind::ClearInFlightException
         )
         && try_walker_lower_exc_info_residual(
             ctx,
@@ -6409,6 +6419,16 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 )? {
                     return Ok(outcome);
                 }
+                if let Some(outcome) = try_walker_trace_readonly_descr_attr_raise(
+                    ctx,
+                    op,
+                    obj_opref,
+                    value_opref,
+                    w_code_ptr,
+                    namei as usize,
+                )? {
+                    return Ok(outcome);
+                }
                 if let Some(specialization) = spec_gate_store_attr(|| {
                     try_walker_specialize_store_attr(
                         ctx,
@@ -6699,7 +6719,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // its 4x pypy gate, and four benches' jit-stats move (most visibly
     // `exception_reraise_tb_depth_hot`, `loops_aborted 0 -> 63`).
     //
-    // The scan is whole-body, so one `try` anywhere in a module also charges
+    // The gate is whole-body, so one `try` anywhere in a module also charges
     // every name access in it a live dict lookup (~83ns each, linear in the
     // count).  Measured on a 200k-iteration
     // `bench/synth/exc_info_module_loop_hot`, folding it is worth 1.87us ->
@@ -6707,7 +6727,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // sits under this box's noise floor.
     if ctx.is_authoritative_executor
         && ei.pyre_helper == majit_ir::PyreHelperKind::LoadName
-        && !jitcode_has_exception_handler(code)
+        && !walk_body_has_exception_handler(ctx, code)
     {
         if let (Some(&frame_opref), Some(&name_opref)) = (r_args.first(), r_args.get(1)) {
             if let (

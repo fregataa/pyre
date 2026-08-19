@@ -31,10 +31,10 @@
 //! | `int_return/i`      | PARITY        | int-bank counterpart of `ref_return/r` — top-level records `Finish(reg) descr=done_with_this_frame_descr_int` (`pyjitpl.py:3206-3208`), sub-walk surfaces `SubReturn{Some(value)}`. RPython `pyjitpl.py:463 opimpl_int_return = _opimpl_any_return`. |
 //! | `float_return/f`    | PARITY        | float-bank counterpart — top-level records `Finish(reg) descr=done_with_this_frame_descr_float` (`pyjitpl.py:3212-3214`), sub-walk surfaces `SubReturn{Some(value)}`. RPython `pyjitpl.py:465 opimpl_float_return = _opimpl_any_return`. |
 //! | `void_return/`      | PARITY        | void return — top-level records `Finish([]) descr=done_with_this_frame_descr_void` (`pyjitpl.py:3202-3205`, `exits = []` branch), sub-walk surfaces `SubReturn{None}`. RPython `pyjitpl.py:467-469 opimpl_void_return → finishframe(None)`. |
-//! | `inline_call_r_r/dR>r` | PARITY (per-frame catch) | recurses into sub-jitcode via `JitCodeDescr::jitcode_index()`, populates callee `registers_r` (`setup_call_r`, OOR surfaces `InlineCallArityMismatch`), writes `SubReturn{value}` into caller dst (Ref bank), scans caller's `op.next_pc` for `live/` + `catch_exception/L` on `SubRaise` (`pyjitpl.py:2506-2522 finishframe_exception`). Sub-walk reaching `Terminate` is unexpected (top-level should never fire from a sub-walk); `SubReturn{None}` into a `_r_*` slot surfaces `UnexpectedVoidSubReturn`. |
-//! | `inline_call_r_i/dR>i` | PARITY        | int-result sibling of `inline_call_r_r/dR>r`. Same recursion + arglist + raise routing; only the dst bank changes (`registers_i[dst] = subreturn_value`). RPython `pyjitpl.py:1266-1324 _opimpl_inline_call*` is generated through `_opimpl_any_inline_call` decorator that varies on the result type — pyre's walker shares the body via `dispatch_inline_call_dr_kind(dst_bank)`. |
-//! | `inline_call_ir_r/dIR>r`, `inline_call_ir_i/dIR>i` | PARITY | extended-arglist siblings — descr + I-list + R-list + dst. RPython `setup_call(argboxes_i, argboxes_r, argboxes_f)` (pyjitpl.py:230-260) populates the callee's int + ref banks from the two lists. Walker uses `dispatch_inline_call_dir_kind(dst_bank)` which reads `read_int_var_list` then `read_ref_var_list` and surfaces per-bank arity overflow as `InlineCallIntArityMismatch` / `InlineCallArityMismatch`. |
-//! | `inline_call_irf_r/dIRF>r`, `inline_call_irf_f/dIRF>f` | PARITY | full-arglist variants — descr + I-list + R-list + F-list + dst. RPython same `setup_call` distribution; walker uses `dispatch_inline_call_dirf_kind(dst_bank)` extending the dIR helper with `read_float_var_list` + float-bank arg setup. Float arity overflow surfaces `InlineCallFloatArityMismatch`. |
+//! | `inline_call_r_r/dR>r` | PARITY (per-frame catch) | recurses into sub-jitcode via `JitCodeDescr::jitcode_index()`, populates callee `registers_r` (`setup_call_r`, OOR surfaces `InlineCallArityMismatch`), clears the caller's `last_exc_value` before writing `SubReturn{value}` into its Ref dst (`pyjitpl.py:2503-2510 finishframe`), and scans caller's `op.next_pc` for `live/` + `catch_exception/L` on `SubRaise` (`pyjitpl.py:2530-2558 finishframe_exception`). Sub-walk reaching `Terminate` is unexpected (top-level should never fire from a sub-walk); `SubReturn{None}` clears before surfacing `UnexpectedVoidSubReturn`. |
+//! | `inline_call_r_i/dR>i` | PARITY        | int-result sibling of `inline_call_r_r/dR>r`. Same recursion, arglist, normal-return clear, and raise routing; only the dst bank changes (`registers_i[dst] = subreturn_value`). RPython `pyjitpl.py:1266-1324 _opimpl_inline_call*` is generated through `_opimpl_any_inline_call` decorator that varies on the result type — pyre's walker shares the body via `dispatch_inline_call_dr_kind(dst_bank)`. |
+//! | `inline_call_ir_r/dIR>r`, `inline_call_ir_i/dIR>i` | PARITY | extended-arglist siblings — descr + I-list + R-list + dst. RPython `setup_call(argboxes_i, argboxes_r, argboxes_f)` (pyjitpl.py:230-260) populates the callee's int + ref banks from the two lists. Walker uses `dispatch_inline_call_dir_kind(dst_bank)` which reads `read_int_var_list` then `read_ref_var_list`, clears the caller exception slot on normal return, and surfaces per-bank arity overflow as `InlineCallIntArityMismatch` / `InlineCallArityMismatch`. |
+//! | `inline_call_irf_r/dIRF>r`, `inline_call_irf_f/dIRF>f` | PARITY | full-arglist variants — descr + I-list + R-list + F-list + dst. RPython same `setup_call` distribution; walker uses `dispatch_inline_call_dirf_kind(dst_bank)` extending the dIR helper with `read_float_var_list` + float-bank arg setup and the same normal-return clear. Float arity overflow surfaces `InlineCallFloatArityMismatch`. |
 //! | `int_copy/i>i`      | PARITY        | `registers_i[dst] = registers_i[src]` SSA rename, no IR op emitted (`pyjitpl.py:471-477 _opimpl_any_copy + >i` decorator) |
 //! | `ref_copy/r>r`      | PARITY        | Ref-bank sibling — `registers_r[dst] = registers_r[src]` SSA rename, no IR op. Const-source variants (codewriter `emit_ref_copy!` with `ConstRef`) resolve through the constants window of `registers_r` (pre-populated by `setposition` in [`num_regs_r, num_regs_and_consts_r)`). |
 //! | `int_<binop>/ii>i`  | PARITY        | int_add/int_sub/int_mul/int_and/int_or/int_xor/int_lshift/int_rshift + comparisons int_eq/int_ne/int_lt/int_le/int_gt/int_ge (14 ops). Reads two `i`-coded regs, records `OpCode::Int<Binop>` with `[a, b]`, writes recorder result into dst (`pyjitpl.py:279-336`). Mixed shapes such as `int_lshift/ri>i` stay unwired: those are kind-flow kind-flow bugs and must stay unsupported. |
@@ -1070,7 +1070,7 @@ fn finish_current_frame_execution<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sy
     }
 }
 
-fn recording_instruction_is_bare_reraise<Sym: WalkSym>(
+fn recording_raise_keeps_existing_traceback<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     opcode_position: usize,
 ) -> bool {
@@ -1080,7 +1080,7 @@ fn recording_instruction_is_bare_reraise<Sym: WalkSym>(
         ctx.inline_callee_consts
             .map_or(-1, |consts| consts.jitcode_index)
     };
-    crate::state::jitcode_pc_is_bare_reraise(jitcode_index, opcode_position as i32)
+    crate::state::jitcode_pc_raise_keeps_existing_traceback(jitcode_index, opcode_position as i32)
 }
 
 /// The frame identity, code object and instruction coordinate one
@@ -1180,7 +1180,8 @@ fn emit_traceback_node<Sym: WalkSym>(
     kind: pyre_object::interp_exceptions::ExcKind,
     site: &TracebackNodeSite,
     w_next: OpRef,
-) {
+    opcode_position: usize,
+) -> Result<(), DispatchError> {
     let traceback = ctx.trace_ctx.record_op_with_descr(
         OpCode::NewWithVtable,
         &[],
@@ -1211,22 +1212,40 @@ fn emit_traceback_node<Sym: WalkSym>(
 
     // `f_lineno` resolves through `offset2lineno(pycode, last_instr)` on every
     // read, so the frame itself has to carry the coordinate — the node's own
-    // `tb_lasti` answers a different question and is frozen. The interpreter
-    // gets this for free from `pyopcode.py`'s per-opcode `last_instr` store;
-    // compiled code does not run it, and `fbw_publish_exit_last_instr` only
-    // reaches the virtualizable, so an inlined callee frame would keep the `-1`
-    // initialization sentinel and report its `def` line. A frame that goes on
-    // running has this overwritten by its own later publish, exactly as the
-    // per-opcode store would.
+    // `tb_lasti` answers a different question and is frozen.  Preserve the
+    // exact operation PyPy traces from `pyopcode.py`'s per-opcode
+    // `self.last_instr = ...`: `pyjitpl.py:1188-1199
+    // _opimpl_setfield_vable` updates the shadow for the standard frame and
+    // falls through to SETFIELD_GC only for a nonstandard/inlined frame.  A raw
+    // SETFIELD_GC here wrote the root frame on every caught-exception bridge,
+    // even though `last_instr` is declared virtualizable by
+    // `interp_jit.py:25-30`.
     let last_instr_value = ctx.trace_ctx.const_int(i64::from(site.last_instruction));
-    let last_instr_descr = crate::descr::pyframe_next_instr_descr();
-    ctx.trace_ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[site.frame, last_instr_value],
-        last_instr_descr.clone(),
+    let unavailable = || DispatchError::TracebackNodeVableFieldUnavailable {
+        pc: opcode_position,
+        field: "last_instr",
+    };
+    let vinfo = ctx.trace_ctx.virtualizable_info().ok_or_else(unavailable)?;
+    let last_instr_index = vinfo
+        .static_field_index_by_name("last_instr")
+        .ok_or_else(unavailable)?;
+    let last_instr_descr = vinfo.static_field_descr(last_instr_index);
+    // A traceback node names an inlined callee's frame as often as the walk's
+    // own, and a frame that is not `virtualizable_boxes[-1]` sends
+    // `vable_setfield` down the `_nonstandard_virtualizable` path, which mints
+    // a PTR_EQ promote `GuardValue` internally with no resume snapshot.  Every
+    // other vable emit site pairs the call with this capture for that reason;
+    // without it the promote reaches the decoder holding
+    // `UNSTAMPED_JITCODE_INDEX` and `frame_value_count_at` fails loud.
+    let guards_before = ctx.trace_ctx.num_guards();
+    let write = ctx.trace_ctx.vable_setfield(
+        opcode_position,
+        site.frame,
+        last_instr_descr,
+        last_instr_value,
+        Some(Value::Int(i64::from(site.last_instruction))),
     );
-    ctx.trace_ctx
-        .heapcache_setfield_cached(site.frame, last_instr_descr.index(), last_instr_value);
+    walker_capture_inline_nonstandard_vable_guard(ctx, opcode_position, guards_before, write)?;
 
     let traceback_descr = crate::descr::w_exception_traceback_descr(kind);
     ctx.trace_ctx.record_op_with_descr(
@@ -1236,6 +1255,7 @@ fn emit_traceback_node<Sym: WalkSym>(
     );
     ctx.trace_ctx
         .heapcache_setfield_cached(exc, traceback_descr.index(), traceback);
+    Ok(())
 }
 
 /// IR-virtual PREPEND of one `PyTraceback` node — the general-case sibling
@@ -1270,23 +1290,23 @@ fn record_prepend_application_traceback<Sym: WalkSym>(
     exc: OpRef,
     exc_concrete: ConcreteValue,
     opcode_position: usize,
-) -> bool {
+) -> Result<bool, DispatchError> {
     if exc.is_none() || exc.is_constant() {
         // A `Const` exception box freezes the RECORDING iteration's address
         // (`walker_record_guard_exception` pins every raise after the first
         // one in a walk), so reading and writing `w_traceback` through it
         // would chain onto a stale object on every later iteration.  The
         // opaque hook takes the live exception as an argument instead.
-        return false;
+        return Ok(false);
     }
     let ConcreteValue::Ref(exc_ptr) = exc_concrete else {
-        return false;
+        return Ok(false);
     };
     if exc_ptr.is_null() || unsafe { !pyre_object::is_exception(exc_ptr) } {
-        return false;
+        return Ok(false);
     }
     let Some(site) = traceback_node_site(ctx, opcode_position) else {
-        return false;
+        return Ok(false);
     };
     if site.frame.is_none() {
         // No materialized frame for this level.  The opaque inline hook
@@ -1302,15 +1322,15 @@ fn record_prepend_application_traceback<Sym: WalkSym>(
         // this walk lacks, and the vable box is not a substitute (a traceback
         // outlives the frame, so storing it demands the escape marking this
         // path does not perform).
-        return false;
+        return Ok(false);
     }
     let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc_ptr) };
     // `tb = operror.get_traceback()`.  MUST precede the node's own store, or
     // the heapcache answers with the node being built and `w_next` self-links.
     let traceback_descr = crate::descr::w_exception_traceback_descr(kind);
     let w_next = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, exc, traceback_descr);
-    emit_traceback_node(ctx, exc, kind, &site, w_next);
-    true
+    emit_traceback_node(ctx, exc, kind, &site, w_next, opcode_position)?;
+    Ok(true)
 }
 
 /// IR-virtual traceback record for an exception the walk itself built: the
@@ -1326,27 +1346,27 @@ fn record_fresh_application_traceback<Sym: WalkSym>(
     exc: OpRef,
     exc_concrete: ConcreteValue,
     opcode_position: usize,
-) -> bool {
+) -> Result<bool, DispatchError> {
     let ConcreteValue::Ref(exc_ptr) = exc_concrete else {
-        return false;
+        return Ok(false);
     };
     if exc_ptr.is_null() || unsafe { !pyre_object::is_exception(exc_ptr) } {
-        return false;
+        return Ok(false);
     }
     let Some(site) = traceback_node_site(ctx, opcode_position) else {
-        return false;
+        return Ok(false);
     };
     if site.frame.is_none() {
         // Same disposition as the prepend sibling, for the same reason: the
         // opaque inline hook fabricates a frame from the promoted callee
         // metadata, while a null one answers None and breaks every consumer
         // that follows `tb_frame.f_code` — `traceback.print_exc` among them.
-        return false;
+        return Ok(false);
     }
     let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc_ptr) };
     let w_next = ctx.trace_ctx.const_ref(0);
-    emit_traceback_node(ctx, exc, kind, &site, w_next);
-    true
+    emit_traceback_node(ctx, exc, kind, &site, w_next, opcode_position)?;
+    Ok(true)
 }
 
 /// Compile-time-constant frame fields of an inlined callee.
@@ -1426,6 +1446,15 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// bridge's own resume coordinate, restoring the RPython positional
     /// semantics.
     pub bridge_entry_merge_pc: Option<usize>,
+    /// FOR_ITER key inherited only by the user-instance `__next__` sub-walk.
+    /// Every guard it emits is tagged so failure resumes in the blackhole
+    /// instead of compiling a bridge from the middle of the callee.
+    pub instance_next_foriter_green_key: Option<u64>,
+    /// Census marker paired with `instance_next_foriter_green_key`.  Keeping
+    /// the route identity separate from the optional descr key lets the
+    /// specialization census prove that every captured callee guard was
+    /// actually stamped.
+    pub instance_next_foriter_census_active: bool,
 }
 
 impl<Sym: WalkSym> Clone for FbwWalkMode<Sym> {
@@ -1470,6 +1499,8 @@ impl<Sym: WalkSym> Default for FbwWalkMode<Sym> {
             current_exception_seed_from_walk_store: false,
             class_of_last_exc_is_const: false,
             bridge_entry_merge_pc: None,
+            instance_next_foriter_green_key: None,
+            instance_next_foriter_census_active: false,
         }
     }
 }
@@ -1637,7 +1668,9 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// because each recursive frame has its own context. The flow
     /// (callee raise → caller catch → caller handler reads) only
     /// touches the caller's slot, so per-frame storage is equivalent
-    /// to RPython's metainterp-level slot for the catch path.
+    /// to RPython's metainterp-level slot for the catch path. The other
+    /// half is normal return: `finishframe` clears before `popframe()`, so
+    /// each caller-side `SubReturn` handler clears this caller slot.
     pub last_exc_value: Option<OpRef>,
     /// Concrete shadow companion to [`last_exc_value`].
     /// Holds the live `PyObjectRef` of the standing
@@ -2498,6 +2531,16 @@ pub enum DispatchError {
     /// `pyjitpl.py:2865 _interpret` calls `blackhole_if_trace_too_long()` right
     /// after `run_one_step()` — and raises `SwitchToBlackhole(ABORT_TOO_LONG)`.
     TraceTooLong { pc: usize, ops: usize },
+    /// The traceback node's `last_instr` store could not resolve the
+    /// virtualizable static field named `field`: either the trace carries no
+    /// `VirtualizableInfo` at all, or the registered one declares no such
+    /// field.  `interp_jit.py:25-30` declares `last_instr` virtualizable and
+    /// `pyjitpl.py:1188-1199 _opimpl_setfield_vable` routes the write through
+    /// it, so an unresolvable descr means the walk is recording against a
+    /// frame layout the jitdriver never registered.  Abort rather than fall
+    /// back to a raw SETFIELD_GC, which writes the root frame's shadow on
+    /// every caught-exception bridge.
+    TracebackNodeVableFieldUnavailable { pc: usize, field: &'static str },
 }
 
 impl DispatchError {
@@ -2569,6 +2612,7 @@ impl DispatchError {
             }
             Self::ExcEdgeNoInFrameCatch { .. } => "ExcEdgeNoInFrameCatch",
             Self::TraceTooLong { .. } => "TraceTooLong",
+            Self::TracebackNodeVableFieldUnavailable { .. } => "TracebackNodeVableFieldUnavailable",
         }
     }
 
@@ -2631,7 +2675,8 @@ impl DispatchError {
             | Self::BranchGuardUnrestorableKeptStackPermanent { pc, .. }
             | Self::InplaceContainerMutationUnsupported { pc, .. }
             | Self::ExcEdgeNoInFrameCatch { pc, .. }
-            | Self::TraceTooLong { pc, .. } => *pc,
+            | Self::TraceTooLong { pc, .. }
+            | Self::TracebackNodeVableFieldUnavailable { pc, .. } => *pc,
         }
     }
 
@@ -3281,7 +3326,7 @@ pub fn walk<Sym: WalkSym>(
                             exc,
                             exc_concrete,
                             node_position,
-                        );
+                        )?;
                     record_inline_exception_context(ctx.trace_ctx, exc, exc_concrete);
                     record_inline_application_traceback(
                         ctx,
@@ -3331,7 +3376,7 @@ pub fn walk<Sym: WalkSym>(
                 if ctx.is_top_level {
                     let recording_opcode_position =
                         ctx.session.borrow().recording_opcode_position;
-                    if !recording_instruction_is_bare_reraise(ctx, opcode_position) {
+                    if !recording_raise_keeps_existing_traceback(ctx, opcode_position) {
                         // Emit at runtime too, not only for the recording pass.
                         // Leaving the node to the interpreter holds only for a
                         // trace the interpreter entered: `CALL_ASSEMBLER` enters
@@ -3390,7 +3435,7 @@ pub fn walk<Sym: WalkSym>(
                     // the trace bridges and guard failures for no gain.  The
                     // publish above has already settled `last_instr`, which the
                     // recorder falls back to.
-                    if !recording_instruction_is_bare_reraise(ctx, opcode_position) {
+                    if !recording_raise_keeps_existing_traceback(ctx, opcode_position) {
                         record_top_level_application_traceback(
                             ctx,
                             exc,
@@ -3412,7 +3457,7 @@ pub fn walk<Sym: WalkSym>(
                     fbw_terminate_with_raise(exc, exc_concrete);
                     return Ok((DispatchOutcome::Terminate, pc));
                 } else {
-                    if !recording_instruction_is_bare_reraise(ctx, opcode_position) {
+                    if !recording_raise_keeps_existing_traceback(ctx, opcode_position) {
                         // Emit the node at runtime as well as applying it for
                         // the recording pass, for the same reason the top-level
                         // arm above does — here because an inlined callee has
@@ -3426,7 +3471,7 @@ pub fn walk<Sym: WalkSym>(
                             exc,
                             exc_concrete,
                             opcode_position,
-                        );
+                        )?;
                         record_inline_application_traceback(
                             ctx,
                             exc,
@@ -4949,13 +4994,31 @@ fn funcptr_concrete_int<Sym: WalkSym>(
     }
 }
 
-/// Returns `true` when the jitcode body contains any `catch_exception/L`
-/// op — i.e. the source function has a `try`/`except` handler.  Used by
-/// the residual-call fast paths that conservatively decline a handler-
-/// bearing body to the generic walk (which resumes a `GUARD_NO_EXCEPTION`
-/// deopt into the handler correctly) rather than to their concrete fold.
-fn jitcode_has_exception_handler(code: &[u8]) -> bool {
-    crate::jitcode_runtime::decoded_ops(code).any(|op| op.opname == "catch_exception")
+/// Returns `true` when the body being walked has a Python `try`/`except`
+/// handler.  Used by the residual-call fast paths that conservatively decline
+/// a handler-bearing body to the generic walk (which resumes a
+/// `GUARD_NO_EXCEPTION` deopt into the handler correctly) rather than to their
+/// concrete fold.
+///
+/// The question is about the source function, so it reads `co_exceptiontable`.
+/// Scanning the jitcode for `catch_exception` ops answers a different one: the
+/// codewriter also emits that op for can-raise sites it routes itself — the
+/// FOR_ITER exception-match arm emits one at every `for` loop — and those have
+/// no Python handler for a deopt to resume into.  Falls back to the scan when
+/// the walk's jitcode index resolves to no `CodeObject`.
+fn walk_body_has_exception_handler<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    code: &[u8],
+) -> bool {
+    let jitcode_index = if ctx.is_top_level {
+        ctx.session.borrow().recording_jitcode_index
+    } else {
+        ctx.inline_callee_consts
+            .map_or(-1, |consts| consts.jitcode_index)
+    };
+    crate::state::jitcode_source_has_exception_handler(jitcode_index).unwrap_or_else(|| {
+        crate::jitcode_runtime::decoded_ops(code).any(|op| op.opname == "catch_exception")
+    })
 }
 
 /// Maps a freshly-boxed `W_Bool` opref (the `jit_bool_value_from_truth(t)`
@@ -11497,7 +11560,7 @@ fn handle<Sym: WalkSym>(
             ctx.last_exc_value_concrete = concrete_exc;
             ctx.fbw_mode.class_of_last_exc_is_const = true;
             let freshly_normalized = fbw_built_exc_take(exc);
-            if !recording_instruction_is_bare_reraise(ctx, op.pc) {
+            if !recording_raise_keeps_existing_traceback(ctx, op.pc) {
                 let caught_in_frame = try_catch_exception_at(code, op.next_pc).is_some();
                 if caught_in_frame {
                     // Unless this walk built the exception it may already
@@ -11510,9 +11573,9 @@ fn handle<Sym: WalkSym>(
                     // weaker node than the live one — still a node whose
                     // `tb_frame.f_code` answers the right code object.
                     let emit_runtime = if freshly_normalized {
-                        !record_fresh_application_traceback(ctx, exc, concrete_exc, op.pc)
+                        !record_fresh_application_traceback(ctx, exc, concrete_exc, op.pc)?
                     } else {
-                        !record_prepend_application_traceback(ctx, exc, concrete_exc, op.pc)
+                        !record_prepend_application_traceback(ctx, exc, concrete_exc, op.pc)?
                     };
                     record_inline_application_traceback(
                         ctx,
