@@ -4252,7 +4252,7 @@ impl Optimizer {
             // jitcell is the one the recorded close JUMP points to, which is
             // also where `front_target_tokens` comes from (`compile_bridge`
             // resolves it off the JUMP target, not the bridge origin).
-            // `assert cell_token.target_tokens` ⇒ require a target.
+            // `assert cell_token.target_tokens`: require a target.
             if !front_target_tokens.is_empty() {
                 let mut ctx = self.final_ctx.take().unwrap_or_else(|| {
                     // opencoder.py:259 inputarg_from_tp parity — seed inputarg
@@ -6137,6 +6137,7 @@ mod tests {
             1,
             0,
             &[majit_ir::descr::SimpleFieldDescrSpec {
+                is_class_word: false,
                 index: 91,
                 field_key: "CallResult.field".to_string(),
                 name: "CallResult.field".to_string(),
@@ -6229,6 +6230,7 @@ mod tests {
             0,
             &[
                 majit_ir::descr::SimpleFieldDescrSpec {
+                    is_class_word: false,
                     index: 101,
                     field_key: "CallResult.type".to_string(),
                     name: "CallResult.type".to_string(),
@@ -6242,6 +6244,7 @@ mod tests {
                     index_in_parent: 0,
                 },
                 majit_ir::descr::SimpleFieldDescrSpec {
+                    is_class_word: false,
                     index: 102,
                     field_key: "CallResult.value".to_string(),
                     name: "CallResult.value".to_string(),

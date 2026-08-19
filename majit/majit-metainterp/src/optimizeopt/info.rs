@@ -70,9 +70,16 @@ fn w_class_store_is_covered_by_alloc(
     let Some(w_class) = size.w_class_obj().filter(|&w| w != 0) else {
         return false;
     };
-    let Some(init_field) = size.gc_fielddescrs().iter().find(|fd| fd.is_w_class()) else {
+    let Some(init_field) = size.class_word_field() else {
         return false;
     };
+    // Keep this comparison even though the slot is now declared. The
+    // declared slot replaces the *name* test and nothing else. `field` comes
+    // from the operation and `init_field` from the layout, and pyre mints
+    // those from two independent producers, so they are distinct objects that
+    // may or may not describe the same bytes. This is the check that they do;
+    // removing it would let a store to any field of a class-word-bearing
+    // struct be elided as "already written by the allocation".
     if init_field.offset() != field.offset() || init_field.field_size() != field.field_size() {
         return false;
     }
@@ -1784,6 +1791,12 @@ mod tests {
         }
         fn field_name(&self) -> &str {
             self.name
+        }
+        // The fixture builds an op-side and a layout-side descr separately and
+        // tells them apart by name, so the mock declares from the name it was
+        // constructed with. Production producers store the flag instead.
+        fn is_w_class(&self) -> bool {
+            self.name == "w_class" || self.name.ends_with(".w_class")
         }
     }
 

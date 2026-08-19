@@ -1076,9 +1076,11 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     );
     // Coverage gate. Every `skipped` entry is a function whose MIR shape
     // the driver could not lower — already after the reverse-postorder
-    // retry in `lower_fun_decl`. The single known, tracked gap is an
-    // "uninitialised local read" that even RPO could not bind (a genuine
-    // loop-carried def — none in the current snapshot); such a function
+    // retry in `lower_fun_decl`. The tracked gaps are exactly the shapes
+    // `is_known_lowering_gap` recognises; its arms are the only statement
+    // of that set that cannot go stale. One of them, an "uninitialised local
+    // read" that even RPO could not bind, needs a genuine loop-carried def.
+    // Such a function
     // would degrade the program by being dropped to a residual call,
     // never a correctness loss. Any *other* lowering failure likewise
     // degrades to a residual call — matching `exceptiontransform.py:212`,
@@ -1095,8 +1097,10 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             .partition(|(_, msg)| is_known_lowering_gap(msg));
         if std::env::var("PYRE_MIR_FRONTEND_DEBUG").is_ok() && !tracked.is_empty() {
             eprintln!(
-                "[mir-frontend] {} function(s) skipped via the tracked \
-                 uninitialised-local gap:",
+                "[mir-frontend] {} function(s) skipped via a shape \
+                 `is_known_lowering_gap` recognises; the per-function \
+                 message below names which one, and all degrade to a \
+                 residual call:",
                 tracked.len()
             );
             for (name, msg) in tracked.iter().take(20) {
@@ -3464,7 +3468,7 @@ impl<'a> Lowering<'a> {
                         state[nxt] = 1;
                         stack.push((nxt, 0));
                     }
-                    1 => headers[nxt] = true, // grey successor ⇒ back-edge target
+                    1 => headers[nxt] = true, // a grey successor is a back-edge target
                     _ => {}
                 }
             } else {
@@ -10089,7 +10093,8 @@ impl<'a> Lowering<'a> {
     ///
     /// Five conditions, cheapest first (so the body scans run only on
     /// genuine candidates): the callee is `<ptr>::add`; two arguments;
-    /// the receiver is `*mut PyObjectRef`; the index is a runtime local
+    /// the receiver points at a managed reference
+    /// ([`is_object_ref_items_ptr`]); the index is a runtime local
     /// (not the constant offset brick 1 collapses); the base traces to
     /// an items-base accessor ([`base_traces_to_items_block_accessor`])
     /// — so the header `base_size` re-add lands on `items[0]`; and the
@@ -13998,19 +14003,19 @@ fn regular_call_is_ptr_add(reg: &RegularCall, llbc: &Llbc) -> bool {
 /// `items_block_items_ptr`).  brick 3's `*base.add(idx)` lowering only
 /// fires when the base traces to one of these (their header return is
 /// what the `base_size = ITEMS_BLOCK_ITEMS_OFFSET` array descr re-adds);
-/// a `*mut PyObjectRef` from any other producer already points at
+/// an items pointer from any other producer already points at
 /// `items[0]` and must keep its residual `add`.
+///
+/// Recognised through [`is_object_items_block_base_accessor`], the same
+/// module-qualified suffix brick 1 keys on. Matching whole `pyre_object::`
+/// paths here would make brick 3 strictly narrower than the rewrite it is
+/// paired with; see that function for why the two must not disagree.
 fn regular_call_is_items_block_accessor(reg: &RegularCall, llbc: &Llbc) -> bool {
     let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
         return false;
     };
-    llbc.fn_by_id(*id).is_some_and(|fd| {
-        matches!(
-            fd.item_meta.name_path().as_str(),
-            "pyre_object::object_array::items_block_items_base"
-                | "pyre_object::object_array::items_block_items_ptr"
-        )
-    })
+    llbc.fn_by_id(*id)
+        .is_some_and(|fd| is_object_items_block_base_accessor(fd.item_meta.name_path().as_str()))
 }
 
 /// The [`TyRef`] of a plain-place [`Operand`], or `None` for a
@@ -14043,7 +14048,7 @@ fn is_list_items_elem_ptr_add_parts(
 ) -> bool {
     args_len == 2
         && regular_call_is_ptr_add(reg, llbc)
-        && base_ty.is_some_and(|ty| is_pyobjectref_items_ptr(ty, llbc))
+        && base_ty.is_some_and(|ty| is_object_ref_items_ptr(ty, llbc))
         && index_local.is_some()
         && base_local.is_some_and(|base| base_traces_to_items_block_accessor(body, base, llbc))
         && add_dest_used_only_as_single_deref(body, dest_local)
@@ -16430,15 +16435,30 @@ fn tyref_is_raw_byte_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
     })
 }
 
-/// Whether `ty` is a `*mut PyObjectRef` / `*const PyObjectRef`
-/// (`RawPtr` onto a `RawPtr` onto `PyObject`) — the pointer-to-pointer
-/// signature of the object-element store an `ItemsBlock` lays out after
-/// its length header, and the receiver type of brick 3's
-/// `*base.add(idx)` ([`Lowering::is_list_items_elem_ptr_add`]).  A typed
-/// primitive array carries a scalar pointee (`*mut u8` / `*mut i64`),
-/// excluded by the inner-`RawPtr` test; the `PyObject` pointee root pins
-/// it to the object family rather than any `*mut *mut T`.
-fn is_pyobjectref_items_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
+/// Whether `ty` is a pointer to a MANAGED REFERENCE — `RawPtr` onto a `RawPtr`
+/// onto a named class root — the pointer-to-pointer signature of the object
+/// element an items block lays out after its length header, and the receiver
+/// type of brick 3's `*base.add(idx)`
+/// ([`Lowering::is_list_items_elem_ptr_add`]).
+///
+/// Two tests, and what each one excludes is different. The inner `RawPtr`
+/// rejects a typed primitive array, whose pointee is a scalar (`*mut u8` /
+/// `*mut i64`) — that is what keeps a `TypedItemsBlock` out of the `Ref`-typed
+/// array ops. [`raw_ptr_pointee_class_root`] answering `Some` rejects a
+/// pointer-to-pointer whose pointee is not a class at all.
+///
+/// The root is derived rather than fixed. Comparing it against the literal
+/// `"PyObject"` would make the route unreachable from any other host:
+/// `adt_node_class_root` answers with the pointee's own leaf name, so a class
+/// family rooted at another header answers its own name. This matches
+/// `Lowering::resolve_place`'s class-singleton narrow already carries: a
+/// prebuilt is annotated with the class of the object itself
+/// (`rpython/annotator/bookkeeper.py:339-345`), so the root comes off the type
+/// rather than out of the front end. Naming one host's root here bought no
+/// safety the accessor gate does not already provide — what makes the base an
+/// items pointer is [`base_traces_to_items_block_accessor`], not the spelling
+/// of its element.
+fn is_object_ref_items_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
     let Some(outer) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
         return false;
     };
@@ -16451,7 +16471,7 @@ fn is_pyobjectref_items_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
     else {
         return false;
     };
-    raw_ptr_pointee_class_root(inner, llbc).as_deref() == Some("PyObject")
+    raw_ptr_pointee_class_root(inner, llbc).is_some()
 }
 
 /// The `__cast_pointer/<Root>` marker call — front::mir's carrier for
@@ -18105,17 +18125,55 @@ fn strip_crate_prefix(path: &str) -> String {
     }
 }
 
+/// True for the two REFERENCE items-base accessors — the ones whose block
+/// lays `Ptr` items after its length header.
+///
+/// Split out of [`graph_is_items_block_base_accessor`] rather than spelled
+/// twice, because brick 1 (the accessor-body collapse) and brick 3 (the
+/// element `*base.add(i)`) must recognise the same accessor or the pointer
+/// means different things at the two ends: brick 1 rewrites the accessor to
+/// return the block HEADER, and only brick 3's `base_size`-bearing array descr
+/// adds the item offset back. An accessor collapsed by the first and declined
+/// by the second leaves a residual `.add` striding from the LENGTH WORD — a
+/// silent one-element mis-index, not a missed optimisation. One list, two
+/// call sites.
+///
+/// Matched on the module-qualified path so a leaf collision in another module
+/// cannot widen the gate, and crate-prefix-independent so the same accessor
+/// matches whether reached from `pyre_object`, `pyre_interpreter`, `pyre_jit`'s
+/// monomorphized copy — or a non-pyre host crate that lays its block out this
+/// way. The prefix carries no information the suffix does not: what makes the
+/// collapse sound is the accessor's CONTRACT (return the interior pointer for
+/// descr-based consumption), which the module-qualified name states and the
+/// crate name does not.
+///
+/// Compared with [`path_ends_with_segments`] and not with `str::ends_with`. On
+/// a `::`-joined path `ends_with` is a SUBSTRING test, not a path test: it
+/// accepts `some_host::my_object_array::items_block_items_base`, because
+/// `object_array::…` is a byte suffix of `my_object_array::…` while naming a
+/// different module. A module that merely *ends in* `object_array` would then
+/// have its accessor collapsed to the block header on the strength of its
+/// spelling. The segment-aware comparator already existed in this file; these
+/// gates were the ones not using it.
+fn is_object_items_block_base_accessor(name: &str) -> bool {
+    path_ends_with_segments(name, "object_array::items_block_items_base")
+        || path_ends_with_segments(name, "object_array::items_block_items_ptr")
+}
+
 /// True for the `ItemsBlock` / `TypedItemsBlock` items-base accessor bodies
 /// whose `.add(*_ITEMS_OFFSET)` the front-end collapses to the
-/// receiver (see [`Lowering::is_items_block_base_ptr_add`]).  Matched on
-/// the module-qualified path so a leaf collision in another module
-/// cannot widen the gate, and crate-prefix-independent so the same
-/// accessor matches whether reached from `majit_rlib`, `pyre_object`,
-/// `pyre_interpreter`, or `pyre_jit`'s monomorphized copy.
+/// receiver (see [`Lowering::is_items_block_base_ptr_add`]).
+///
+/// The typed (scalar) accessor is here and NOT in
+/// [`is_object_items_block_base_accessor`]: its block holds `u64` words, so a
+/// `*base.add(i)` through it is not a reference element store and brick 3 must
+/// not lower it as one. That separation is what keeps the shared-list
+/// invariant above from pulling a scalar block into the `Ref`-typed array ops
+/// — the element side is refused by [`is_object_ref_items_ptr`] as well, so the
+/// two gates agree by construction rather than by coincidence.
 fn graph_is_items_block_base_accessor(name: &str) -> bool {
-    name.ends_with("object_array::items_block_items_base")
-        || name.ends_with("object_array::items_block_items_ptr")
-        || name.ends_with("rlist::typed_items_block_items_base")
+    is_object_items_block_base_accessor(name)
+        || path_ends_with_segments(name, "rlist::typed_items_block_items_base")
 }
 
 /// One path segment, with a raw-identifier prefix removed.  `r#struct` and
@@ -18156,6 +18214,19 @@ fn path_has_suffix_ignoring_raw(path: &str, key: &str) -> bool {
             _ => return false,
         }
     }
+}
+
+/// `key` names the trailing `::` segments of `path` — as a PATH, not as a
+/// substring. The drop-in for `path.ends_with(key)` wherever `key` is a
+/// `::`-joined path rather than a bare leaf.
+///
+/// Both arms are needed. [`path_has_suffix_ignoring_raw`] deliberately demands
+/// a *proper* suffix — at least one segment of `path` left over — so on its own
+/// it would reject a `path` that is exactly `key`, which `ends_with` accepted.
+/// Pairing it with [`path_eq_ignoring_raw`] leaves the substring collision as
+/// the only input whose answer changes.
+fn path_ends_with_segments(path: &str, key: &str) -> bool {
+    path_eq_ignoring_raw(path, key) || path_has_suffix_ignoring_raw(path, key)
 }
 
 fn static_key_matches(full: &str, stripped: &str, key: &str) -> bool {
@@ -19081,7 +19152,7 @@ fn block_dominates(graph: &FunctionGraph, dom: BlockId, target: BlockId) -> bool
             }
         }
     }
-    // `target` unreachable once `dom` is cut ⇒ `dom` dominates `target`.
+    // If cutting `dom` makes `target` unreachable, `dom` dominates `target`.
     // Guard against an unreachable `target` (vacuously "dominated"): only
     // treat as dominated when `target` is genuinely reachable in the full
     // graph.
@@ -21687,6 +21758,65 @@ mod tests {
         assert!(!graph_is_items_block_base_accessor(
             "pyre_object::other_mod::items_block_items_base_helper"
         ));
+    }
+
+    /// brick 1 collapses an accessor to its receiver — the block header — and
+    /// only brick 3's `base_size`-bearing array descr adds the item offset
+    /// back. So every REFERENCE accessor brick 1 rewrites must also be one
+    /// brick 3 recognises, or the residual `.add` strides from the length
+    /// word. The typed accessor is the deliberate exception: brick 1 collapses
+    /// it, and its scalar element is refused on the element side instead
+    /// (`is_object_ref_items_ptr`), so no `Ref`-typed array op is minted for a
+    /// `u64` block.
+    #[test]
+    fn the_two_bricks_agree_on_every_reference_items_base_accessor() {
+        use super::{graph_is_items_block_base_accessor, is_object_items_block_base_accessor};
+
+        for name in [
+            "pyre_object::object_array::items_block_items_base",
+            "pyre_object::object_array::items_block_items_ptr",
+            "pyre_jit::object_array::items_block_items_base",
+        ] {
+            assert!(
+                is_object_items_block_base_accessor(name),
+                "brick 3 declines {name}, which brick 1 rewrites"
+            );
+            assert!(graph_is_items_block_base_accessor(name));
+        }
+
+        // The typed block: brick 1 only.
+        let typed = "majit_rlib::lltypesystem::rlist::typed_items_block_items_base";
+        assert!(graph_is_items_block_base_accessor(typed));
+        assert!(!is_object_items_block_base_accessor(typed));
+
+        // Neither gate is keyed on a crate: a host crate laying its block out
+        // the same way is recognised by the same module-qualified suffix. The
+        // name below is a shape, not a crate this workspace contains.
+        let host = "some_host::runtime::object_array::items_block_items_base";
+        assert!(is_object_items_block_base_accessor(host));
+        assert!(graph_is_items_block_base_accessor(host));
+
+        // A leaf collision still cannot widen either gate. Note this case
+        // proves less than it looks: it is refused for TWO independent
+        // reasons — the leaf is `…_helper`, and the module is `other_mod` —
+        // so it passes even under a plain `ends_with`, and it never tested
+        // whether the comparison respects `::` boundaries at all.
+        let collision = "some_host::other_mod::items_block_items_base_helper";
+        assert!(!is_object_items_block_base_accessor(collision));
+        assert!(!graph_is_items_block_base_accessor(collision));
+
+        // The case that does test it. Every segment of the key appears, the
+        // leaf is exact, and the whole key is a byte-suffix of the path — so
+        // `ends_with` accepts it — yet the module is `my_object_array` and not
+        // `object_array`, so a path comparison must refuse it. This is the one
+        // input whose answer changed when the gates moved off `ends_with`.
+        let neighbour = "some_host::runtime::my_object_array::items_block_items_base";
+        assert!(!is_object_items_block_base_accessor(neighbour));
+        assert!(!graph_is_items_block_base_accessor(neighbour));
+
+        // The same defect on the other predicate's own arm.
+        let neighbour_typed = "majit_rlib::lltypesystem::my_rlist::typed_items_block_items_base";
+        assert!(!graph_is_items_block_base_accessor(neighbour_typed));
     }
 
     #[test]

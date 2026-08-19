@@ -250,13 +250,19 @@ impl VirtualizableTracker {
         };
         // Input-layout seeding applies only to the initial loop/preamble entry
         // (`inputarg_base == 0`), whose inputargs carry the
-        // `[frame, vable_scalars..., array_items...]` layout. A bridge
-        // (`inputarg_base > 0`) inherits only the failing guard's live boxes as
-        // inputargs (frame first, then the surviving reds), NOT the unpacked
-        // vable scalar/array slots; it re-establishes the virtualizable fields
-        // from the explicit SetfieldGc/SetarrayitemGc reconstruction ops the
-        // resume path records into the bridge body. So the bridge frame is
-        // seeded as an empty Virtualizable and populated by those ops.
+        // `[frame, vable_scalars..., array_items...]` layout. The gate is the
+        // base and not `building_bridge` because the seeding below addresses
+        // slots with unshifted raw indices (`input_arg_typed(flat_input_idx)`),
+        // which name this run's inputargs only when the base is 0.
+        //
+        // A bridge inherits only the failing guard's live boxes as inputargs
+        // (frame first, then the surviving reds), not the unpacked vable
+        // scalar/array slots; it re-establishes the virtualizable fields from
+        // the explicit SetfieldGc/SetarrayitemGc reconstruction ops the resume
+        // path records into the bridge body. So the bridge frame is seeded as
+        // an empty Virtualizable and populated by those ops. An unrolled
+        // Phase 2 body is also shifted and skips the seeding, but keeps the
+        // resolved identity slot; see `identity_input_ref`.
         let base = ctx.inputarg_base;
         if base == 0 {
             let mut flat_input_idx = 1usize + self.config.vable_input_offset;
@@ -948,8 +954,7 @@ impl OptVirtualize {
         // excluded for the reason the arms below give -- they do not resolve
         // through the field list at all.
         if !is_raw_op
-            && !is_typeptr
-            && !field_descr.is_w_class()
+            && !field_descr.is_header_field()
             && let (Some(b), Some(parent_descr)) =
                 (struct_box.as_ref(), field_descr.get_parent_descr())
         {
@@ -990,12 +995,7 @@ impl OptVirtualize {
                 let stored = vinfo
                     .descr
                     .as_size_descr()
-                    .and_then(|sd| {
-                        sd.all_fielddescrs()
-                            .iter()
-                            .find(|fd| fd.is_w_class())
-                            .map(|fd| fd.index_in_parent() as u32)
-                    })
+                    .and_then(|sd| sd.class_word_index_in_parent().map(|idx| idx as u32))
                     .and_then(|widx| get_field(&vinfo.fields, widx));
                 if let Some(val_ref) = stored {
                     let b_old = Operand::from_bound_op(op_rc);
@@ -1081,7 +1081,7 @@ impl OptVirtualize {
                 _ => true,
             };
             let slot_resolvable =
-                slot_identifies_field || is_raw_op || is_typeptr || field_descr.is_w_class();
+                slot_identifies_field || is_raw_op || field_descr.is_header_field();
             if !slot_resolvable && crate::majit_log_enabled() {
                 // What the skip is worth: a populated slot is the value
                 // `get_field` would have forwarded for a field not in it.
@@ -1168,8 +1168,7 @@ impl OptVirtualize {
             // because upstream defines this handler for GETFIELD_GC_{I,R,F}
             // only.
             let folds_to_zero = !is_raw_op
-                && !is_typeptr
-                && !field_descr.is_w_class()
+                && !field_descr.is_header_field()
                 && matches!(info, PtrInfo::Virtual(_) | PtrInfo::VirtualStruct(_));
             if folds_to_zero {
                 // optimizer.py:528-534 new_const: CONST_NULL for a pointer
@@ -4478,6 +4477,7 @@ mod tests {
             1,
             0,
             &[majit_ir::descr::SimpleFieldDescrSpec {
+                is_class_word: false,
                 index: 10,
                 field_key: "Node.value".to_string(),
                 name: "Node.value".to_string(),
@@ -6168,6 +6168,7 @@ mod tests {
             1,
             0,
             &[majit_ir::descr::SimpleFieldDescrSpec {
+                is_class_word: false,
                 index: 10,
                 field_key: "Node.value".to_string(),
                 name: "Node.value".to_string(),

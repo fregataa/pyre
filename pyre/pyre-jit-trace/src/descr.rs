@@ -107,6 +107,11 @@ pub struct PyreFieldDescr {
     quasi_immutable: bool,
     /// RPython descr.py:227 — field name for heaptracker.py:66 filtering.
     name: &'static str,
+    /// Whether this field is the owning struct's class word — the declared
+    /// answer behind `FieldDescr::is_w_class()`.  Stated per construction
+    /// site rather than recovered from `name`, so a consumer never has to
+    /// know how this host spells its header.
+    is_class_word: bool,
     index_in_parent: usize,
     parent_descr: Option<Weak<dyn Descr>>,
     /// `effectinfo.py:465 compute_bitstrings` ei_index. `u32::MAX` until
@@ -330,6 +335,9 @@ impl Descr for PyreFieldDescr {
 }
 
 impl FieldDescr for PyreFieldDescr {
+    fn is_w_class(&self) -> bool {
+        self.is_class_word
+    }
     fn offset(&self) -> usize {
         self.offset
     }
@@ -370,6 +378,7 @@ pub fn make_field_descr(
         immutable: false,
         quasi_immutable: false,
         name: "",
+        is_class_word: false,
         index_in_parent: 0,
         parent_descr: None,
         ei_index: AtomicU32::new(u32::MAX),
@@ -405,6 +414,7 @@ pub fn make_field_descr_full(
         immutable,
         quasi_immutable: false,
         name: "",
+        is_class_word: false,
         index_in_parent: 0,
         parent_descr: None,
         ei_index: AtomicU32::new(u32::MAX),
@@ -427,6 +437,7 @@ pub fn make_immutable_field_descr(
         immutable: true,
         quasi_immutable: false,
         name: "",
+        is_class_word: false,
         index_in_parent: 0,
         parent_descr: None,
         ei_index: AtomicU32::new(u32::MAX),
@@ -449,6 +460,7 @@ pub fn make_quasi_immutable_field_descr(
         immutable: false,
         quasi_immutable: true,
         name: "",
+        is_class_word: false,
         index_in_parent: 0,
         parent_descr: None,
         ei_index: AtomicU32::new(u32::MAX),
@@ -558,8 +570,10 @@ pub use pyre_object::listobject::W_LIST_GC_TYPE_ID;
 // Array GC type ids live in `pyre-object` alongside the backing storage
 // structs/constants they describe (matching W_INT/W_FLOAT/W_LIST/W_TUPLE
 // pattern). Re-exported here for existing call sites.
+// The two `GcArray` tids are accessors, not constants: pyre declares them from
+// its own `gc.register_type` results at GC build time (`pyre-jit/src/eval.rs`).
 pub use pyre_object::object_array::{
-    GC_FLOAT_ARRAY_GC_TYPE_ID, GC_INT_ARRAY_GC_TYPE_ID, PY_OBJECT_ARRAY_GC_TYPE_ID,
+    PY_OBJECT_ARRAY_GC_TYPE_ID, gc_float_array_gc_type_id, gc_int_array_gc_type_id,
 };
 pub use pyre_object::tupleobject::W_TUPLE_GC_TYPE_ID;
 // GC type ids for `W_SpecialisedTupleObject_{ii,ff,oo}` live in
@@ -792,6 +806,14 @@ fn build_object_descr_group_with_extra_gc_edges(
                 is_quasi_immutable: quasi_immutable,
                 flag: runtime_array_flag(field_type, signed),
                 virtualizable: false,
+                // pyre's layout invariant, not a name rule: the inherited
+                // `PyObject` header sits at `W_CLASS_OFFSET` in every object
+                // group. A name rule cannot express this — `Method` has a
+                // *payload* field called `w_class` (the class the bound
+                // function was found on) whose qualified name
+                // `"Method.w_class"` matches the header spelling exactly, and
+                // it sits ahead of the real header in the field list.
+                is_class_word: offset == pyre_object::pyobject::W_CLASS_OFFSET,
                 index_in_parent,
             },
         )
@@ -2051,6 +2073,7 @@ static PYFRAME_VABLE_TOKEN_FIELD_DESCR: LazyLock<Arc<dyn FieldDescr>> = LazyLock
         immutable: false,
         quasi_immutable: false,
         name: "vable_token",
+        is_class_word: false,
         index_in_parent: 0,
         parent_descr: None,
         ei_index: AtomicU32::new(u32::MAX),
@@ -2320,6 +2343,7 @@ fn array_lendescr_at_offset(offset: usize) -> DescrRef {
         immutable: false,
         quasi_immutable: false,
         name: "len",
+        is_class_word: false,
         index_in_parent: 0,
         parent_descr: None,
         ei_index: AtomicU32::new(u32::MAX),
@@ -2459,11 +2483,12 @@ use pyre_object::{FLOAT_TYPE, INT_TYPE};
 ///
 /// Mutable because __class__ assignment can change it.
 fn new_w_class_field_descr() -> Arc<dyn FieldDescr> {
-    // Named "w_class" so `FieldDescr::is_w_class()` recognises the
-    // header field; OptVirtualize must resolve it from the object's
-    // class identity rather than indexing it against a virtual's value
-    // fields (its `index_in_parent` of 0 would otherwise collide with
-    // the first value field, e.g. `W_IntObject.intval`).
+    // Declares itself the class word (`is_class_word`), which is what
+    // `FieldDescr::is_w_class()` reports; the name is for diagnostics only
+    // and no consumer reads it. OptVirtualize must resolve this field from
+    // the object's class identity rather than indexing it against a
+    // virtual's value fields (its `index_in_parent` of 0 would otherwise
+    // collide with the first value field, e.g. `W_IntObject.intval`).
     Arc::new(PyreFieldDescr {
         offset: pyre_object::pyobject::W_CLASS_OFFSET,
         // `WORD` on paper — the field is a `*mut PyObject`, so 4 bytes on
@@ -2481,6 +2506,7 @@ fn new_w_class_field_descr() -> Arc<dyn FieldDescr> {
         immutable: false,
         quasi_immutable: false,
         name: "w_class",
+        is_class_word: true,
         index_in_parent: 0,
         parent_descr: None,
         ei_index: AtomicU32::new(u32::MAX),
@@ -3605,6 +3631,12 @@ static PYCODE_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLoc
         is_quasi_immutable: false,
         flag,
         virtualizable: false,
+        // The group lists only the four read-only payload fields; the
+        // inherited `PyObject` header row is not among them, so none of them
+        // is the class word and `class_word_field` answers `None` for this
+        // layout. Testing `offset == W_CLASS_OFFSET` the way the object-group
+        // factory does would read as if the header could appear here.
+        is_class_word: false,
         index_in_parent: 0,
     };
     let mut specs = vec![
@@ -4452,6 +4484,11 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
         is_quasi_immutable: false,
         flag: ArrayFlag::Unsigned,
         virtualizable: false,
+        // `ExecutionContext` is not a `PyObject` layout; it carries no class
+        // word. Its offsets are `EC_*` and share no origin with
+        // `W_CLASS_OFFSET`, so matching on offset here would be a coincidence,
+        // not an invariant.
+        is_class_word: false,
         // Stamped below, once the specs are in offset order.
         index_in_parent: 0,
     };
@@ -4732,6 +4769,119 @@ mod tests {
                 .iter()
                 .any(|fd| fd.offset() == W_CLASS_OFFSET),
             "malloc_zero_filled=False requires the inherited PyObject.w_class edge"
+        );
+    }
+
+    /// Every layout's class word is the inherited `PyObject` header slot, and
+    /// both accessors must name that one field.
+    ///
+    /// `SimpleFieldDescr`'s legacy producer infers `is_w_class` from the field
+    /// name (`class_word_inferred_from_name`: `== "w_class"` or
+    /// `ends_with(".w_class")`), and
+    /// `build_object_descr_group_with_extra_gc_edges` qualifies every name
+    /// with the group's simple name.  So a group that declares a payload field
+    /// literally called `w_class` publishes *two* descrs reporting
+    /// `is_w_class()`, and both accessors take the first — which is the payload
+    /// field, at the wrong offset and the wrong slot.
+    ///
+    /// Both halves are asserted because the two accessors read different lists:
+    /// `class_word_field` answers a byte offset off `gc_fielddescrs`, and
+    /// `class_word_index_in_parent` a slot position off `all_fielddescrs`.
+    #[test]
+    fn every_groups_class_word_is_the_inherited_pyobject_header_slot() {
+        let groups: &[(&str, DescrRef)] = &[
+            ("Function", w_function_size_descr()),
+            ("Method", w_method_size_descr()),
+            ("W_ListObject", w_list_size_descr()),
+            ("W_ObjectObject", w_object_object_size_descr()),
+            ("W_IntObject", w_int_size_descr()),
+            ("W_BoolObject", w_bool_size_descr()),
+            ("W_RangeIterObject", w_range_iter_size_descr()),
+            ("W_RangeObject", w_range_size_descr()),
+            ("W_FloatObject", w_float_size_descr()),
+            ("W_LongObject", w_long_size_descr()),
+            ("W_TupleObject", w_tuple_size_descr()),
+            ("W_TupleIter", tuple_iter_size_descr()),
+            ("W_ZipObject", w_zip_size_descr()),
+            ("SpecialisedTupleII", specialised_tuple_ii_size_descr()),
+            ("SpecialisedTupleFF", specialised_tuple_ff_size_descr()),
+            ("SpecialisedTupleOO", specialised_tuple_oo_size_descr()),
+            ("PyTraceback", pytraceback_size_descr()),
+            ("W_SliceObject", w_slice_size_descr()),
+            ("PyFrame", pyframe_size_descr()),
+        ];
+
+        // Violations are accumulated rather than asserted in place: a test that
+        // stops at the first bad group reports which one comes *first*, not
+        // which ones are wrong, and the population is the finding here.
+        let mut violations: Vec<String> = Vec::new();
+        let mut positional_answers = 0usize;
+        for (label, descr) in groups {
+            let size = descr
+                .as_size_descr()
+                .unwrap_or_else(|| panic!("{label} must be a SizeDescr"));
+
+            // (a) the byte-offset answer names the header slot
+            if let Some(fd) = size.class_word_field()
+                && fd.offset() != W_CLASS_OFFSET
+            {
+                violations.push(format!(
+                    "{label}: class_word_field() -> `{}` at offset {} (want the \
+                     inherited PyObject header at {W_CLASS_OFFSET})",
+                    fd.field_name(),
+                    fd.offset(),
+                ));
+            }
+
+            // (b) the positional answer indexes that same field
+            if let Some(idx) = size.class_word_index_in_parent() {
+                positional_answers += 1;
+                match size.all_fielddescrs().get(idx) {
+                    None => violations.push(format!(
+                        "{label}: class_word_index_in_parent() = {idx} is out of \
+                         range for all_fielddescrs() (len {})",
+                        size.all_fielddescrs().len(),
+                    )),
+                    Some(fd) if fd.offset() != W_CLASS_OFFSET => violations.push(format!(
+                        "{label}: class_word_index_in_parent() = {idx} names \
+                             `{}` at offset {} (want the inherited PyObject \
+                             header at {W_CLASS_OFFSET})",
+                        fd.field_name(),
+                        fd.offset(),
+                    )),
+                    Some(_) => {}
+                }
+            }
+        }
+
+        // The accessor must not be able to degenerate to a constant `None`:
+        // that would silently disable OptVirtualize's class-word fold instead
+        // of correcting it, and every check above would still hold.
+        assert!(
+            positional_answers > 0,
+            "no group answered class_word_index_in_parent() — a fold that never \
+             fires is indistinguishable from a fold that is right"
+        );
+        // This held two `Method` exceptions until the host gained a declaration
+        // channel.  `Method` carries a payload field literally called `w_class`
+        // — the class the bound function was found on, which
+        // `method_w_class_descr` documents as "distinct from the inherited
+        // `PyObject.w_class` naming the Method's own type" — and the group
+        // factory qualifies it to `Method.w_class`, which the name fallback
+        // accepts on the `.w_class` suffix.  It precedes the header row, so
+        // `find()` stopped on it in both lists.
+        //
+        // Now `build_object_descr_group_with_extra_gc_edges` declares
+        // `is_class_word: offset == W_CLASS_OFFSET`, a layout invariant a name
+        // rule cannot express, and the exceptions retired.
+        assert!(
+            violations.is_empty(),
+            "{} of {} groups resolve a class word that is not the inherited \
+             PyObject header — a payload field is shadowing its layout's \
+             header row:\n  {}",
+            violations.len(),
+            groups.len(),
+            violations.join("\n  "),
         );
     }
 
@@ -5432,6 +5582,11 @@ fn simple_field_spec_from_bh(
         is_quasi_immutable: spec.is_quasi_immutable,
         flag: spec.field_flag,
         virtualizable: false,
+        // `BhFieldSpec` carries no class-word flag, so a declaration does not
+        // survive the blackhole round trip and the name is all that is left.
+        // Inherits the fallback's limitation: a `Method.w_class` payload
+        // rebuilt from a blackhole spec still reads as a class word.
+        is_class_word: majit_ir::descr::class_word_inferred_from_name(&spec.name),
         index_in_parent: spec.index_in_parent,
     }
 }

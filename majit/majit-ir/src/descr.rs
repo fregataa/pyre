@@ -19,7 +19,7 @@
 ///   `ExitPendingFieldLayout` (`majit-backend/src/lib.rs:549`) compare
 ///   descrs via `opt_descr_ptr_eq` for the same reason.
 /// * `ResolvedPendingFieldWrite` / `EncodedPendingFieldWrite`
-///   (`majit-metainterp/src/resume.rs:1496/1523`) and
+///   (`majit-metainterp/src/resume.rs`) and
 ///   `PendingFieldLayoutSummary` (`majit-ir/src/resumedata.rs:137`) use
 ///   the canonical `resumedata::opt_descr_arc_ptr_eq`.
 /// * `GuardPendingFieldEntry` (resoperation.rs:892) carries
@@ -58,6 +58,19 @@
 /// (parity: PyPy reaches the array descr via `gccache._cache_array`
 /// rather than relying on the InteriorFieldDescr backreference for
 /// identity).
+///
+/// Leaking is not the only thing a cycle costs: any *walk* over the
+/// descr graph must refuse the back-reference too.  `Debug` is such a
+/// walk, and with both ends derived it recursed until the stack ran
+/// out — `SimpleArrayDescr::fmt` → `OnceLock` → `Vec<DescrRef>` →
+/// `SimpleInteriorFieldDescr::fmt` → `SimpleArrayDescr::fmt` → … — for
+/// every `{:?}` that reached a struct-array descr, including
+/// `format_assembler`'s `EffectInfo` render.  `SimpleInteriorFieldDescr`
+/// therefore has a hand-written `Debug` that prints `array_descr` as an
+/// identity summary, matching `descr.py:420-421
+/// InteriorFieldDescr.repr_of_descr`, which never follows
+/// `self.arraydescr`.  A future reader added to this graph has to make
+/// the same choice at the same edge.
 ///
 /// **C (landed 2026-05-19).**  Trait-dispatch + structural keying
 /// migration for the virtualizable / virtualref field paths:
@@ -1947,6 +1960,16 @@ impl GcCache {
         clippy::too_many_arguments,
         reason = "The argument order is the stable JIT IR/descriptor or generated-interpreter ABI shape; grouping it into a Rust-only options object would obscure opcode-field correspondence and macro call-site parity"
     )]
+    /// The name-inferring entry point, for producers that have no spec to
+    /// declare on — chiefly the `BhDescr` path, which rebuilds a descr from a
+    /// serialized field name.  A producer that knows its own layout should
+    /// call [`Self::get_field_descr_declaring`] instead: a name rule cannot
+    /// separate a header row from a payload field a host happens to spell the
+    /// same way.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The argument order is the stable JIT IR/descriptor or generated-interpreter ABI shape; grouping it into a Rust-only options object would obscure opcode-field correspondence and macro call-site parity"
+    )]
     pub fn get_field_descr(
         &mut self,
         struct_key: LLType,
@@ -1961,6 +1984,45 @@ impl GcCache {
         index: u32,
         virtualizable: bool,
         index_in_parent: Option<usize>,
+    ) -> Arc<SimpleFieldDescr> {
+        self.get_field_descr_declaring(
+            struct_key,
+            field_name,
+            display_name,
+            offset,
+            field_size,
+            field_type,
+            is_immutable,
+            is_quasi_immutable,
+            flag,
+            index,
+            virtualizable,
+            index_in_parent,
+            None,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The argument order is the stable JIT IR/descriptor or generated-interpreter ABI shape; grouping it into a Rust-only options object would obscure opcode-field correspondence and macro call-site parity"
+    )]
+    pub fn get_field_descr_declaring(
+        &mut self,
+        struct_key: LLType,
+        field_name: &str,
+        display_name: Option<&str>,
+        offset: usize,
+        field_size: usize,
+        field_type: Type,
+        is_immutable: bool,
+        is_quasi_immutable: bool,
+        flag: ArrayFlag,
+        index: u32,
+        virtualizable: bool,
+        index_in_parent: Option<usize>,
+        // `Some` when the producer declares whether this field is the class
+        // word.  `None` falls back to the display name.
+        declared_class_word: Option<bool>,
     ) -> Arc<SimpleFieldDescr> {
         // descr.py:234-238: parent_descr = get_size_descr(gccache, STRUCT, vtable)
         let parent = self._cache_size.get(&struct_key).cloned();
@@ -2147,6 +2209,9 @@ impl GcCache {
             name,
             field_name.to_string(),
         );
+        if let Some(is_class_word) = declared_class_word {
+            fd = fd.with_class_word(is_class_word);
+        }
         fd.virtualizable = virtualizable;
         // descr.py:228: index_in_parent (from heaptracker).
         //
@@ -4425,6 +4490,77 @@ pub trait SizeDescr: Descr {
     fn gc_fielddescrs(&self) -> &[Arc<dyn FieldDescr>] {
         &[]
     }
+
+    /// The class word's slot position within `all_fielddescrs()`, or `None`
+    /// when this layout has no class word *in that list*.
+    ///
+    /// This is deliberately not answered from [`Self::class_word_field`]. That
+    /// accessor searches `gc_fielddescrs()` first, and
+    /// `with_extra_gc_fielddescr`
+    /// appends header edges that are **absent from `all_fielddescrs()` on
+    /// purpose** — its doc says "kept out of `all_fielddescrs` so the
+    /// positional indexing above is unaffected".  `index_in_parent` is defined
+    /// against `all_fielddescrs()`, so reading it off a gc-only edge yields a
+    /// slot number that indexes an unrelated field: pyre seeds every object
+    /// group's `gc_edges` with the shared header descr at `index_in_parent
+    /// == 0`, which lands on the first value field and forwards `Ref <- Int`.
+    ///
+    /// Byte-offset consumers want `class_word_field()`; positional ones want
+    /// this.  The two lists genuinely differ, so one accessor cannot serve
+    /// both.
+    fn class_word_index_in_parent(&self) -> Option<usize> {
+        self.all_fielddescrs()
+            .iter()
+            .find(|fd| fd.is_w_class())
+            .map(|fd| fd.index_in_parent())
+    }
+
+    /// The field slot of *this* layout that holds the class word, or `None`
+    /// when this layout has no class word at all.
+    ///
+    /// This is the transposition of `gc.py:33-37`, where a host that sets
+    /// `gcremovetypeptr` gets `fielddescr_vtable = None`: absence of the
+    /// header field is a property the layout *declares*, never one a consumer
+    /// infers from a lookup that missed.
+    ///
+    /// It is deliberately a per-`SizeDescr` question and not a per-host one.
+    /// Upstream's `fielddescr_vtable` answers "what descr do I store
+    /// through" for a single lltype at a fixed offset, and upstream excludes
+    /// `typeptr` from `all_fielddescrs` (`heaptracker.py:66`) so no field
+    /// list ever contains it.  Here the header descr *is* in the list, and
+    /// every consumer needs to know which slot of the struct in front of it
+    /// is the class word — a question one process-global descr cannot
+    /// answer.  Compounding that, pyre has two identity-stable `w_class`
+    /// descrs by construction (a parentless tracer singleton on the op side,
+    /// a per-layout `SimpleFieldDescr` on the allocation side), so consumers
+    /// that must establish the two describe the same bytes compare
+    /// `offset()`/`field_size()` and cannot compare identity.
+    ///
+    /// The default body finds the entry that *declares* itself the class
+    /// word (`FieldDescr::is_w_class`), so nothing here reads a field name.
+    /// A producer that already knows its header slot overrides this and skips
+    /// the scan.
+    ///
+    /// It searches `gc_fielddescrs()` before `all_fielddescrs()`.  The class
+    /// word is a GC pointer, so a real layout lists the *same* `Arc` in both
+    /// (`gc_fielddescrs` is documented as the `only_gc=True` filter of
+    /// `all_fielddescrs`) and the order cannot matter.  It matters only for a
+    /// descr that populates the two lists with different objects, and for
+    /// that case the GC list is the answer every byte-offset consumer here
+    /// was already using.
+    ///
+    /// It answers with the *first* declaring entry. A layout that publishes
+    /// two — pyre's `Method` declares a payload field named `w_class` beside
+    /// the inherited header, and the legacy name inference accepts both — gets
+    /// the earlier one, which is not the header.  Pinned by
+    /// `every_groups_class_word_is_the_inherited_pyobject_header_slot` in
+    /// `pyre-jit-trace`.
+    fn class_word_field(&self) -> Option<&Arc<dyn FieldDescr>> {
+        self.gc_fielddescrs()
+            .iter()
+            .chain(self.all_fielddescrs())
+            .find(|fd| fd.is_w_class())
+    }
 }
 
 /// Type-erased marker for `VirtualizableInfo`. Upstream parity:
@@ -4562,20 +4698,42 @@ pub trait FieldDescr: Descr {
             || name.ends_with(".ob_type")
     }
 
-    /// Pyre object-model: `PyObject.w_class` (offset 8) carries the
-    /// Python-level class identity, distinct from the `typeptr`/vtable
-    /// (offset 0). Like `typeptr`, it is a header field — not a value
-    /// field that may be indexed by `index_in_parent` against a
-    /// virtual's stored fields. Recognised by name so OptVirtualize can
-    /// resolve it from the object's class identity instead of colliding
-    /// with the first value field.
+    /// Whether this descr names the class word: the header slot carrying
+    /// Python-level class identity, distinct from the `typeptr`/vtable at
+    /// offset 0.  Like `typeptr` it is a *header* field, not a value field
+    /// that may be indexed by `index_in_parent` against a virtual's stored
+    /// fields, so consumers resolve it from the object's class identity
+    /// rather than colliding it with the first value field.
     ///
-    /// Handles both formats:
-    /// - `"w_class"` (pyre tracer w_class_descr)
-    /// - `"STRUCT.w_class"` (e.g. "PyObject.w_class")
+    /// **Declared, not inferred.**  A producer that mints a class-word descr
+    /// says so; nothing here reads the field's name.  `false` is the
+    /// upstream-orthodox default rather than a convenience: RPython's field
+    /// lists contain no header field at all (`heaptracker.py:66` drops
+    /// `typeptr` before any descr is built), so "this is an ordinary value
+    /// field" is what a list entry means unless its producer states
+    /// otherwise.
     fn is_w_class(&self) -> bool {
-        let name = self.field_name();
-        name == "w_class" || name.ends_with(".w_class")
+        false
+    }
+
+    /// Whether this descr names *any* header slot — the class word or the
+    /// `typeptr`/vtable.  Both are resolved from class identity and neither
+    /// resolves through the owner's value-field list, so the sites that must
+    /// skip header fields ask this rather than spelling the union.
+    ///
+    /// This is the right question only where the two header fields are
+    /// genuinely interchangeable.  It must not be substituted for
+    /// `is_w_class()` at a site that has already handled `typeptr`
+    /// separately: `virtualize.rs`'s GETFIELD fold resolves a `typeptr` from
+    /// `known_class` in an earlier arm and only *falls through* to the
+    /// class-word arm when that arm found no known class, so widening the
+    /// class-word test to the union there would route a typeptr read into the
+    /// `w_class` fold. `optimizeopt/mod.rs`'s `ensure_ptr_info_arg0` and
+    /// `info.rs`'s allocation-cover check are likewise about the class word
+    /// specifically. Widening any of the three by symmetry with the sites
+    /// below would be a behaviour change, not a de-duplication.
+    fn is_header_field(&self) -> bool {
+        self.is_typeptr() || self.is_w_class()
     }
 
     /// descr.py: sort_key() — for ordering field descriptors.
@@ -5268,6 +5426,16 @@ pub struct SimpleFieldDescr {
     /// FLAG_POINTER, FLAG_FLOAT, FLAG_SIGNED, FLAG_UNSIGNED, FLAG_STRUCT, FLAG_VOID.
     flag: ArrayFlag,
     virtualizable: bool,
+    /// Whether this field is the owning struct's class word — the declared
+    /// answer behind `FieldDescr::is_w_class()`.
+    ///
+    /// `new_with_name` seeds it from the `"STRUCT.fieldname"` the codewriter
+    /// supplies, which for this descr *is* the producer's declaration:
+    /// `descr.py:227` builds that name from the struct and field being
+    /// described, so a caller cannot pass a class-word name for a field that
+    /// is not one.  `with_class_word` overrides it for a producer that knows
+    /// its layout without going through the name.
+    is_class_word: bool,
     /// descr.py:158 FieldDescr.index — slot position within the
     /// parent struct's `all_fielddescrs`.
     pub index_in_parent: usize,
@@ -5289,6 +5457,23 @@ pub struct SimpleFieldDescr {
     pub vinfo: Option<Weak<dyn VinfoMarker>>,
 }
 
+/// Guess from a descr's display name whether it is a class word.
+///
+/// This is a fallback, not a layout rule. It cannot separate a header row from a
+/// payload field a host happens to spell the same way — pyre's `Method`
+/// carries both an inherited header and a payload field named `w_class`, and
+/// this returns `true` for both. Any producer that knows its own layout must
+/// declare instead, through `SimpleFieldDescrSpec::is_class_word` or
+/// `SimpleFieldDescr::with_class_word`.
+///
+/// It survives for one caller: the serialized-`BhDescr` path, which rebuilds a
+/// descr from a field name with no layout in reach. Consequently, a
+/// declaration does **not** survive a blackhole round trip — `BhFieldSpec`
+/// carries no flag, so a descr rebuilt from one falls back to this guess.
+pub fn class_word_inferred_from_name(name: &str) -> bool {
+    name == "w_class" || name.ends_with(".w_class")
+}
+
 impl Clone for SimpleFieldDescr {
     fn clone(&self) -> Self {
         SimpleFieldDescr {
@@ -5304,6 +5489,7 @@ impl Clone for SimpleFieldDescr {
             is_quasi_immutable: self.is_quasi_immutable,
             flag: self.flag,
             virtualizable: self.virtualizable,
+            is_class_word: self.is_class_word,
             index_in_parent: self.index_in_parent,
             parent_descr: RwLock::new(self.parent_descr.read().unwrap().clone()),
             vinfo: self.vinfo.clone(),
@@ -5375,6 +5561,9 @@ impl SimpleFieldDescr {
             is_quasi_immutable: false,
             flag,
             virtualizable: false,
+            // Unnamed: this constructor describes a field by geometry alone,
+            // and a producer with a header slot uses `with_class_word`.
+            is_class_word: false,
             index_in_parent: 0,
             parent_descr: RwLock::new(None),
             vinfo: None,
@@ -5399,6 +5588,7 @@ impl SimpleFieldDescr {
         field_key: String,
     ) -> Self {
         let field_key_start = field_key_start(&name, &field_key);
+        let is_class_word = class_word_inferred_from_name(&name);
         SimpleFieldDescr {
             index: AtomicU32::new(index),
             descr_index: AtomicI32::new(-1),
@@ -5412,6 +5602,7 @@ impl SimpleFieldDescr {
             is_quasi_immutable: false,
             flag,
             virtualizable: false,
+            is_class_word,
             index_in_parent: 0,
             parent_descr: RwLock::new(None),
             vinfo: None,
@@ -5424,6 +5615,15 @@ impl SimpleFieldDescr {
     /// `FieldDescr::is_quasi_immutable()` below.
     pub fn with_quasi_immutable(mut self, is_quasi_immutable: bool) -> Self {
         self.is_quasi_immutable = is_quasi_immutable;
+        self
+    }
+
+    /// Declare (or retract) that this field is the owning struct's class
+    /// word.  For a producer that knows its own layout and does not spell
+    /// the field's name in the `"STRUCT.fieldname"` form `new_with_name`
+    /// reads.
+    pub fn with_class_word(mut self, is_class_word: bool) -> Self {
+        self.is_class_word = is_class_word;
         self
     }
 
@@ -5522,6 +5722,10 @@ impl Descr for SimpleFieldDescr {
 }
 
 impl FieldDescr for SimpleFieldDescr {
+    fn is_w_class(&self) -> bool {
+        self.is_class_word
+    }
+
     fn offset(&self) -> usize {
         self.offset
     }
@@ -5838,6 +6042,14 @@ pub struct SimpleFieldDescrSpec {
     pub flag: ArrayFlag,
     pub virtualizable: bool,
     pub index_in_parent: usize,
+    /// Whether this field is the owning layout's class word.
+    ///
+    /// Declared by the producer, which knows its own layout.  majit-ir cannot
+    /// derive it: a host may spell a *payload* field with the same tail as its
+    /// header row (pyre's `Method` has both `Method.w_class` at the method's
+    /// own class and the inherited header), so any name rule either misses a
+    /// header or claims a payload.
+    pub is_class_word: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -5904,7 +6116,7 @@ pub fn make_simple_descr_group_keyed_with_headerless(
     let field_descrs: Vec<Arc<SimpleFieldDescr>> = field_specs
         .iter()
         .map(|spec| {
-            gc.get_field_descr(
+            gc.get_field_descr_declaring(
                 struct_key.clone(),
                 &spec.field_key,
                 Some(spec.name.as_str()),
@@ -5925,6 +6137,7 @@ pub fn make_simple_descr_group_keyed_with_headerless(
                 // bound is exact only for callers that hand the `Option` in
                 // themselves — the deserialized-`BhDescr::Field` path.
                 Some(spec.index_in_parent),
+                Some(spec.is_class_word),
             )
         })
         .collect();
@@ -5999,6 +6212,7 @@ fn make_simple_descr_group_inner(
                     is_quasi_immutable: spec.is_quasi_immutable,
                     flag: spec.flag,
                     virtualizable: spec.virtualizable,
+                    is_class_word: spec.is_class_word,
                     index_in_parent: spec.index_in_parent,
                     parent_descr: RwLock::new(Some(parent_descr.clone())),
                     vinfo: None,
@@ -6366,7 +6580,6 @@ impl ArrayDescr for SimpleArrayDescr {
 }
 
 /// Simple concrete InteriorFieldDescr.
-#[derive(Debug)]
 pub struct SimpleInteriorFieldDescr {
     /// per-trace analyzer slot id. Stored atomic so the analyzer's
     /// `cc.interiorfielddescrof` cache-or-mint can stamp on a
@@ -6394,6 +6607,39 @@ pub struct SimpleInteriorFieldDescr {
     /// `arraydescr`).  Kept for pyre's
     /// `ensure_ptr_info_arg0`-style dispatch paths.
     owner_size_descr: Option<std::sync::Arc<dyn SizeDescr>>,
+}
+
+/// Hand-written rather than derived: `array_descr` is the back half of
+/// the `SimpleArrayDescr.all_interiorfielddescrs` ↔
+/// `SimpleInteriorFieldDescr.array_descr` strong cycle recorded in the
+/// Arc cycle audit at the top of this module, so a derived `Debug`
+/// makes every `{:?}` of a struct-array descr non-terminating
+/// (`SimpleArrayDescr::fmt` → `OnceLock` → `Vec<DescrRef>` →
+/// `SimpleInteriorFieldDescr::fmt` → `SimpleArrayDescr::fmt` → …).
+/// `descr.py:420-421 InteriorFieldDescr.repr_of_descr` renders only
+/// `self.fielddescr.repr_of_descr()` and never follows
+/// `self.arraydescr`, so the back-reference prints as an identity
+/// summary here instead of being traversed.  The forward half stays
+/// derived — one broken edge makes every walk finite, and
+/// `all_interiorfielddescrs` is the half a reader actually wants.
+impl std::fmt::Debug for SimpleInteriorFieldDescr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SimpleInteriorFieldDescr")
+            .field("index", &self.index)
+            .field("descr_index", &self.descr_index)
+            .field("ei_index", &self.ei_index)
+            .field(
+                "array_descr",
+                &format_args!(
+                    "<ArrayDescr cache_key={}, type_id={}>",
+                    self.array_descr.cache_key(),
+                    self.array_descr.type_id()
+                ),
+            )
+            .field("field_descr", &self.field_descr)
+            .field("owner_size_descr", &self.owner_size_descr)
+            .finish()
+    }
 }
 
 impl Clone for SimpleInteriorFieldDescr {
@@ -6741,6 +6987,9 @@ pub fn make_vtable_field_descr() -> DescrRef {
                     is_quasi_immutable: false,
                     flag: ArrayFlag::Signed,
                     virtualizable: false,
+                    // `typeptr` is the other header field, not the class
+                    // word; `is_typeptr()` answers for it.
+                    is_class_word: false,
                     index_in_parent: 0,
                     parent_descr: RwLock::new(Some(parent_descr)),
                     vinfo: None,
@@ -7393,6 +7642,227 @@ mod register_keyed_size_authority_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A struct-array descr and its interior field descrs point at each
+    /// other (the "CYCLE, accepted" row of the Arc cycle audit at the top
+    /// of this module), so a `Debug` that follows both edges never
+    /// terminates.  Formatting either end must finish; a regression here
+    /// aborts the process with a stack overflow rather than failing an
+    /// assertion, which is precisely why the walk has to refuse the
+    /// back-reference.
+    #[test]
+    fn debug_of_a_struct_array_descr_terminates() {
+        let array = Arc::new(SimpleArrayDescr::with_flag(
+            0,
+            16,
+            8,
+            7,
+            Type::Int,
+            ArrayFlag::Struct,
+        ));
+        let field: Arc<dyn FieldDescr> = Arc::new(SimpleFieldDescr::new_with_name(
+            0,
+            0,
+            8,
+            Type::Int,
+            false,
+            ArrayFlag::Signed,
+            "Item.x".to_string(),
+            "x".to_string(),
+        ));
+        let interior: DescrRef = Arc::new(SimpleInteriorFieldDescr::new(
+            0,
+            array.clone() as Arc<dyn ArrayDescr>,
+            field,
+        ));
+        array.set_all_interiorfielddescrs(vec![interior.clone()]);
+
+        // Both entry points, because either can be the one a caller holds.
+        let from_array = format!("{array:?}");
+        let from_interior = format!("{interior:?}");
+
+        // The forward edge still renders the interior descr; only the
+        // back-reference is summarised.
+        assert!(from_array.contains("SimpleInteriorFieldDescr"));
+        assert!(from_interior.contains("<ArrayDescr cache_key=0, type_id=7>"));
+        // One level each way, not many: a walk that re-entered the cycle
+        // even a few times would repeat the array descr's own name.
+        assert_eq!(from_array.matches("SimpleArrayDescr").count(), 1);
+        assert_eq!(from_interior.matches("SimpleInteriorFieldDescr").count(), 1);
+    }
+
+    /// `class_word_field()` is the layout's own answer, and "this layout has
+    /// no class word" is a real answer rather than a lookup that missed —
+    /// the `fielddescr_vtable = None` case of `gc.py:33-37`.
+    ///
+    /// The list precedence is pinned because it is observable: a descr whose
+    /// two field lists hold different objects gets the GC-list one, which is
+    /// what every byte-offset consumer searched before this accessor existed.
+    /// The class-word answer is the descr's own, and `is_header_field()` is
+    /// strictly wider than it — `typeptr` is a header field that is *not* the
+    /// class word, which is why the three sites that resolve a typeptr
+    /// separately cannot use the union.
+    #[test]
+    fn a_field_descr_declares_whether_it_is_the_class_word() {
+        let named = |offset: usize, ty: Type, flag: ArrayFlag, name: &str| {
+            SimpleFieldDescr::new_with_name(
+                0,
+                offset,
+                8,
+                ty,
+                false,
+                flag,
+                name.to_string(),
+                name.to_string(),
+            )
+        };
+
+        let w = named(8, Type::Ref, ArrayFlag::Pointer, "PyObject.w_class");
+        assert!(w.is_w_class());
+        assert!(w.is_header_field());
+
+        let value = named(16, Type::Int, ArrayFlag::Signed, "W_IntObject.intval");
+        assert!(!value.is_w_class());
+        assert!(!value.is_header_field());
+
+        // Geometry-only construction describes a value field; a producer
+        // that has no name declares the slot explicitly instead.
+        let bare = SimpleFieldDescr::new(0, 8, 8, Type::Ref, false);
+        assert!(!bare.is_w_class());
+        assert!(bare.with_class_word(true).is_w_class());
+
+        // `typeptr` is the other header field: header, but not the class word.
+        let vtable_descr = make_vtable_field_descr();
+        let typeptr = vtable_descr.as_field_descr().expect("a FieldDescr");
+        assert!(typeptr.is_typeptr());
+        assert!(!typeptr.is_w_class());
+        assert!(typeptr.is_header_field());
+    }
+
+    /// A gc-only header edge must never answer a POSITIONAL question.
+    ///
+    /// pyre seeds every object group's `gc_edges` with the shared header
+    /// descr, which `with_extra_gc_fielddescr` keeps out of
+    /// `all_fielddescrs()` precisely so positional indexing is unaffected.
+    /// Reading `index_in_parent` off that edge yields 0, which indexes the
+    /// first *value* field — an `Int` where the caller expects a `Ref` — and
+    /// `OptVirtualize` then forwards `Ref <- Int`, tripping the `make_equal_to`
+    /// Box.type invariant across most of the synth suite.
+    #[test]
+    fn a_gc_only_header_edge_never_answers_the_positional_question() {
+        let spec = |name: &str, offset: usize, ty: Type, idx: usize| SimpleFieldDescrSpec {
+            index: 0,
+            field_key: name.to_string(),
+            name: name.to_string(),
+            offset,
+            field_size: 8,
+            field_type: ty,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            flag: ArrayFlag::from_field_type(ty),
+            virtualizable: false,
+            index_in_parent: idx,
+            // A value field; the class word here arrives as a gc-only edge.
+            is_class_word: false,
+        };
+        let header: Arc<dyn FieldDescr> = Arc::new(SimpleFieldDescr::new_with_name(
+            0,
+            8,
+            8,
+            Type::Ref,
+            false,
+            ArrayFlag::Pointer,
+            "w_class".to_string(),
+            "w_class".to_string(),
+        ));
+        assert!(header.is_w_class());
+
+        // A layout that declares no class word of its own, with the shared
+        // header pushed as a gc-only edge — the common pyre object group.
+        let group = make_simple_descr_group_keyed_with_headerless(
+            0,
+            32,
+            7,
+            0x0C1A_0001,
+            0,
+            true,
+            false,
+            &[spec("W_IntObject.intval", 16, Type::Int, 0)],
+            &[header],
+        );
+        let sd = group.size_descr.as_size_descr().expect("a SizeDescr");
+
+        // The byte-offset answer legitimately sees the gc-only edge...
+        assert_eq!(sd.class_word_field().map(|fd| fd.offset()), Some(8));
+        // ...but the positional answer must not, or it returns slot 0 and
+        // collides with `intval`.
+        assert_eq!(sd.class_word_index_in_parent(), None);
+    }
+
+    #[test]
+    fn class_word_field_is_absent_for_a_layout_without_one() {
+        #[derive(Debug)]
+        struct Layout {
+            all_fields: Vec<Arc<dyn FieldDescr>>,
+            gc_fields: Vec<Arc<dyn FieldDescr>>,
+        }
+        impl Descr for Layout {
+            fn as_size_descr(&self) -> Option<&dyn SizeDescr> {
+                Some(self)
+            }
+        }
+        impl SizeDescr for Layout {
+            fn size(&self) -> usize {
+                32
+            }
+            fn type_id(&self) -> u32 {
+                7
+            }
+            fn is_immutable(&self) -> bool {
+                false
+            }
+            fn all_fielddescrs(&self) -> &[Arc<dyn FieldDescr>] {
+                &self.all_fields
+            }
+            fn gc_fielddescrs(&self) -> &[Arc<dyn FieldDescr>] {
+                &self.gc_fields
+            }
+        }
+
+        let named = |offset: usize, name: &str| -> Arc<dyn FieldDescr> {
+            Arc::new(SimpleFieldDescr::new_with_name(
+                0,
+                offset,
+                8,
+                Type::Ref,
+                false,
+                ArrayFlag::Pointer,
+                name.to_string(),
+                name.to_string(),
+            ))
+        };
+
+        // A header-less layout: every field is a value field.
+        let headerless = Layout {
+            all_fields: vec![named(0, "Point.x"), named(8, "Point.y")],
+            gc_fields: vec![],
+        };
+        assert!(headerless.class_word_field().is_none());
+
+        // The GC list wins when the two lists disagree.
+        let split = Layout {
+            all_fields: vec![named(24, "PyObject.w_class")],
+            gc_fields: vec![named(8, "w_class")],
+        };
+        assert_eq!(split.class_word_field().map(|fd| fd.offset()), Some(8));
+
+        // Falling back to the all-list covers impls that populate only it.
+        let all_only = Layout {
+            all_fields: vec![named(8, "PyObject.w_class")],
+            gc_fields: vec![],
+        };
+        assert_eq!(all_only.class_word_field().map(|fd| fd.offset()), Some(8));
+    }
 
     #[test]
     fn strip_instantiation_suffix_drops_generic_args() {

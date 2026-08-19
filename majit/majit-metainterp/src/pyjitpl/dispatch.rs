@@ -66,6 +66,7 @@ fn field_spec_from_bh(
     majit_ir::descr::SimpleFieldDescrSpec {
         index: f.index,
         field_key: f.field_key().to_string(),
+        is_class_word: majit_ir::descr::class_word_inferred_from_name(&f.name),
         name: f.name.clone(),
         offset: f.offset,
         field_size: f.field_size,
@@ -240,6 +241,9 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                                 specs.push(majit_ir::descr::SimpleFieldDescrSpec {
                                     index: u32::MAX,
                                     field_key: name.clone(),
+                                    is_class_word: majit_ir::descr::class_word_inferred_from_name(
+                                        name,
+                                    ),
                                     name: name.clone(),
                                     offset: *offset,
                                     field_size: *field_size,
@@ -372,6 +376,7 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                         let spec = majit_ir::descr::SimpleFieldDescrSpec {
                             index: u32::MAX,
                             field_key: name.clone(),
+                            is_class_word: majit_ir::descr::class_word_inferred_from_name(name),
                             name: name.clone(),
                             offset: *offset,
                             field_size: *field_size,
@@ -542,6 +547,7 @@ pub fn residual_write_effect_info(
                 majit_ir::descr::SimpleFieldDescrSpec {
                     index: u32::MAX,
                     field_key: name.to_string(),
+                    is_class_word: majit_ir::descr::class_word_inferred_from_name(name),
                     name: name.to_string(),
                     offset,
                     // Same width rule as the `field_specs_from_layout` twin
@@ -7183,7 +7189,7 @@ where
                     //     return self.execute_varargs(rop.CALL_I,
                     //                                 allboxes, descr,
                     //                                 exc, pure)
-                    // pure ⇒ post-record fold via record_result_of_call_pure
+                    // Pure calls fold after recording via record_result_of_call_pure.
                     // (pyjitpl.py:1947-1949).  Only the plain branch carries
                     // pure: forces/release_gil/loopinvariant don't combine
                     // with elidable in upstream call.py:282-299 getcalldescr.
@@ -10286,8 +10292,8 @@ pub fn build_state_field_snapshot(
     // the virtualizable list: the virtualizable identity (stored at
     // `boxes[-1]` per `TraceCtx::init_virtualizable_boxes`) is moved
     // to the FRONT, then the rest follow in original order.  The
-    // resume reader (`resume.py:1404 consume_vable_info` ↔
-    // `resume.rs:6477`) reads the first entry as the virtualizable
+    // resume reader (`resume.py:1404 consume_vable_info` and
+    // `resume.rs::consume_vable_info`) reads the first entry as the virtualizable
     // pointer, so this reorder is load-bearing.
     // `opencoder.py:718-726 _list_of_boxes_virtualizable` /
     // `opencoder.py:712-717 _list_of_boxes` encode every list element
@@ -10310,7 +10316,7 @@ pub fn build_state_field_snapshot(
 /// reorder for the virtualizable box list.  `virtualizable_boxes[-1]` is the
 /// virtualizable identity (placed there by
 /// `TraceCtx::init_virtualizable_boxes`); the snapshot moves it to slot 0 so
-/// the resume reader's `consume_vable_info` (`resume.rs:6477`, mirroring
+/// the resume reader's `consume_vable_info` (in `resume.rs`, mirroring
 /// `resume.py:1404`) reads the identity first.  Each entry must carry
 /// `OpRef::ty()`; misshapen entries panic rather than silently shrink the
 /// snapshot relative to upstream.
