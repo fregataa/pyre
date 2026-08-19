@@ -2376,7 +2376,10 @@ fn value_id_end(inputargs: &[InputArg], ops: &[Op]) -> u32 {
 ///
 /// `TempVar` ids live in a reserved high strip and constants in their own
 /// namespace; neither indexes a value local, so both pass through unchanged.
-fn rebase_region_value_ids(bridge: &InlinedBridge, offset: u32) -> (InlinedBridge, u32) {
+fn rebase_region_value_ids(
+    bridge: &InlinedBridge,
+    offset: u32,
+) -> Result<(InlinedBridge, u32), BackendError> {
     use majit_ir::operand::Operand;
 
     let shift = |r: OpRef| -> OpRef {
@@ -2388,6 +2391,20 @@ fn rebase_region_value_ids(bridge: &InlinedBridge, offset: u32) -> (InlinedBridg
     };
 
     let width = value_id_end(&bridge.inputargs, &bridge.ops);
+    // `with_raw` keeps the variant, but the emitters classify by raw payload
+    // (`OpRef::raw_is_constant`), so an id shifted to or past the limit reads
+    // as a constant and its result is skipped. Decline instead: the merged
+    // stream is an optimization, and no renumbering is correct once the
+    // region's range no longer fits below the limit.
+    if offset
+        .checked_add(width)
+        .is_none_or(|end| end > OpRef::VALUE_ID_LIMIT)
+    {
+        return Err(BackendError::Unsupported(format!(
+            "wasm backend: inlined bridge value ids exceed the value-id space \
+             (offset {offset}, width {width})"
+        )));
+    }
     let inputargs: Vec<InputArg> = bridge
         .inputargs
         .iter()
@@ -2423,7 +2440,7 @@ fn rebase_region_value_ids(bridge: &InlinedBridge, offset: u32) -> (InlinedBridg
         }
     }
 
-    (
+    Ok((
         InlinedBridge {
             source_fail_index: bridge.source_fail_index,
             trace_id: bridge.trace_id,
@@ -2433,7 +2450,7 @@ fn rebase_region_value_ids(bridge: &InlinedBridge, offset: u32) -> (InlinedBridg
             constants: bridge.constants.clone(),
         },
         width,
-    )
+    ))
 }
 
 /// Build a wasm module from majit IR.
@@ -2486,7 +2503,7 @@ pub fn build_wasm_module(
         rebased_constants = constants.clone();
         let mut next_value_id = value_id_end(inputargs, ops);
         for bridge in inlined_bridges {
-            let (bridge, width) = rebase_region_value_ids(bridge, next_value_id);
+            let (bridge, width) = rebase_region_value_ids(bridge, next_value_id)?;
             // The pool is keyed by value position for a folded value with no
             // producing op, so rebasing the region's ids moved its reads off
             // its own entries. Replay that window at the offset, and drop a
@@ -2544,6 +2561,33 @@ pub fn build_wasm_module(
             return Err(BackendError::Unsupported(
                 "wasm backend: inlined bridge stream has an empty region".into(),
             ));
+        }
+        // A region can carry a CALL_ASSEMBLER this build has no arm for. The
+        // dedicated arm is selected by `ca.emit_ca`, which is decided when the
+        // OWNER is compiled, and it reads the callee's geometry out of
+        // `ca.targets`; a region merged in later brings its own callee. An op
+        // that misses that arm does not fail — it falls through to the ordinary
+        // residual-call arm, which lowers arg 0 as an
+        // `__indirect_function_table` slot, and a CALL_ASSEMBLER's arg 0 is the
+        // callee's first frame slot. That calls whatever the slot happens to
+        // index and returns its result as the callee's, which is a silent wrong
+        // answer rather than a trap. `wasm_unsupported_trace_reason` asks this
+        // question of every trace's own ops; the merged stream is the one place
+        // it is never re-asked, so ask it here.
+        for op in &bridge.ops {
+            if !op.opcode.is_call_assembler() {
+                continue;
+            }
+            let target = op
+                .getdescr()
+                .and_then(|descr| descr.as_call_descr().and_then(|d| d.call_target_token()));
+            if !ca.emit_ca || target.is_none_or(|token| !ca.targets.contains_key(&token)) {
+                return Err(BackendError::Unsupported(format!(
+                    "wasm backend: inlined bridge carries {:?}, which the owner \
+                     build has no CALL_ASSEMBLER arm for",
+                    op.opcode
+                )));
+            }
         }
         let source_guard = guards
             .get(bridge.source_fail_index as usize)
