@@ -719,7 +719,7 @@ jobs:
           done
         } >> "$GITHUB_STEP_SUMMARY"
     - name: Run wasm runtime codegen regression tests (Linux only)
-      # majit-backend-wasm/tests/codegen_test.rs holds two #[ignore]d runtime
+      # majit-backend-wasm/tests/codegen_test.rs holds six #[ignore]d runtime
       # integration tests that run a bench on both the dynasm and wasm backends
       # and compare, so they need the release pyre-dynasm + pyre-wasm-runner and
       # the wasm-host module. check.py has just built all three on Linux (it adds
@@ -727,11 +727,18 @@ jobs:
       # loads), so run the ignored tests against them here. The plain
       # `cargo test --all` job cannot: it never builds those artifacts.
       #
-      # Serialized: each test spawns a full pyre process on both backends, and
-      # the default one-thread-per-core fan-out ran them concurrently. Two runs
-      # then lost a runner with an empty stderr, in a different test each time.
+      # Left at the default fan-out. All six set PYRE_WASM_JIT_STATS, so they
+      # share one wasmtime `.cwasm` variant, and both hazards of that sharing
+      # are closed: check.py warms it, so the five that use the cache
+      # deserialize instead of each recompiling the ~14MB module (the sixth
+      # sets PYRE_WASM_NO_CACHE and never touches it), and the runner publishes
+      # the artifact by renaming a per-process temporary over it, so no run can
+      # truncate the file another has mapped. Writing it in place is what
+      # previously left a runner here exiting non-zero having written nothing
+      # at all, in a different test each time; run_runtime_program now names
+      # the signal when a child dies on one.
       if: runner.os == 'Linux'
-      run: cargo test -p majit-backend-wasm --test codegen_test -- --ignored --test-threads=1
+      run: cargo test -p majit-backend-wasm --test codegen_test -- --ignored
     - name: Run release-only dispatcher-graph acceptance test (Linux only)
       # `slow_generated_jitcodes_preserve_complete_dispatcher_graph` self-ignores
       # under `debug_assertions`, so the `cargo test --all` job never runs it: it
