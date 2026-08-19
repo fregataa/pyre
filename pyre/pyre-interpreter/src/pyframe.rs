@@ -3025,13 +3025,23 @@ impl PyFrame {
 
     #[inline]
     pub fn peek(&self) -> PyObjectRef {
-        locals_w!(self)[self.valuestackdepth - 1]
+        // The index is computed into a local first, as
+        // `pyframe.py:479-484 peekvalue_maybe_none` computes `index` before
+        // its subscript.  A subscript evaluates its receiver before its index
+        // expression, so spelling the arithmetic inside the brackets emits the
+        // `locals_cells_stack_w` read ahead of the subtraction's overflow
+        // check, and that check's branch then carries the array out of the
+        // block on a link — which `_check_no_vable_array` rejects.
+        let index = self.valuestackdepth - 1;
+        locals_w!(self)[index]
     }
 
     #[inline]
     #[allow(dead_code)]
     pub fn peek_at(&self, depth: usize) -> PyObjectRef {
-        locals_w!(self)[self.valuestackdepth - 1 - depth]
+        // Hoisted for the reason given on [`Self::peek`].
+        let index = self.valuestackdepth - 1 - depth;
+        locals_w!(self)[index]
     }
 
     /// Null the locals_cells_stack slots at and above `depth`, the
@@ -3143,7 +3153,8 @@ impl PyFrame {
         let mut idx = n;
         while idx > 0 {
             idx -= 1;
-            values_w[idx] = locals_w!(self)[base + idx];
+            let slot = base + idx;
+            values_w[idx] = locals_w!(self)[slot];
         }
         values_w
     }
@@ -4144,6 +4155,13 @@ impl PyFrame {
     /// silently dropped).  A function frame with no locals bound yet lazily
     /// allocates a fresh dict (pyframe.py:557 `self.space.newdict(instance=True)`)
     /// and caches it, so `locals() is locals()` holds.  Errors propagate.
+    ///
+    /// `@jit.unroll_safe` (`pyframe.py:572`) cancels `contains_loop` in the
+    /// policy (`codewriter/policy.rs look_inside_graph`), so the slot loop
+    /// below does not keep the codewriter out.  Without it the whole function
+    /// is one residual call, and the `f_locals` read behind it forces the
+    /// virtualizable for the length of that call.
+    #[majit_macros::unroll_safe]
     pub fn fast2locals(&mut self) -> Result<(), crate::PyError> {
         // `space.setitem_str` / `space.delitem` allocate one key per slot and
         // can collect.  RPython's GC transform keeps both the frame and its
