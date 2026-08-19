@@ -3616,9 +3616,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                 // the inlined-call push, which closed the gap.
                 // `synth/getframe_while_escaping_read_frame_identity` is the
                 // regression guard.
-                } else if writes_live_heap
-                    && odometer_unchanged
-                    && ctx.fbw_mode.inline_subwalk
+                } else if ctx.fbw_mode.inline_subwalk
                     && let Some(framestack) = build_multi_frame_miframe(
                         ctx,
                         resume_pc,
@@ -4148,7 +4146,7 @@ fn live_py_pc_from_snapshot<Sym: WalkSym>(
 /// Kept as a thin pass-through so the dispatcher call sites stay
 /// readable; collapses to direct `walker_*` once the dispatchers
 /// inline.
-fn maybe_record_inline_callee_last_instr<Sym: WalkSym>(
+pub(crate) fn maybe_record_inline_callee_last_instr<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     jit_pc: usize,
 ) {

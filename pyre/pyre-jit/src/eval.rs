@@ -3862,20 +3862,23 @@ fn build_gc() -> Box<MiniMarkGC> {
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
 
-    // `posix.DirEntry`: four inline GC edges (`w_name`/`w_path` and the cached
-    // `w_stat`/`w_lstat`, the latter two NULL until first requested).  Appended
-    // after the last unconditional vtable-bearing object (`W_GcStats`) so only
-    // the trailing bare-`with_gc_ptrs` ids (twister, leaf storage boxes) shift,
-    // and those carry no census alias.  `posix` is
-    // compiled out on wasm32, so this registration and its census aliases are
-    // gated to match — which is why it stays last among the rclass
-    // registrations: an unconditional type after it would take a different id
-    // on wasm32 than on a native target.
+    // Register `posix.DirEntry`'s four inline GC edges and
+    // `posix.ScandirIterator`'s entries-list edge. The entries in
+    // `SUBCLASS_RANGE_HIERARCHY` and `all_subclass_range_aliases` are
+    // native-only because `posix` is absent on wasm32; registering these after
+    // unconditional rclasses keeps their type IDs stable across targets.
     #[cfg(not(target_arch = "wasm32"))]
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
         <pyre_interpreter::module::posix::W_DirEntry
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    #[cfg(not(target_arch = "wasm32"))]
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::module::posix::W_ScandirIterator
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     // `_ssl` keeps rustls objects behind opaque native pointers.  Context and
@@ -4566,6 +4569,9 @@ fn walk_parked_exception_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 /// root at that thread's `unregister_mutator` while the holder stayed live.
 fn walk_immortal_store_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     walk_rbigint_parts_cache(visitor);
+    pyre_interpreter::module::_io::walk_autoflusher_roots(|slot| {
+        visit_pyobject_root(slot, visitor)
+    });
     sre_pattern_root_walker(visitor);
     w_globals_stamped_code_root_walker(visitor);
     mapdict_method_cache_root_walker(visitor);
@@ -4642,10 +4648,6 @@ fn register_thread_root_areas() {
         register(
             signal_handler_root_walker_area,
             pyre_interpreter::module::signal::interp_signal::capture_signal_handler_root_area(),
-        );
-        register(
-            autoflusher_root_walker_area,
-            pyre_interpreter::module::_io::capture_autoflusher_root_area(),
         );
         register(
             jit_callee_frame_root_walker_area,
@@ -5460,17 +5462,6 @@ unsafe fn signal_handler_root_walker_area(
             data,
             |slot| visit_pyobject_root(slot, visitor),
         );
-    }
-}
-
-unsafe fn autoflusher_root_walker_area(
-    data: *const (),
-    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
-) {
-    unsafe {
-        pyre_interpreter::module::_io::walk_autoflusher_roots_area(data, |slot| {
-            visit_pyobject_root(slot, visitor);
-        });
     }
 }
 
@@ -9137,44 +9128,40 @@ fn maybe_compile_and_run(
     if driver.has_runnable_compiled_loop(green_key) {
         return execute_assembler(frame, green_key, loop_header_pc, driver, info, env);
     }
-    // Pyre-local deviation: this short-circuit treats `DONT_TRACE_HERE` as a
-    // permanent never-trace blacklist and returns before the counter tick.
-    // Upstream `warmstate.py:485-495` uses the identically named flag to force
-    // a separate trace when no procedure token has been seen; the ported
-    // behavior exists in `warmstate.rs::should_start_dont_trace_here_trace`
-    // and `warmstate.rs::can_inline_callable`, but this eval-layer guard
-    // shadows it.
-    if driver
-        .meta_interp()
-        .warm_state_ref()
-        .is_dont_trace_here(green_key)
-    {
-        return None;
-    }
-    // warmstate.py:496-511: counter.tick → threshold reached → bound_reached
-    // TODO(parity): warmstate.py:473-496 funnels every back-edge through
-    // `maybe_compile_and_run`, which checks JC_TRACING, compiled-loop
-    // presence, DONT_TRACE_HERE, has_seen_a_procedure_token, and
-    // counter.tick in one linear sequence.  Pyre splits the checks
-    // across this function and `counter_tick_checked` (warmstate.rs:559).
-    // The flag-based DONT_TRACE_HERE path above duplicates part of the
-    // warmstate logic; verify that `counter_tick_checked` still covers
-    // the `has_seen_a_procedure_token` guard and the full `bound_reached`
-    // flow identically to warmstate.py:496-511.
-    if driver
+    // `WarmEnterState::maybe_compile_decision` is the port of warmstate.py's
+    // complete JitCell decision: token lookup, DONT_TRACE_HERE retry,
+    // dead-token cleanup, and counter tick. Keeping that policy in one symbol
+    // prevents the eval entry point from assigning different semantics to its
+    // flags.
+    //
+    // The decision alone, without the `cell.flags |= JC_TRACING` that
+    // warmstate.py:441 makes with it: upstream marks the cell in the same
+    // `bound_reached` that runs the trace, and pyre marks it there too —
+    // `MetaInterp::bound_reached` reaches the cell through
+    // `force_start_tracing_for_key`. Marking it here as well makes that call
+    // read this door's own mark and decline with `AlreadyTracing`, so the
+    // trace this door just decided on never starts and the counter it reset
+    // never re-arms the location.
+    match driver
         .meta_interp_mut()
         .warm_state_mut()
-        .counter_tick_checked(green_key)
+        .maybe_compile_decision(green_key)
     {
-        if driver
-            .meta_interp()
-            .is_tracing_key((frame.pycode as usize, loop_header_pc))
-        {
-            return None;
+        majit_metainterp::warmstate::HotResult::StartTracing => {
+            if driver
+                .meta_interp()
+                .is_tracing_key((frame.pycode as usize, loop_header_pc))
+            {
+                return None;
+            }
+            bound_reached(frame, green_key, loop_header_pc, driver, info, env)
         }
-        return bound_reached(frame, green_key, loop_header_pc, driver, info, env);
+        majit_metainterp::warmstate::HotResult::RunCompiled => {
+            execute_assembler(frame, green_key, loop_header_pc, driver, info, env)
+        }
+        majit_metainterp::warmstate::HotResult::NotHot
+        | majit_metainterp::warmstate::HotResult::AlreadyTracing => None,
     }
-    None
 }
 
 /// Panic-safe RAII pairing for `FailDescr::start_compiling` /

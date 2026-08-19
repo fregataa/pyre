@@ -87,6 +87,71 @@ fn drain_args(parser: &mut lexopt::Parser) -> Result<Vec<std::ffi::OsString>, le
     Ok(parser.raw_args()?.collect())
 }
 
+/// Remove the common space/tab prefix from the `-c` source's nonblank lines and
+/// empty its blank ones.
+///
+/// A line is what sits between two `\n`, so a `\r` is content like any other
+/// character: `"  \r"` holds something, narrows the margin to its two spaces
+/// and keeps its carriage return, where `"  "` alone is blank. That is a
+/// narrower notion of blank than `textwrap.dedent`'s, which empties every line
+/// `str.isspace()` answers for.
+fn dedent_command(source: &str) -> std::borrow::Cow<'_, str> {
+    fn split_newline(line: &str) -> (&str, &str) {
+        match line.strip_suffix('\n') {
+            Some(content) => (content, "\n"),
+            None => (line, ""),
+        }
+    }
+    fn is_blank(content: &str) -> bool {
+        content.bytes().all(|byte| matches!(byte, b' ' | b'\t'))
+    }
+
+    // The margin is the common leading run of spaces and tabs over the lines
+    // that hold something. A blank line never narrows it, and a run stops at
+    // the first character that is neither, so an indent built from any other
+    // character is not a margin at all.
+    let mut margin: Option<&str> = None;
+    for line in source.split_inclusive('\n') {
+        let (content, _) = split_newline(line);
+        if is_blank(content) {
+            continue;
+        }
+        let indent_len = content
+            .find(|c| !matches!(c, ' ' | '\t'))
+            .unwrap_or(content.len());
+        let indent = &content[..indent_len];
+        margin = Some(match margin {
+            None => indent,
+            Some(current) => {
+                let common_len = current
+                    .bytes()
+                    .zip(indent.bytes())
+                    .take_while(|(left, right)| left == right)
+                    .count();
+                &current[..common_len]
+            }
+        });
+    }
+
+    // No margin, no rewriting: a source with a line at column zero keeps its
+    // blank lines as they were written, rather than having them emptied on
+    // their own.
+    let margin = margin.unwrap_or("");
+    if margin.is_empty() {
+        return std::borrow::Cow::Borrowed(source);
+    }
+    let mut dedented = String::with_capacity(source.len());
+    for line in source.split_inclusive('\n') {
+        let (content, newline) = split_newline(line);
+        if !is_blank(content) {
+            // Every nonblank line contributed to `margin`, so it is a prefix.
+            dedented.push_str(&content[margin.len()..]);
+        }
+        dedented.push_str(newline);
+    }
+    std::borrow::Cow::Owned(dedented)
+}
+
 /// Emit the `preconfig_init_utf8_mode` fatal error for an invalid PYTHONUTF8 /
 /// `-X utf8` value and exit; the value is validated during pre-init config.
 fn fatal_utf8_config_error(detail: &str) -> ! {
@@ -655,7 +720,8 @@ fn real_main(binary_name: &str) {
             let mut argv = vec![std::ffi::OsString::from("-c")];
             argv.extend(args);
             importing::set_sys_argv(&argv);
-            run_source(&cmd, Mode::Exec, "<string>", no_site);
+            let cmd = dedent_command(&cmd);
+            run_source(cmd.as_ref(), Mode::Exec, "<string>", no_site);
             if inspect {
                 repl::run_repl(true, no_site);
             }
@@ -1971,7 +2037,104 @@ fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_heapsize, set_last_exec_ctx, setup_exec_context};
+    use super::{dedent_command, parse_heapsize, set_last_exec_ctx, setup_exec_context};
+
+    #[test]
+    fn command_dedent_removes_shared_space_prefix() {
+        let source = "\n    import sys\n    print(\"ok\")\n";
+        assert_eq!(
+            dedent_command(source).as_ref(),
+            "\nimport sys\nprint(\"ok\")\n"
+        );
+    }
+
+    #[test]
+    fn command_dedent_leaves_extra_indentation() {
+        let source = "  print(\"first\")\n    print(\"second\")\n";
+        assert_eq!(
+            dedent_command(source).as_ref(),
+            "print(\"first\")\n  print(\"second\")\n"
+        );
+    }
+
+    #[test]
+    fn command_dedent_treats_tabs_as_distinct_prefix_bytes() {
+        let source = "\tprint(\"first\")\n\tprint(\"second\")\n";
+        assert_eq!(
+            dedent_command(source).as_ref(),
+            "print(\"first\")\nprint(\"second\")\n"
+        );
+    }
+
+    #[test]
+    fn command_dedent_handles_one_line_without_leading_newline() {
+        assert_eq!(dedent_command("    print(\"B\")").as_ref(), "print(\"B\")");
+    }
+
+    #[test]
+    fn command_dedent_empties_whitespace_only_line_shallower_than_prefix() {
+        let source = "    print(\"first\")\n  \n    print(\"second\")\n";
+        assert_eq!(
+            dedent_command(source).as_ref(),
+            "print(\"first\")\n\nprint(\"second\")\n"
+        );
+    }
+
+    #[test]
+    fn command_dedent_empties_whitespace_only_line_deeper_than_prefix() {
+        let source = "    print(\"first\")\n        \n    print(\"second\")\n";
+        assert_eq!(
+            dedent_command(source).as_ref(),
+            "print(\"first\")\n\nprint(\"second\")\n"
+        );
+    }
+
+    #[test]
+    fn command_dedent_empties_whitespace_only_line_equal_to_prefix() {
+        let source = "    print(\"first\")\n    \n    print(\"second\")\n";
+        assert_eq!(
+            dedent_command(source).as_ref(),
+            "print(\"first\")\n\nprint(\"second\")\n"
+        );
+    }
+
+    #[test]
+    fn command_dedent_is_raw_text_and_stops_at_column_zero() {
+        let source = "    text = \"\"\"\n  inside\ninside\n\"\"\"\n";
+        assert!(matches!(
+            dedent_command(source),
+            std::borrow::Cow::Borrowed(value) if value == source
+        ));
+    }
+
+    #[test]
+    fn command_dedent_leaves_a_blank_line_alone_when_there_is_no_margin() {
+        let source = "x = \"\"\"a\n  \nb\"\"\"\n";
+        assert!(matches!(
+            dedent_command(source),
+            std::borrow::Cow::Borrowed(value) if value == source
+        ));
+    }
+
+    #[test]
+    fn command_dedent_counts_a_carriage_return_as_content() {
+        // Python tokenization normalizes the retained carriage return.
+        let source = "    a\r\n  \r\n    b\r\n";
+        assert_eq!(dedent_command(source).as_ref(), "  a\r\n\r\n  b\r\n");
+    }
+
+    #[test]
+    fn command_dedent_counts_whitespace_that_is_not_space_or_tab_as_content() {
+        // A form feed on its own line is content at column zero, which leaves
+        // no margin for anything to lose.
+        for content in ["\u{c}", "\u{b}", "\u{85}"] {
+            let source = format!("    a\n{content}\n    b\n");
+            assert!(
+                matches!(dedent_command(&source), std::borrow::Cow::Borrowed(value) if value == source),
+                "{content:?}"
+            );
+        }
+    }
 
     #[test]
     fn heapsize_suffixes_and_validation() {

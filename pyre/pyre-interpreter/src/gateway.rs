@@ -1807,18 +1807,36 @@ fn path_or_fd_w(
             }
             (Vec::new(), obj_slot, fd)
         } else {
-            // `type(path).__fspath__(path)` — the descriptor read off the type is
-            // unbound, so `path` is supplied as the sole argument.
-            let Some(fspath_fn) = crate::typedef::r#type(obj)
+            let Some(fspath_descr) = crate::typedef::r#type(obj)
                 .and_then(|pt| crate::baseobjspace::lookup_in_type(pt.as_ptr(), "__fspath__"))
             else {
                 return Err(reject(obj));
             };
             let fspath_slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(fspath_fn);
+            pyre_object::gc_roots::pin_root(fspath_descr);
+            let path_type =
+                crate::typedef::r#type(pyre_object::gc_roots::shadow_stack_get(obj_slot))
+                    .expect("a path argument has a type");
+            // PyPy's `interp_posix._fspath` binds `__fspath__` before calling
+            // it; a non-descriptor is its own bound value.
+            let fspath_fn = crate::baseobjspace::get(
+                pyre_object::gc_roots::shadow_stack_get(fspath_slot),
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                path_type.as_ptr(),
+            )?
+            .unwrap_or_else(|| pyre_object::gc_roots::shadow_stack_get(fspath_slot));
+            let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            // A `None` left on the type switches the protocol off the way
+            // `__hash__ = None` does, so the object is turned away as not
+            // path-like and named by its own type.  `_unwrap_path` instead
+            // calls what it found, which reports `NoneType` as not callable.
+            if pyre_object::is_none(fspath_fn) {
+                return Err(reject(obj));
+            }
+            pyre_object::gc_roots::shadow_stack_set(fspath_slot, fspath_fn);
             let result = crate::call::call_function_impl_result(
                 pyre_object::gc_roots::shadow_stack_get(fspath_slot),
-                &[pyre_object::gc_roots::shadow_stack_get(obj_slot)],
+                &[],
             )?;
             let result_slot = pyre_object::gc_roots::shadow_stack_len();
             pyre_object::gc_roots::pin_root(result);

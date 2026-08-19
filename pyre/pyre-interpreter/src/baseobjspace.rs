@@ -3045,20 +3045,18 @@ pub(crate) fn enumerate_reduce_method(args: &[PyObjectRef]) -> PyResult {
         let i64_index = pyre_object::functional::w_enumerate_get_index(self_);
         let raw = pyre_object::functional::w_enumerate_get_iter_or_list(self_);
         let w_iter = if raw.is_null() {
-            // Exhausted enumerate (`:294-295` set `w_iter_or_list` to
-            // null); substitute an empty seq-iter so the reduce stays
-            // round-trippable.
-            pyre_object::w_seq_iter_new(w_list_new(vec![]), 0)
+            // `W_Enumerate.descr_next` clears the source after exhaustion.
+            // An empty list iterator preserves that exhausted state and the
+            // concrete iterator type exposed by CPython's reduce protocol.
+            pyre_object::w_list_iter_new(w_list_new(vec![]))
         } else if pyre_object::is_list(raw) {
-            // List fast path (`:289-294`): `w_iter_or_list` is the source
-            // list itself and `index` is the cursor into it.  Materialise
-            // a seq-iterator positioned at the cursor so the reconstructed
-            // enumerate resumes from the right element rather than the
-            // list head.
+            // The exact-list constructor fast path stores the source list and
+            // uses `index` as its cursor. Materialise the corresponding list
+            // iterator at that cursor so unpickling resumes at the same item.
             let len = pyre_object::w_list_len(raw);
-            let it = pyre_object::w_seq_iter_new(raw, len);
+            let it = pyre_object::w_list_iter_new(raw);
             let pos = i64_index.clamp(0, len as i64);
-            pyre_object::w_seq_iter_set_index(it, pos);
+            pyre_object::w_list_iter_set_index(it, pos);
             it
         } else {
             raw
@@ -8451,10 +8449,14 @@ pub fn uint_w(obj: PyObjectRef) -> Result<u64, PyError> {
             "int too large to convert to unsigned int",
         ));
     }
-    // W_Root.uint_w → _typed_unwrap_error(space, "integer").
-    let tp_name = unsafe { (*(*obj).ob_type).name };
+    // W_Root.uint_w → _typed_unwrap_error(space, "integer"), whose body
+    // (baseobjspace.py:316-318) is `"expected %s, got %T object"`.  `%T`
+    // formats `space.type(w_obj).getname(space)`, the user-visible class —
+    // not the `ob_type` tag, which every instance of a Python-level class
+    // shares and which would name them all `object`.
     Err(PyError::type_error(format!(
-        "expected integer, got {tp_name} object"
+        "expected integer, got {} object",
+        object_functionstr_type_name(obj)
     )))
 }
 
@@ -8511,12 +8513,14 @@ pub fn c_ushort_w(obj: PyObjectRef) -> Result<u16, PyError> {
     Ok(value as u16)
 }
 
-/// pypy/interpreter/baseobjspace.py c_uid_t_w. Equivalent to c_uint_w,
-/// except -1 maps to UINT_MAX ((uid_t)-1) and values below -1 raise
-/// OverflowError rather than ValueError. `uint_w` does not run any
-/// __index__ conversion, so the `int_w` retry on the negative branch sees
-/// only the real int and is side-effect free.
+/// `baseobjspace.py:2110` c_uid_t_w. Equivalent to c_uint_w, except -1 maps to
+/// UINT_MAX ((uid_t)-1) and values below -1 raise OverflowError rather than
+/// ValueError. `posixmodule.c:823` applies the index protocol before the range
+/// checks, but reports the original object's type if conversion fails. A
+/// successful conversion happens once up front, so `c_uint_w` and the `int_w`
+/// retry see the same integer and the retry is side-effect free.
 pub fn c_uid_t_w(obj: PyObjectRef) -> Result<u32, PyError> {
+    let obj = space_index(obj).unwrap_or(obj);
     match c_uint_w(obj) {
         Ok(value) => Ok(value),
         Err(e) if e.kind == PyErrorKind::ValueError => {
@@ -14383,6 +14387,37 @@ pub fn ismapping_w(w_obj: PyObjectRef) -> bool {
         }
         lookup(w_obj, "__getitem__").is_some()
     }
+}
+
+/// Port of `ObjSpace.issequence_w` from PyPy's `baseobjspace`.
+/// The `is_dict` arm mirrors `ismapping_w`'s, for the same reason: the builtin
+/// mapping's flag may not be reachable through `typedef::r#type`, while a dict
+/// subclass carries the inherited flag.
+pub fn issequence_w(w_obj: PyObjectRef) -> bool {
+    unsafe {
+        if is_dict(w_obj) {
+            return false;
+        }
+        let w_type = crate::typedef::r#type(w_obj).map_or(std::ptr::null_mut(), |p| p.as_ptr());
+        let flag = pyre_object::typeobject::w_type_get_flag_map_or_seq(w_type);
+        if flag == b'M' {
+            return false;
+        }
+        if flag == b'S' {
+            return true;
+        }
+        lookup(w_obj, "__getitem__").is_some()
+    }
+}
+
+/// `PyMapping_Check`'s rule: the object's type defines `__getitem__`.
+///
+/// This deliberately does not use `ismapping_w` or `issequence_w`: both first
+/// consult `flag_map_or_seq`, which makes a list non-mapping and a dict
+/// non-sequence before their shared type-level `__getitem__` fallback.  The C
+/// API predicate is only that fallback, and ignores instance attributes.
+pub fn py_mapping_check(w_obj: PyObjectRef) -> bool {
+    unsafe { lookup(w_obj, "__getitem__").is_some() }
 }
 
 pub fn is_iterable(obj: PyObjectRef) -> bool {
