@@ -164,11 +164,16 @@ crate::py_module! {
                     store(name, *value as i64);
                 }
             }
-            // `interp_errno.py`'s "MacOSX specific errnos" block, plus the
-            // `EQFULL` the 3.14 surface adds.  `DefinedConstantInteger`
-            // drops each of these on a platform whose `errno.h` lacks it;
-            // the equivalent here is the target gate, since `libc` declares
-            // them for apple targets only.
+            // `interp_errno.py`'s "MacOSX specific errnos" block, plus
+            // `EQFULL`, which that list omits.  Nothing here writes a number
+            // down -- `libc` supplies each one, and `errno.EQFULL` read 106
+            // under 3.14.6 on darwin when that omission was checked.
+            // `extra_tests/snippets/errno_platform_names.py` asserts that
+            // every name in this block is exported and reaches `errorcode`,
+            // on the reference interpreter as well as on pyre.
+            // `DefinedConstantInteger` drops each of these on a platform whose
+            // `errno.h` lacks it; the equivalent here is the target gate,
+            // since `libc` declares them for apple targets only.
             #[cfg(target_vendor = "apple")]
             {
                 let apple_entries: &[(&str, i32)] = &[
