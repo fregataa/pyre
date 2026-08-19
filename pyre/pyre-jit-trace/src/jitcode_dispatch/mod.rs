@@ -5127,6 +5127,14 @@ pub fn bool_box_truth_reset() {
 pub(crate) enum ResidualDecline {
     ValueUnavailable,
     Symbolic,
+    /// A CANNOT-raise `CallPure*` the fold could not answer, because some
+    /// argbox is still symbolic.  Recording it and moving on IS the tracing
+    /// behaviour — an elidable call that cannot raise has neither an effect for
+    /// anything to apply later nor an exception to miss — so unlike the other
+    /// two this decline leaves no obligation behind.  An `EF_ELIDABLE_CAN_RAISE`
+    /// callee wears the same opcode but is declined as `Symbolic`, because the
+    /// raise it may owe is an observable a no-replay walk-end road would drop.
+    PureUnfolded,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -7326,7 +7334,7 @@ fn direct_call_release_gil<Sym: WalkSym>(
     let resid_raised = match resid_exec {
         ResidualExecOutcome::Executed(result) => result.is_err(),
         ResidualExecOutcome::Declined(cause) => {
-            fbw_abort_nested_unjournaled_residual(ctx, pc)?;
+            fbw_abort_nested_unjournaled_residual(ctx, pc, Some(cause))?;
             fbw_mark_unjournaled_effect(cause);
             false
         }
