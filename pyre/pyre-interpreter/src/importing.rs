@@ -21,6 +21,14 @@ use std::sync::{
 // stay in scope unconditionally.
 #[cfg(feature = "host_env")]
 use std::path::Path;
+// `normalize_lexically` walks a path a component at a time to collapse `.`
+// and `..`; it is reached only from the executable-discovery arm.
+#[cfg(all(
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+))]
+use std::path::Component;
 
 use crate::PyExecutionContext;
 use crate::{CodeObject, Mode, PyFrame, compile_source_with_filename};
@@ -2028,11 +2036,90 @@ fn exists_and_is_executable(path: &Path) -> bool {
     not(target_arch = "wasm32")
 ))]
 fn absolute_from(path: PathBuf, cwd: &Path) -> PathBuf {
-    if path.is_absolute() {
+    let joined = if path.is_absolute() {
         path
     } else {
         cwd.join(path)
+    };
+    normalize_lexically(&joined)
+}
+
+/// Collapse `.` and `..` without touching the filesystem, the second half of
+/// `posixpath.abspath` (`normpath(join(cwd, path))`).  `Path::join` alone
+/// leaves the spelling the caller typed, so invoking `./venv/bin/pyre` would
+/// carry the `.` into `sys.executable` and every prefix derived from it —
+/// `site.py` then reports the venv prefix as unexpected because it compares
+/// that string against the directory it found itself in.
+///
+/// Symlinks stay unresolved on purpose: `find_invoked_executable` needs the
+/// venv spelling, and a lexical walk cannot follow a link anyway.  That is the
+/// same division `initpath.py` draws between `abspath` and `resolvedirof`.
+#[cfg(all(
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+))]
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                // Only a normal segment can be cancelled.
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                // `/..` is `/`: nothing sits above a root, so the component
+                // names nothing and is dropped rather than kept
+                // (`rpath.py:53-57`, and `:142` for the drive-rooted spelling).
+                Some(Component::RootDir) => {}
+                // A relative path may open with `..`, `../..` keeps both, and
+                // a drive-relative `C:..` keeps its own: popping a prefix
+                // would rewrite which volume the path names.
+                _ => out.push(component),
+            },
+            other => out.push(other),
+        }
     }
+    if out.as_os_str().is_empty() {
+        out.push(Component::CurDir);
+    }
+    restore_double_root(path, out)
+}
+
+/// A path opening with exactly two slashes is reserved for the host to
+/// interpret, so `//host/bin` keeps both while `///x` collapses to one
+/// (`rpath.py:43-47`).  `Path::components` yields a single `RootDir` either
+/// way, so the distinction has to be read off the original spelling and put
+/// back afterwards.
+#[cfg(all(
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32"),
+    unix
+))]
+fn restore_double_root(original: &Path, normalized: PathBuf) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = original.as_os_str().as_bytes();
+    if !bytes.starts_with(b"//") || bytes.starts_with(b"///") {
+        return normalized;
+    }
+    let mut doubled = std::ffi::OsString::from("/");
+    doubled.push(normalized.as_os_str());
+    PathBuf::from(doubled)
+}
+
+/// Windows carries its own leading separators in `Component::Prefix`, which
+/// `Path::push` spells back out, so nothing is left to restore.
+#[cfg(all(
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32"),
+    not(unix)
+))]
+fn restore_double_root(_original: &Path, normalized: PathBuf) -> PathBuf {
+    normalized
 }
 
 /// Return the executable spelling used to invoke pyre, made absolute without
