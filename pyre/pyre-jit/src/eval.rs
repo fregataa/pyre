@@ -4942,10 +4942,9 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // source-level one upstream and rides in the jitcode; this codewriter
     // unrolls the bytecode, so the same store would need one int pool
     // constant per instruction. The blackhole publishes it at the `-live-`
-    // marker instead.
-    majit_metainterp::blackhole::register_live_marker_hook(
-        pyre_jit_trace::state::publish_last_instr_at_live_marker,
-    );
+    // marker instead, and clears the Ref registers the marker leaves out —
+    // the marker is the one program point that names the live set.
+    majit_metainterp::blackhole::register_live_marker_hook(pyre_jit_trace::state::on_live_marker);
     // warmspot.py:1039 handle_jitexception_from_blackhole parity:
     // portal_runner is called when ContinueRunningNormally is raised
     // at a recursive portal level during blackhole execution.
@@ -9565,8 +9564,13 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
     novable: bool,
 ) -> crate::call_jit::BlackholeResult {
     // Same deadframe rooting as `handle_fail`: `decode_ref`'s TAGBOX arm reads
-    // these slots after the resume construction has already allocated.
-    let _deadframe_roots = unsafe {
+    // these slots after the resume construction has already allocated.  The
+    // scope is handed to `blackhole_resume_via_rd_numb` below rather than held
+    // here: that call runs the resumed frame forward to completion, and a slot
+    // still registered pins whatever object the guard left in it for the whole
+    // run.  `blackhole.py:1782-1796 resume_in_blackhole` ends `deadframe`'s
+    // live range at `_prepare_resume_from_failure`, before `_run_forever`.
+    let deadframe_roots = unsafe {
         majit_metainterp::resume::DeadFrameRefRoots::enter(raw_values, |index| {
             exit_layout.exit_types.get(index) == Some(&majit_ir::Type::Ref)
                 || exit_layout.gc_ref_slots.contains(&index)
@@ -9617,6 +9621,7 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
             guard_exc,
             novable,
             all_virtuals,
+            Some(deadframe_roots),
         );
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
