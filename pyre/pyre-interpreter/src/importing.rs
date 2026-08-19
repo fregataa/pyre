@@ -413,6 +413,17 @@ static SYS_MODULES: LazyLock<Mutex<HashMap<String, usize>>> =
 static MODULE_DICT_ROOTS: LazyLock<Mutex<std::collections::HashSet<usize>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 static SYS_MODULES_DICT: AtomicUsize = AtomicUsize::new(0);
+/// `baseobjspace.py:730` — `self.w_default_importlib_import =
+/// frozen_importlib.w_import`: the interp-level `__import__` gateway, held on
+/// the object space rather than read back out of a namespace, so a later
+/// `builtins.__import__` rebind cannot reach the importer `_handle_fromlist`
+/// is handed.  `moduledef.py:78-87 startup` puts the same object in builtins,
+/// so this cell is filled where that copy is made.
+///
+/// The wrapper is allocated in the movable nursery like any other function
+/// object, so this raw copy is forwarded by `walk_process_import_roots` for
+/// the reason `SYS_MODULES_DICT` is.
+static DEFAULT_IMPORTLIB_IMPORT: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "host_env")]
 static SYS_PATH: LazyLock<Mutex<Vec<PathBuf>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 /// The directory prepended to `sys.path` at startup (`config->sys_path_0`):
@@ -2847,6 +2858,29 @@ unsafe fn walk_bound_module_dicts(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
     }
 }
 
+/// `baseobjspace.py:730` — record the interp-level `__import__` as the space's
+/// default importer.  Called where `builtins.__import__` is bound, which is
+/// what `moduledef.py:87 startup` copies from.
+///
+/// The space captures one importer while it is being set up, so a namespace
+/// built after that keeps the first one: `install_default_builtins` also runs
+/// for a fresh builtins dict, and the module that dict belongs to is not the
+/// one every frame resolves `__import__` through.
+pub fn set_default_importlib_import(w_import: PyObjectRef) {
+    let _ = DEFAULT_IMPORTLIB_IMPORT.compare_exchange(
+        0,
+        w_import as usize,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+}
+
+/// `space.w_default_importlib_import`, or `None` before builtins is bound.
+fn default_importlib_import() -> Option<PyObjectRef> {
+    let w_import = DEFAULT_IMPORTLIB_IMPORT.load(Ordering::Acquire) as PyObjectRef;
+    (!w_import.is_null()).then_some(w_import)
+}
+
 /// Forward the `sys.modules` dict pointer cached in `SYS_MODULES_DICT`.
 ///
 /// The same dict object is also reachable as `sys.__dict__["modules"]`
@@ -2903,6 +2937,11 @@ pub(crate) unsafe fn walk_process_import_roots(visitor: &mut dyn FnMut(&mut PyOb
     if !dict.is_null() {
         visitor(&mut dict);
         SYS_MODULES_DICT.store(dict as usize, Ordering::Release);
+    }
+    let mut w_import = DEFAULT_IMPORTLIB_IMPORT.load(Ordering::Acquire) as PyObjectRef;
+    if !w_import.is_null() {
+        visitor(&mut w_import);
+        DEFAULT_IMPORTLIB_IMPORT.store(w_import as usize, Ordering::Release);
     }
 }
 
@@ -4550,6 +4589,85 @@ fn strip_bootstrap_traceback_frames(mut err: crate::PyError) -> crate::PyError {
     err
 }
 
+/// Native counterpart of RPython `str.find(char, start) -> Signed`.
+///
+/// `interp_import.py:76 interp___import__` reads `name.find(".")` as a Signed
+/// with `-1` for "no dot".  Rust's `str::find` returns `Option<usize>` and
+/// takes no start, so the interpreter carries this exact compatibility
+/// function and the translator emits the orthodox RPython string method
+/// instead of tracing this body.  The only caller passes `0`, and an ASCII
+/// dot is always a UTF-8 boundary.
+fn rpython_str_find_char(value: &str, needle: char, start: i64) -> i64 {
+    let Ok(start) = usize::try_from(start) else {
+        return -1;
+    };
+    value
+        .get(start..)
+        .and_then(|tail| tail.find(needle))
+        .and_then(|offset| i64::try_from(start + offset).ok())
+        .unwrap_or(-1)
+}
+
+/// Native counterpart of RPython `s[:stop]`.
+///
+/// `interp_import.py:79` slices the dotted name as `name[:dotindex]`.  The
+/// caller has just proved that `stop` is a non-negative byte index returned by
+/// `rpython_str_find_char`, so translation replaces this exact helper with the
+/// existing post-annotation `getslice(s, 0, stop)` marker.
+fn rpython_str_slice_prefix(value: &str, stop: i64) -> &str {
+    &value[..usize::try_from(stop).expect("find returned a non-negative index")]
+}
+
+/// `interp_import.py:85-90` — hand a cached package's fromlist to importlib.
+///
+/// `space.call_method(w_importlib, "_handle_fromlist", w_mod, w_fromlist,
+/// space.w_default_importlib_import)`.  `_handle_fromlist` imports whichever
+/// names the list adds, so the package case needs no `sys.meta_path` walk of
+/// its own.  Answers `None` while the bootstrap is not installed, which leaves
+/// the caller on the slow path.
+fn handle_fromlist_fast(
+    w_mod: PyObjectRef,
+    w_fromlist: PyObjectRef,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    let _roots = push_roots();
+    let mod_slot = shadow_stack_len();
+    pin_root(w_mod);
+    let fromlist_slot = shadow_stack_len();
+    pin_root(w_fromlist);
+    let Some(w_bootstrap) = get_sys_module("importlib._bootstrap") else {
+        return Ok(None);
+    };
+    let bootstrap_slot = shadow_stack_len();
+    pin_root(w_bootstrap);
+    let Some(w_handle) =
+        crate::baseobjspace::findattr_result(shadow_stack_get(bootstrap_slot), "_handle_fromlist")?
+    else {
+        return Ok(None);
+    };
+    let handle_slot = shadow_stack_len();
+    pin_root(w_handle);
+    // `space.w_default_importlib_import` is the importer `_handle_fromlist`
+    // calls for a name the package does not already carry.  It is the space's
+    // own captured copy, so rebinding `builtins.__import__` or
+    // `_bootstrap.__import__` cannot redirect it.
+    let Some(w_import) = default_importlib_import() else {
+        return Ok(None);
+    };
+    let import_slot = shadow_stack_len();
+    pin_root(w_import);
+    crate::call::call_function_impl_result(
+        shadow_stack_get(handle_slot),
+        &[
+            shadow_stack_get(mod_slot),
+            shadow_stack_get(fromlist_slot),
+            shadow_stack_get(import_slot),
+        ],
+    )
+    .map(Some)
+}
+
 /// `builtins.__import__` — `interp___import__`: a fast path answering
 /// absolute imports from initialised `sys.modules` entries, the app-level
 /// `_bootstrap.__import__` (the full `sys.meta_path` / `sys.path_hooks`
@@ -4591,29 +4709,35 @@ pub fn dunder_import(
     });
 
     if level == 0 {
-        // Fast path only for absolute imports (interp_import.py).
-        // A package with a fromlist needs `_handle_fromlist`, which the
-        // slow path runs.
+        // `interp_import.py:66-92` — the fast path is only for absolute
+        // imports.  A fromlist is answered from the cache when the module is
+        // not a package; a package hands its list to `_handle_fromlist`, which
+        // imports whatever the list adds.  No import lock is taken here:
+        // `interp_import.py:19` records that CPython's fast path does not
+        // take one either.
         let have_fromlist =
             !fromlist_missing && crate::baseobjspace::is_true(shadow_stack_get(fromlist_slot))?;
         if let Some(w_mod) = gcd_import_fast(name)? {
             let mod_slot = shadow_stack_len();
             pin_root(w_mod);
             if !have_fromlist {
-                match name.find('.') {
-                    None => return Ok(shadow_stack_get(mod_slot)),
-                    Some(dot) => {
-                        // `import a.b` returns `a`; give up when the
-                        // top-level ancestor is not initialised yet.
-                        if let Some(w_top) = gcd_import_fast(&name[..dot])? {
-                            return Ok(w_top);
-                        }
-                    }
+                let dotindex = rpython_str_find_char(name, '.', 0);
+                if dotindex < 0 {
+                    return Ok(shadow_stack_get(mod_slot));
+                }
+                // `import a.b` answers `a`; give up when the top-level
+                // ancestor is not initialised yet.
+                if let Some(w_top) = gcd_import_fast(rpython_str_slice_prefix(name, dotindex))? {
+                    return Ok(w_top);
                 }
             } else if crate::baseobjspace::findattr_result(shadow_stack_get(mod_slot), "__path__")?
                 .is_none()
             {
                 return Ok(shadow_stack_get(mod_slot));
+            } else if let Some(w_handled) =
+                handle_fromlist_fast(shadow_stack_get(mod_slot), shadow_stack_get(fromlist_slot))?
+            {
+                return Ok(w_handled);
             }
         }
     }
@@ -5759,5 +5883,14 @@ mod tests {
         assert!(src.contains("def compile"));
         assert!(vfs.read_to_string(&mount.join("re/_nope.py")).is_err());
         assert!(!vfs.is_file(&mount.join("re/_nope.py")));
+    }
+
+    #[test]
+    fn signed_string_find_matches_the_rpython_operation() {
+        assert_eq!(rpython_str_find_char("pkg.child.leaf", '.', 0), 3);
+        assert_eq!(rpython_str_find_char("pkg.child.leaf", '.', 4), 9);
+        assert_eq!(rpython_str_find_char("pkg.child.leaf", '.', 10), -1);
+        assert_eq!(rpython_str_find_char("plain", '.', 0), -1);
+        assert_eq!(rpython_str_slice_prefix("pkg.child", 3), "pkg");
     }
 }
