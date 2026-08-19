@@ -265,14 +265,32 @@ pub fn struct_tid_is_unresolved(serialized_cache_key: u64, resolved_tid: u32) ->
     serialized_cache_key > u32::MAX as u64 && resolved_tid == serialized_cache_key as u32
 }
 
+/// Descriptor-cache identity for a named low-level struct.
+///
+/// RPython treats `GcStruct(T)` and raw `Struct(T)` as distinct lltypes even
+/// when their fields are identical. Runtime `#[jit_interp]` lowering uses the
+/// same two-step hash, so build-time graph descriptors must include the raw
+/// discriminator as well.
+pub fn path_hash_for_gc_kind(s: &str, is_gc_managed: bool) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut hasher);
+    if !is_gc_managed {
+        "raw".hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 /// `path_hash` sibling that drops the leading `<crate>::` segment from
 /// `module_path` before hashing.  PyPy/RPython has no notion of a crate
 /// boundary — `lltype.Struct` identity is keyed on the Python module
-/// path alone (`descr.py:105 cache[STRUCT]`).  Pyre's `module_path!()`
-/// macro produces the full `crate::module::sub::...` form, whereas the
-/// analyzer-side `module_path_from_source_file` (and the hard-coded
-/// `build_object_descr_group_with_def_path` def-paths) strip the crate
-/// segment.  Stripping the crate here aligns the macro-emitted
+/// path alone (`descr.py:105 cache[STRUCT]`).  A consumer's
+/// `module_path!()` macro produces the full `crate::module::sub::...`
+/// form, whereas the analyzer-side
+/// `majit_translate::module_path::module_path_from_source_file` (and the
+/// hard-coded `build_object_descr_group_with_def_path` def-paths) strip
+/// the crate segment.  Stripping the crate here aligns the macro-emitted
 /// `__majit_type_id()` with both, giving a single `path_hash` namespace
 /// across analyzer / hard-coded runtime publish / generic `#[jit_struct]`
 /// runtime publish.
@@ -2481,6 +2499,43 @@ impl GcCache {
                 // `W_BASE_EXCEPTION_DESCR_CACHE` are not — they arrive after,
                 // and a one-sided rule would reject their vtable exactly the
                 // way the other order loses it.
+                // The header shape outranks both. A cached headerless descr
+                // says this key's objects carry no type-id word ahead of the
+                // payload, and a producer that does not model that would
+                // clear the bit by arriving second. It must not: the type
+                // guard is emitted for a gc-managed descr that is NOT
+                // headerless, and it loads the word at `ref - 8` — the word a
+                // headerless object does not have, so the read lands in
+                // whatever precedes it. Losing a field or a vtable makes the
+                // descr less complete; losing this bit makes it wrong, so the
+                // bit is carried forward whatever else the incoming spec has
+                // to offer.
+                //
+                // The reverse direction is deliberately not symmetric: a
+                // headerless spec arriving over a headered one still has to
+                // win on its own merits below, because a genuinely headered
+                // struct must not be talked out of its header either.
+                let existing_headerless =
+                    existing.as_size_descr().is_some_and(SizeDescr::headerless);
+                let new_headerless = descr.as_size_descr().is_some_and(SizeDescr::headerless);
+                if existing_headerless && !new_headerless {
+                    return;
+                }
+                // Two producers reporting different gc-kinds for one key are
+                // not describing one type. Upstream cannot express this at
+                // all — `descr.py:105-127 get_size_descr` mints once per
+                // STRUCT and `lltype.py:418 _gckind` is a property of that
+                // STRUCT — so the disagreement means the key is being shared
+                // by two low-level types and every field descr under it is
+                // already ambiguous.
+                assert_eq!(
+                    existing
+                        .as_size_descr()
+                        .is_some_and(SizeDescr::is_gc_managed),
+                    descr.as_size_descr().is_some_and(SizeDescr::is_gc_managed),
+                    "two producers disagree about the gc-kind of {key:?}; \
+                     one key cannot name both a gc-managed and a raw struct",
+                );
                 match (existing_vtable != 0, new_vtable != 0) {
                     (true, false) => false,
                     (false, true) => true,
