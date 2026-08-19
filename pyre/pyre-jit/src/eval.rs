@@ -1904,15 +1904,19 @@ fn build_gc() -> Box<MiniMarkGC> {
     // `BUILTIN_FUNCTION_TYPE` is a separate static `PyType` for module-level
     // builtins (`pypy/interpreter/function.py:706 BuiltinFunction`) but its
     // instances are the same Rust struct, so the vtable map sends
-    // both PyTypes to `function_tid`. No `.with_destructor_fn`: a mortal
-    // function's `name` box is reclaimed by its own tid's drop glue (off-GC
-    // storage); a holder destructor would double-free a box swept before
-    // its owner.
-    let function_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-        std::mem::size_of::<pyre_interpreter::function::Function>(),
-        object_tid,
-        pyre_interpreter::function::FUNCTION_GC_PTR_OFFSETS.to_vec(),
-    ));
+    // both PyTypes to `function_tid`. The destructor reclaims only the inline
+    // `mutate_<name>` slots (`function.py:34-42 _immutable_fields_`), which the
+    // function owns outright: a mortal function's `name` box is reclaimed by
+    // its own tid's drop glue (off-GC storage), and reaching it from here would
+    // double-free a box swept before its owner.
+    let function_tid = gc.register_type(
+        TypeInfo::object_subclass_with_gc_ptrs(
+            std::mem::size_of::<pyre_interpreter::function::Function>(),
+            object_tid,
+            pyre_interpreter::function::FUNCTION_GC_PTR_OFFSETS.to_vec(),
+        )
+        .with_destructor_fn(pyre_interpreter::function::function_destructor),
+    );
     debug_assert_eq!(function_tid, FUNCTION_GC_TYPE_ID);
     majit_gc::GcAllocator::register_vtable_for_type(
         &mut gc,
@@ -6334,7 +6338,7 @@ pub fn make_green_key(code_ptr: *const (), pc: usize) -> u64 {
 /// no `PyObject` header, so offering it to the type-keyed registrar would read
 /// one that is not there.
 ///
-/// The two `?` fields:
+/// The declared `?` fields:
 ///
 /// `celldict.py:34 _immutable_fields_ = ["version?"]` — the global cell fast
 /// path bakes a slot's stored cell as a `ConstPtr` under a
@@ -6349,6 +6353,13 @@ pub fn make_green_key(code_ptr: *const (), pc: usize) -> u64 {
 /// constant under a `QUASIIMMUT_FIELD(w_type, _version_tag)`. `mutated()`
 /// (typeobject.py:285-291) bumps the tag and walks subclasses, and the setter
 /// revokes each level's loops.
+///
+/// `function.py:34-42 _immutable_fields_ = ['code?', 'w_func_globals?',
+/// 'closure?[*]', 'defs_w?[*]', 'name?', 'qualname?', 'w_objclass?',
+/// 'w_text_signature?', 'w_kw_defs?']` — the inline-call path reads these off
+/// the live callee, and `f.__defaults__ = ...` / `f.__code__ = ...` retires
+/// every loop that folded one.  All nine share `function_register_quasi_immut_watcher`,
+/// which the slot the index resolves to picks apart.
 pub(crate) fn register_quasi_immutable_deps(_green_key: u64) {
     let (driver, _) = driver_pair();
     let deps: Vec<(u64, u32)> =
@@ -6371,8 +6382,10 @@ pub(crate) fn register_quasi_immutable_deps(_green_key: u64) {
     // Hoisted because each accessor clones a `LazyLock` descr; the index also
     // decides which type `dep_ptr` is cast to, so the chain below ends in a
     // fail-loud default rather than reinterpreting a headerless map node as a
-    // `W_TypeObject`.  These seven are every quasi-immutable descr this binary
-    // mints — see the same reasoning on `state.rs install_quasiimmut_field`.
+    // `W_TypeObject`.  These seven plus the nine `Function` fields
+    // `function_quasi_immut_slot` resolves are every quasi-immutable descr this
+    // binary mints — see the same reasoning on `state.rs
+    // install_quasiimmut_field`.
     for (dep_ptr, field_index) in deps {
         unsafe {
             if field_index == module_dict_version {
@@ -6408,6 +6421,13 @@ pub(crate) fn register_quasi_immutable_deps(_green_key: u64) {
             } else if field_index == audit_holder_hooks {
                 pyre_interpreter::module::sys::vm::audit_holder_register_hooks_watcher(
                     dep_ptr as *const _,
+                    &flag,
+                );
+            } else if let Some(slot) = pyre_jit_trace::descr::function_quasi_immut_slot(field_index)
+            {
+                pyre_interpreter::function::function_register_quasi_immut_watcher(
+                    dep_ptr as pyre_object::PyObjectRef,
+                    slot,
                     &flag,
                 );
             } else {
