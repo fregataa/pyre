@@ -4850,6 +4850,12 @@ pub(crate) fn resolve_pos_or_kw(
 /// is reported against `maxpos`.  The order matters: `list.sort` declares no
 /// positional slot and two keyword-only ones, so one stray positional is a
 /// positional error while three arguments are a total-count error.
+///
+/// The total-count message says "at most" whatever `minargs` is
+/// (`memoryview(b"", 1)` — one required slot — reports "takes at most 1
+/// argument (2 given)"); only the positional message names an exact count,
+/// and only when every positional slot is required (`itertools.batched([], 1,
+/// 2)` reports "takes exactly 2 positional arguments (3 given)").
 pub(crate) fn clinic_arity(
     fn_name: &str,
     npos: usize,
@@ -4861,14 +4867,9 @@ pub(crate) fn clinic_arity(
     let maxargs = maxpos + kwonly;
     if npos + nkw > maxargs {
         return Err(crate::PyError::type_error(format!(
-            "{fn_name}() takes {} {maxargs} {}argument{} ({} given)",
-            if minargs < maxargs {
-                "at most"
-            } else {
-                "exactly"
-            },
+            "{fn_name}() takes at most {maxargs} {}argument{} ({} given)",
             // bpo-31229: a call that passed only keywords names them, so
-            // "takes exactly 1 argument (2 given)" cannot read as a claim
+            // "takes at most 1 argument (2 given)" cannot read as a claim
             // about positional arguments that were never supplied.
             if npos == 0 { "keyword " } else { "" },
             if maxargs == 1 { "" } else { "s" },
@@ -4901,9 +4902,10 @@ pub(crate) fn clinic_arity(
 /// `Arguments._match_signature` (`pypy/interpreter/argument.py`). Each
 /// slot is filled by a positional, then by a keyword of the matching
 /// name; an absent optional slot becomes `PY_NULL` (the generated
-/// `#[pyre_function]` unwrap reads that as "argument omitted"). An absent
-/// required slot, an unknown keyword, a keyword duplicating a positional,
-/// or too many positionals raises `TypeError`.
+/// `#[pyre_function]` unwrap reads that as "argument omitted"), and a
+/// `PY_NULL` arriving in `args` is read the same way. An absent required
+/// slot, an unknown keyword, a keyword duplicating a positional, or too many
+/// positionals raises `TypeError`.
 ///
 /// This is the consumer-side counterpart that lets a builtin resolve
 /// keywords by parameter name without a per-function `Signature`; the
@@ -4916,9 +4918,15 @@ pub(crate) fn bind_builtin_kwargs(
     fn_name: &str,
 ) -> Result<Vec<PyObjectRef>, crate::PyError> {
     let (positional, kwargs) = split_builtin_kwargs(args);
+    // A builtin registered with a `Signature` reaches its body through
+    // `bind_kwargs_to_signature`, which lays out every declared slot and
+    // leaves an omitted one `PY_NULL`; a positional-only registration hands
+    // the body just the arguments the call made. Reading a null slot as an
+    // argument that was not passed makes the two registrations bind alike.
+    let supplied = positional.iter().filter(|v| !v.is_null()).count();
     clinic_arity(
         fn_name,
-        positional.len(),
+        supplied,
         real_kwarg_count(kwargs),
         required.iter().filter(|r| **r).count(),
         names.len(),
@@ -4932,7 +4940,7 @@ pub(crate) fn bind_builtin_kwargs(
     let mut unknown: Option<Wtf8Buf> = None;
     for (i, &v) in positional.iter().enumerate() {
         scope[i] = v;
-        filled[i] = true;
+        filled[i] = !v.is_null();
     }
     if let Some(dict) = kwargs {
         let entries = unsafe { pyre_object::w_dict_str_entries_wtf8(dict) };
@@ -6583,8 +6591,25 @@ fn winerror_derived_errno(w_winerror: PyObjectRef) -> Option<i64> {
 }
 
 /// The POSIX errno a Win32 error code maps to.
+///
+/// A Winsock code is its own errno: the range was built by adding `WSABASEERR`
+/// to the classic numbers, and `errno` publishes the socket names at the
+/// Winsock values, so `errno` and `winerror` agree there and the `OSError`
+/// subclass follows.  The six the table below names are the exception — the
+/// runtime kept its own meaning for those, so they come back down by
+/// `WSABASEERR` to the number they were built from.
 #[cfg(windows)]
 pub(crate) fn winerror_to_errno(code: i64) -> i64 {
+    const WSABASEERR: i64 = 10000;
+    // WSAEINTR, WSAEBADF, WSAEACCES, WSAEFAULT, WSAEINVAL, WSAEMFILE.
+    const WINSOCK_KEEPS_POSIX_ERRNO: &[i64] = &[10004, 10009, 10013, 10014, 10022, 10024];
+    if (WSABASEERR..12000).contains(&code) {
+        return if WINSOCK_KEEPS_POSIX_ERRNO.contains(&code) {
+            code - WSABASEERR
+        } else {
+            code
+        };
+    }
     WINERROR_TO_ERRNO
         .iter()
         .find(|&&(win, _)| win == code)
@@ -6661,18 +6686,28 @@ fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) {
     unsafe { interp_exceptions::w_exception_set_args(exc, args_list) };
 }
 
-/// `ESHUTDOWN` is a POSIX errno absent from the MSVC CRT, so the
-/// `BrokenPipeError` mapping is gated on it being defined (`#ifdef ESHUTDOWN`).
+/// `ESHUTDOWN` is a POSIX errno absent from the MSVC runtime's own `errno.h`,
+/// so the `BrokenPipeError` mapping is gated on it being defined
+/// (`#ifdef ESHUTDOWN`).  Windows has it as the Winsock code, which is the
+/// value a socket reports and the one the `errno` module publishes.
 #[cfg(unix)]
 fn errno_is_eshutdown(e: i32) -> bool {
     e == libc::ESHUTDOWN
+}
+#[cfg(all(windows, feature = "host_env"))]
+fn errno_is_eshutdown(e: i32) -> bool {
+    e == rustpython_host_env::errno::errors::ESHUTDOWN
 }
 /// wasm32 has no libc errnos; match the darwin/BSD numeric value.
 #[cfg(target_arch = "wasm32")]
 fn errno_is_eshutdown(e: i32) -> bool {
     e == 58
 }
-#[cfg(all(not(unix), not(target_arch = "wasm32")))]
+#[cfg(all(
+    not(unix),
+    not(target_arch = "wasm32"),
+    not(all(windows, feature = "host_env"))
+))]
 fn errno_is_eshutdown(_e: i32) -> bool {
     false
 }
@@ -6702,14 +6737,35 @@ mod wasm_errno {
     pub const ETIMEDOUT: i32 = 60;
 }
 
+/// On Windows `ETIMEDOUT` above is the Winsock code, and the runtime's own
+/// `errno.h` has a second value under the same name that a descriptor call
+/// reports; both select `TimeoutError`.
+#[cfg(all(windows, feature = "host_env"))]
+fn errno_is_crt_etimedout(e: i32) -> bool {
+    e == libc::ETIMEDOUT
+}
+#[cfg(not(all(windows, feature = "host_env")))]
+fn errno_is_crt_etimedout(_e: i32) -> bool {
+    false
+}
+
 /// `interp_exceptions.py:1207-1227 ERRNO_MAP` — the OSError subclass the
 /// exact `OSError` constructor selects for a recognised errno, by
 /// registered class name.  Returns `None` for an unmapped errno.
 pub(crate) fn os_error_errno_subclass(errno: i64) -> Option<&'static str> {
-    // `ESHUTDOWN` is sourced through `errno_is_eshutdown` (MSVC CRT lacks it);
-    // the rest come from `libc`, or the darwin/BSD `wasm_errno` table on wasm32.
-    #[cfg(not(target_arch = "wasm32"))]
+    // `ESHUTDOWN` is sourced through `errno_is_eshutdown` (the MSVC runtime's
+    // own `errno.h` lacks it); the rest come from the same table the `errno`
+    // module is published from, so `OSError(errno.X)` selects the subclass the
+    // name `X` implies.  On Windows that table answers the socket names with
+    // their Winsock codes, which is what a socket reports.  Failing that
+    // `libc`, or the darwin/BSD `wasm_errno` table on wasm32.
+    #[cfg(all(not(feature = "host_env"), not(target_arch = "wasm32")))]
     use libc::{
+        EACCES, EAGAIN, EALREADY, ECHILD, ECONNABORTED, ECONNREFUSED, ECONNRESET, EEXIST,
+        EINPROGRESS, EINTR, EISDIR, ENOENT, ENOTDIR, EPERM, EPIPE, ESRCH, ETIMEDOUT, EWOULDBLOCK,
+    };
+    #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+    use rustpython_host_env::errno::errors::{
         EACCES, EAGAIN, EALREADY, ECHILD, ECONNABORTED, ECONNREFUSED, ECONNRESET, EEXIST,
         EINPROGRESS, EINTR, EISDIR, ENOENT, ENOTDIR, EPERM, EPIPE, ESRCH, ETIMEDOUT, EWOULDBLOCK,
     };
@@ -6745,7 +6801,7 @@ pub(crate) fn os_error_errno_subclass(errno: i64) -> Option<&'static str> {
         "PermissionError"
     } else if e == ESRCH {
         "ProcessLookupError"
-    } else if e == ETIMEDOUT {
+    } else if e == ETIMEDOUT || errno_is_crt_etimedout(e) {
         "TimeoutError"
     } else {
         return None;
@@ -6775,6 +6831,45 @@ macro_rules! crt_call {
     }};
 }
 pub(crate) use crt_call;
+
+/// `lseek`, taking and reporting the whole 64-bit file position.
+///
+/// The MSVC runtime's `lseek` is `_lseek`, whose offset and return are a C
+/// `long` — 32 bits there.  A position past 2 GiB therefore arrives as a
+/// negative offset (`1 << 31` fails with `EINVAL`) or as a truncated one
+/// (`1 << 32` seeks to 0), and a position read back off a larger file comes
+/// back wrong.  `_lseeki64` is the one that carries it, and `off_t` is
+/// already 64 bits everywhere else.
+///
+/// Every caller is a file descriptor operation and so already stops at the
+/// targets whose libc has one; the same condition is spelled here because
+/// `wasm32-unknown-unknown` has no `lseek`, no `off_t` and no `c_int` to
+/// declare this with.
+#[cfg(all(any(unix, windows), not(feature = "sandbox")))]
+pub(crate) fn crt_lseek(fd: libc::c_int, offset: i64, whence: libc::c_int) -> i64 {
+    #[cfg(windows)]
+    {
+        crt_call!(libc::lseek64(fd, offset, whence))
+    }
+    #[cfg(not(windows))]
+    {
+        crt_call!(libc::lseek(fd, offset as libc::off_t, whence)) as i64
+    }
+}
+
+/// Clear the C runtime errno, so the next `crt_errno` describes the call made
+/// in between rather than whichever one last set the cell.  A caller needs
+/// this wherever the runtime reports through errno on a return value that is
+/// also a legitimate success (`strftime` answering zero for both a rejected
+/// directive and an empty result).  Windows-only, which is where the runtime
+/// keeps a cell of its own that `std::io::Error::last_os_error` does not read.
+#[cfg(windows)]
+pub(crate) fn clear_crt_errno() {
+    #[cfg(feature = "host_env")]
+    {
+        rustpython_host_env::os::clear_errno();
+    }
+}
 
 /// The errno the last C runtime call reported.
 pub(crate) fn crt_errno() -> i32 {
@@ -15179,7 +15274,7 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
                 {
                     #[cfg(not(feature = "sandbox"))]
                     let pos = {
-                        let pos = crt_call!(libc::lseek(fd, offset as libc::off_t, whence));
+                        let pos = crt_lseek(fd, offset, whence);
                         if pos < 0 {
                             return Err(fd_errno_err(crt_errno()));
                         }
@@ -15224,7 +15319,7 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
                     {
                         #[cfg(not(feature = "sandbox"))]
                         let pos = {
-                            let pos = crt_call!(libc::lseek(fd, 0, libc::SEEK_CUR));
+                            let pos = crt_lseek(fd, 0, libc::SEEK_CUR);
                             if pos < 0 {
                                 return Err(fd_errno_err(crt_errno()));
                             }
@@ -15627,7 +15722,7 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
             {
                 #[cfg(not(feature = "sandbox"))]
-                if crt_call!(libc::lseek(fd, 0, libc::SEEK_END)) < 0 {
+                if crt_lseek(fd, 0, libc::SEEK_END) < 0 {
                     // A pipe has no end to seek to, and opening one for append
                     // is legal; only a real seek failure is an error.
                     let errno = crt_errno();
@@ -16043,7 +16138,7 @@ fn file_method_seekable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         {
             #[cfg(not(feature = "sandbox"))]
             {
-                crt_call!(libc::lseek(fd, 0, libc::SEEK_CUR)) >= 0
+                crt_lseek(fd, 0, libc::SEEK_CUR) >= 0
             }
             #[cfg(feature = "sandbox")]
             {
@@ -16259,8 +16354,8 @@ fn fileio_readall_bufsize(self_obj: PyObjectRef, fd: i32) -> usize {
     if size > 65536 {
         #[cfg(not(feature = "sandbox"))]
         let position = {
-            let position = crt_call!(libc::lseek(fd, 0, libc::SEEK_CUR));
-            (position >= 0).then_some(position as i64)
+            let position = crt_lseek(fd, 0, libc::SEEK_CUR);
+            (position >= 0).then_some(position)
         };
         #[cfg(feature = "sandbox")]
         let position = crate::host_seam::ops::lseek(fd, 0, libc::SEEK_CUR).ok();

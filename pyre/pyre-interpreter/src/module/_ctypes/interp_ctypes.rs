@@ -414,6 +414,18 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
         "resize",
         crate::make_builtin_function("resize", ctypes_resize),
     );
+    // `call_function` / `call_cdeclfunction` are the module's own
+    // "so that we can call CFunction instances" pair, described as debugging
+    // only and private; the readline extension `_ctypes` names in that comment
+    // is why they are still here.  The two differ by the calling convention
+    // they pass, which x86-64 has one of.
+    for name in ["call_function", "call_cdeclfunction"] {
+        crate::module_ns_store(
+            ns,
+            name,
+            crate::make_builtin_function_with_arity(name, super::funcptr::call_function, 2),
+        );
+    }
 }
 
 /// Resolve `symbol` in the library a `_handle` names, for `CFuncPtr((name,
@@ -741,17 +753,26 @@ fn register_windows_loader(ns: pyre_object::PyObjectRef) {
     // ── COMError — `args` is the (text, details) tail, not the whole tuple ──
     let w_exception = crate::builtins::lookup_exc_class("Exception")
         .expect("Exception must be installed before _ctypes init");
-    crate::module_ns_store(
-        ns,
+    let comerror = crate::builtins::make_exc_type_with_init(
         "COMError",
-        crate::builtins::make_exc_type_with_init(
-            "COMError",
-            Some("Raised when a COM method call failed."),
-            crate::builtins::exc_exception_new,
-            Some(comerror_init),
-            w_exception,
-        ),
+        Some("Raised when a COM method call failed."),
+        crate::builtins::exc_exception_new,
+        Some(comerror_init),
+        w_exception,
     );
+    let _ = COMERROR_TYPE_OBJ.set(comerror as usize);
+    crate::module_ns_store(ns, "COMError", comerror);
+}
+
+#[cfg(all(windows, feature = "host_env"))]
+static COMERROR_TYPE_OBJ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// The `COMError` class, once `_ctypes` has been set up.
+#[cfg(all(windows, feature = "host_env"))]
+pub(super) fn comerror_type() -> Option<pyre_object::PyObjectRef> {
+    COMERROR_TYPE_OBJ
+        .get()
+        .map(|&tp| tp as pyre_object::PyObjectRef)
 }
 
 /// `comerror_init` — stamps the three slots and re-points `args` at the tail.
@@ -792,8 +813,10 @@ fn comerror_init(
     crate::baseobjspace::setattr_str(w_self, "hresult", roots.get(args_slot))?;
     crate::baseobjspace::setattr_str(w_self, "text", roots.get(args_slot + 1))?;
     crate::baseobjspace::setattr_str(w_self, "details", roots.get(args_slot + 2))?;
-    // `args = args[1:]`, so the hresult is reachable only through its attribute.
+    // `args` carries all three, hresult included, and `str()`/`repr()` show
+    // all three with it.
     let w_args = pyre_object::tupleobject::w_tuple_new(vec![
+        roots.get(args_slot),
         roots.get(args_slot + 1),
         roots.get(args_slot + 2),
     ]);
@@ -1036,4 +1059,6 @@ fn register_stub_ctypes(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(ns, "addressof", crate::typedef::w_object());
     crate::module_ns_store(ns, "byref", crate::typedef::w_object());
     crate::module_ns_store(ns, "resize", crate::typedef::w_object());
+    crate::module_ns_store(ns, "call_function", crate::typedef::w_object());
+    crate::module_ns_store(ns, "call_cdeclfunction", crate::typedef::w_object());
 }

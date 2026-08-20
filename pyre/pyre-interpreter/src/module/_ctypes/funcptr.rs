@@ -24,17 +24,39 @@ use std::sync::OnceLock;
 /// `_flags_ & FUNCFLAG_USE_ERRNO` — swap the ctypes-local errno around the call.
 pub(super) const FUNCFLAG_USE_ERRNO: i64 = 0x8;
 
+/// `_flags_ & FUNCFLAG_USE_LASTERROR` — swap the ctypes-local last error
+/// around the call, so `ctypes.get_last_error()` reports what the callee set
+/// and no call made since can have overwritten it.
+pub(super) const FUNCFLAG_USE_LASTERROR: i64 = 0x10;
+
 /// Reserved instance-dict keys.
 const PTR_KEY: &str = "_ptr";
 const RESTYPE_KEY: &str = "_restype";
 const ARGTYPES_KEY: &str = "_argtypes";
 pub(super) const CALLABLE_KEY: &str = "_callable";
+const ERRCHECK_KEY: &str = "_errcheck";
+const PARAMFLAGS_KEY: &str = "_paramflags";
+#[cfg(windows)]
+const INDEX_KEY: &str = "_index";
+#[cfg(windows)]
+const IID_KEY: &str = "_iid";
+
+/// `paramflags` direction bits: an argument the caller supplies, one the callee
+/// writes through, and the locale id that always comes from the default.
+const PARAMFLAG_FIN: i64 = 0x1;
+const PARAMFLAG_FOUT: i64 = 0x2;
+const PARAMFLAG_FLCID: i64 = 0x4;
+const PARAMFLAG_DIRECTION: i64 = PARAMFLAG_FIN | PARAMFLAG_FOUT | PARAMFLAG_FLCID;
+const PARAMFLAG_FIN_FLCID: i64 = PARAMFLAG_FIN | PARAMFLAG_FLCID;
+const PARAMFLAG_FIN_FOUT: i64 = PARAMFLAG_FIN | PARAMFLAG_FOUT;
 const INTERNAL_CAST_ADDR: usize = 1;
 const INTERNAL_STRING_AT_ADDR: usize = 2;
 const INTERNAL_WSTRING_AT_ADDR: usize = 3;
 const INTERNAL_MEMORYVIEW_AT_ADDR: usize = 4;
 const INTERNAL_PYBYTES_FROMSTRINGANDSIZE: usize = 5;
 const INTERNAL_PYOS_SNPRINTF: usize = 6;
+#[cfg(windows)]
+const INTERNAL_PYERR_SETFROMWINDOWSERR: usize = 7;
 
 static CFUNCPTR_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
 
@@ -80,6 +102,61 @@ fn init_cfuncptr_type(ns: PyObjectRef) {
             "argtypes",
         ),
     );
+    type_ns_store(
+        ns,
+        "errcheck",
+        crate::typedef::make_getset_property_named(
+            crate::make_builtin_function_with_arity("errcheck", errcheck_getter, 2),
+            crate::make_builtin_function_with_arity("errcheck", errcheck_setter, 3),
+            crate::make_builtin_function_with_arity("errcheck", errcheck_deleter, 2),
+            "errcheck",
+        ),
+    );
+    type_ns_store(
+        ns,
+        "__repr__",
+        crate::make_builtin_function("__repr__", cfuncptr_repr),
+    );
+    type_ns_store(
+        ns,
+        "__bool__",
+        crate::make_builtin_function("__bool__", cfuncptr_bool),
+    );
+}
+
+/// A COM method says which vtable slot it is; everything else reports the
+/// default `<T object at 0x...>`.
+fn cfuncptr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let obj = args[0];
+    let name = cdata::value_type_name(obj);
+    let address = crate::display::repr_addr(obj as usize);
+    #[cfg(windows)]
+    if let Some(index) = com_index(obj) {
+        return Ok(pyre_object::w_str_new(&format!(
+            "<COM method offset {index}: {name} at {address}>"
+        )));
+    }
+    Ok(pyre_object::w_str_new(&format!(
+        "<{name} object at {address}>"
+    )))
+}
+
+/// A COM method is true whether or not it holds an address, because the vtable
+/// slot it names is all it ever needed.
+fn cfuncptr_bool(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let obj = args[0];
+    #[cfg(windows)]
+    if com_index(obj).is_some() {
+        return Ok(pyre_object::w_bool_from(true));
+    }
+    Ok(pyre_object::w_bool_from(funcptr_addr(obj) != 0))
+}
+
+/// The vtable slot a COM method lives in, or `None` for an ordinary function.
+#[cfg(windows)]
+fn com_index(obj: PyObjectRef) -> Option<i64> {
+    let index = instance_get(obj, INDEX_KEY)?;
+    Some(unsafe { pyre_object::w_int_get_value(index) } - 0x1000)
 }
 
 // ── construction ──────────────────────────────────────────────────────
@@ -98,20 +175,40 @@ fn cfuncptr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
     reject_kwargs(kwargs)?;
     let mut callback = pyre_object::PY_NULL;
-    let addr: usize = match pos.last().copied() {
+    let mut paramflags = pyre_object::PY_NULL;
+    #[cfg(windows)]
+    let mut com_index: Option<i64> = None;
+    #[cfg(windows)]
+    let mut com_iid = pyre_object::PY_NULL;
+    let addr: usize = match pos.first().copied() {
         None => 0,
+        // `(name, dll)`, with paramflags allowed after it.
+        Some(a) if unsafe { pyre_object::is_tuple(a) } => {
+            paramflags = pos.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+            resolve_from_tuple(a)?
+        }
+        // `index, name` — a COM method, with paramflags and then the interface
+        // id allowed after it.  It has no address: the vtable of whatever
+        // interface pointer the call is made on is where the method lives.
+        #[cfg(windows)]
+        Some(a) if pos.len() >= 2 && unsafe { pyre_object::is_int(a) } => {
+            if !unsafe { pyre_object::is_str(pos[1]) } {
+                return Err(crate::PyError::type_error(format!(
+                    "argument 2 must be str, not {}",
+                    cdata::value_type_name(pos[1])
+                )));
+            }
+            com_index = Some(unsafe { pyre_object::w_int_get_value(a) });
+            paramflags = pos.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+            com_iid = pos.get(3).copied().unwrap_or(pyre_object::PY_NULL);
+            0
+        }
         Some(a) if unsafe { pyre_object::is_none(a) } => 0,
         Some(a) if unsafe { pyre_object::is_int(a) } => {
             (unsafe { pyre_object::w_int_get_value(a) }) as usize
         }
-        Some(a) if unsafe { pyre_object::is_tuple(a) } => resolve_from_tuple(a)?,
         Some(a) => {
-            let callable = unsafe { crate::function::is_function(a) }
-                || crate::typedef::r#type(a).is_some_and(|ty| {
-                    unsafe { crate::baseobjspace::lookup_in_type(ty.as_ptr(), "__call__") }
-                        .is_some()
-                });
-            if !callable {
+            if !crate::baseobjspace::callable_w(a) {
                 return Err(crate::PyError::type_error(
                     "argument must be callable or integer function address",
                 ));
@@ -120,12 +217,30 @@ fn cfuncptr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             0
         }
     };
+    let paramflags = validate_paramflags(
+        paramflags,
+        type_argtypes(pyre_object::gc_roots::shadow_stack_get(cls_slot)).as_deref(),
+    )?;
     let callback_slot = if callback.is_null() {
         None
     } else {
         let slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(callback);
         Some(slot)
+    };
+    // Building the instance allocates, so what gets stored on it is read back
+    // out of a root slot once it exists.
+    let paramflags_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(paramflags);
+    #[cfg(windows)]
+    let iid_slot = {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(if com_iid.is_null() {
+            pyre_object::w_none()
+        } else {
+            com_iid
+        });
+        slot
     };
     let obj = cdata::new_cdata_obj_from_bytes(
         pyre_object::gc_roots::shadow_stack_get(cls_slot),
@@ -154,7 +269,64 @@ fn cfuncptr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             store_funcptr_addr(pyre_object::gc_roots::shadow_stack_get(obj_slot), code)?;
         }
     }
+    let paramflags = pyre_object::gc_roots::shadow_stack_get(paramflags_slot);
+    if !unsafe { pyre_object::is_none(paramflags) } {
+        instance_set(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            PARAMFLAGS_KEY,
+            paramflags,
+        );
+    }
+    #[cfg(windows)]
+    if let Some(index) = com_index {
+        let index = pyre_object::w_int_new(index + 0x1000);
+        instance_set(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            INDEX_KEY,
+            index,
+        );
+        let iid = pyre_object::gc_roots::shadow_stack_get(iid_slot);
+        if !unsafe { pyre_object::is_none(iid) } {
+            instance_set(
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                IID_KEY,
+                iid,
+            );
+        }
+    }
     Ok(pyre_object::gc_roots::shadow_stack_get(obj_slot))
+}
+
+/// The borrow a marshalled argument is handed to the call as; the borrow ends
+/// with the call, and `owned` outlives it.
+fn owned_arg_as_call_arg(arg: &OwnedArg) -> host_ctypes::CallArg<'_> {
+    match arg {
+        OwnedArg::Typed(code, buf) => host_ctypes::CallArg::Typed {
+            code: code.as_str(),
+            buffer: buf.as_slice(),
+        },
+        OwnedArg::Int(v) => host_ctypes::CallArg::Int(*v),
+        OwnedArg::Double(v) => host_ctypes::CallArg::Double(*v),
+        OwnedArg::Pointer(v) => host_ctypes::CallArg::Pointer(*v),
+        OwnedArg::Aggregate(layout, buf) => host_ctypes::CallArg::Aggregate {
+            layout,
+            buffer: buf.as_slice(),
+        },
+    }
+}
+
+fn call_error(e: host_ctypes::CallError) -> crate::PyError {
+    match e {
+        host_ctypes::CallError::NullFunctionPointer => {
+            crate::PyError::value_error("NULL function pointer")
+        }
+        host_ctypes::CallError::UnknownTypeCode(c) => {
+            crate::PyError::type_error(format!("unsupported type code {c:?}"))
+        }
+        host_ctypes::CallError::BufferTooSmall { expected, got } => crate::PyError::value_error(
+            format!("aggregate argument buffer too small: expected {expected}, got {got}"),
+        ),
+    }
 }
 
 /// `(name, dll)` → resolved symbol address.  `dll._handle` is the integer
@@ -183,6 +355,8 @@ fn resolve_from_tuple(t: PyObjectRef) -> Result<usize, crate::PyError> {
     match name_bytes.as_slice() {
         b"PyBytes_FromStringAndSize" => return Ok(INTERNAL_PYBYTES_FROMSTRINGANDSIZE),
         b"PyOS_snprintf" => return Ok(INTERNAL_PYOS_SNPRINTF),
+        #[cfg(windows)]
+        b"PyErr_SetFromWindowsErr" => return Ok(INTERNAL_PYERR_SETFROMWINDOWSERR),
         _ => {}
     }
     super::interp_ctypes::lookup_symbol(handle, &name_bytes).map_err(|e| {
@@ -255,7 +429,39 @@ fn argtypes_setter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             "argtypes must be a sequence of types",
         ));
     }
+    // Paramflags describe the argtypes one for one, so replacing the argtypes
+    // has to leave that description true.
+    if let Some(paramflags) = instance_get(args[1], PARAMFLAGS_KEY) {
+        validate_paramflags(paramflags, argtypes_seq(value).as_deref())?;
+    }
     instance_set(args[1], ARGTYPES_KEY, value);
+    Ok(pyre_object::w_none())
+}
+
+fn errcheck_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Ok(instance_get(args[1], ERRCHECK_KEY).unwrap_or_else(pyre_object::w_none))
+}
+
+/// The only thing ever done with an errcheck is calling it, so anything that
+/// cannot be called is refused — `None` included, which is why clearing one is
+/// spelled `del`.
+fn errcheck_setter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let value = args[2];
+    if !crate::baseobjspace::callable_w(value) {
+        return Err(crate::PyError::type_error(
+            "the errcheck attribute must be callable",
+        ));
+    }
+    instance_set(args[1], ERRCHECK_KEY, value);
+    Ok(pyre_object::w_none())
+}
+
+fn errcheck_deleter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let d = crate::baseobjspace::getdict_native(args[1]);
+    if !d.is_null() {
+        // Deleting one that was never set is not an error.
+        unsafe { pyre_object::dictmultiobject::w_dict_delitem_str(d, ERRCHECK_KEY) };
+    }
     Ok(pyre_object::w_none())
 }
 
@@ -316,6 +522,56 @@ pub(super) fn resolve_restype(obj: PyObjectRef) -> Result<Ret, crate::PyError> {
     }
 }
 
+/// `restype._check_retval_` — the callable a return value passes through
+/// before the caller sees it.  `HRESULT` declares one so that a failed status
+/// raises `OSError` rather than being handed back as a negative number.
+fn resolve_checker(obj: PyObjectRef) -> Option<PyObjectRef> {
+    let cls = unsafe { pyre_object::w_instance_get_type(obj) };
+    let rt = instance_get(obj, RESTYPE_KEY)
+        .or_else(|| unsafe { crate::baseobjspace::lookup_in_type(cls, "_restype_") })?;
+    if !unsafe { pyre_object::is_type(rt) } {
+        return None;
+    }
+    unsafe { crate::baseobjspace::lookup_in_type(rt, "_check_retval_") }
+}
+
+/// `errcheck(result, self, arguments)` — the last word on what a call returns.
+/// Handing back the argument tuple unchanged means "nothing to say", which is
+/// `None` here; anything else replaces the result outright, `out` parameters
+/// included.
+fn apply_errcheck(
+    self_obj: PyObjectRef,
+    result: PyObjectRef,
+    inargs: &[PyObjectRef],
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    let Some(errcheck) = instance_get(self_obj, ERRCHECK_KEY) else {
+        return Ok(None);
+    };
+    // Building the argument tuple allocates, so the three values the call still
+    // needs are read back out of root slots afterwards.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    for value in [self_obj, result, errcheck] {
+        pyre_object::gc_roots::pin_root(value);
+    }
+    let arguments = pyre_object::w_tuple_new(inargs.to_vec());
+    let arguments_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(arguments);
+    let value = crate::call::call_function_impl_result(
+        pyre_object::gc_roots::shadow_stack_get(base + 2),
+        &[
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+            pyre_object::gc_roots::shadow_stack_get(base),
+            pyre_object::gc_roots::shadow_stack_get(arguments_slot),
+        ],
+    )?;
+    Ok((!std::ptr::eq(
+        value,
+        pyre_object::gc_roots::shadow_stack_get(arguments_slot),
+    ))
+    .then_some(value))
+}
+
 /// Wrap a returned pointer value `p` in a fresh instance of pointer type `rt`.
 fn wrap_pointer_result(rt: PyObjectRef, p: usize) -> Result<PyObjectRef, crate::PyError> {
     let obj = pyre_object::w_instance_new(rt);
@@ -352,13 +608,119 @@ fn wrap_pointer_result(rt: PyObjectRef, p: usize) -> Result<PyObjectRef, crate::
 /// The `_argtypes_` sequence as a Vec, or `None` when unset (ConvParam
 /// defaults apply).
 pub(super) fn resolve_argtypes(obj: PyObjectRef) -> Option<Vec<PyObjectRef>> {
-    let cls = unsafe { pyre_object::w_instance_get_type(obj) };
-    let at = instance_get(obj, ARGTYPES_KEY)
-        .or_else(|| unsafe { crate::baseobjspace::lookup_in_type(cls, "_argtypes_") })?;
+    match instance_get(obj, ARGTYPES_KEY) {
+        Some(at) => argtypes_seq(at),
+        None => type_argtypes(unsafe { pyre_object::w_instance_get_type(obj) }),
+    }
+}
+
+/// The `_argtypes_` declared on type `cls` — what a constructor has to check
+/// paramflags against, the instance having none of its own yet.
+fn type_argtypes(cls: PyObjectRef) -> Option<Vec<PyObjectRef>> {
+    argtypes_seq(unsafe { crate::baseobjspace::lookup_in_type(cls, "_argtypes_") }?)
+}
+
+/// A settled `argtypes` value as a Vec; `None` means unset.
+fn argtypes_seq(at: PyObjectRef) -> Option<Vec<PyObjectRef>> {
     if unsafe { pyre_object::is_none(at) } {
         return None;
     }
     seq_to_vec(at)
+}
+
+/// The name a type reports, for a message about the type itself rather than
+/// about a value of it.
+fn type_display_name(obj: PyObjectRef) -> String {
+    if unsafe { pyre_object::is_type(obj) } {
+        return unsafe { pyre_object::w_type_get_name(obj) }.to_string();
+    }
+    cdata::value_type_name(obj)
+}
+
+/// `_check_outarg_type` — the callee writes an `out` parameter through the
+/// argument, so the argtype has to be something there is a through: a pointer
+/// or array type, or one of the simple codes that is already an address.
+fn check_outarg_type(at: PyObjectRef, index: usize) -> Result<(), crate::PyError> {
+    if let Some(info) = stginfo::stginfo_of(at)
+        && matches!(
+            stginfo::stginfo_paramfunc(info).as_str(),
+            "pointer" | "array"
+        )
+    {
+        return Ok(());
+    }
+    if matches!(cdata::type_code_of(at).as_deref(), Some("P" | "z" | "Z")) {
+        return Ok(());
+    }
+    Err(crate::PyError::type_error(format!(
+        "'out' parameter {index} must be a pointer type, not {}",
+        type_display_name(at)
+    )))
+}
+
+/// `_validate_paramflags` — one paramflag per argtype, each an
+/// `(int [,string [,value]])` tuple naming a direction that is actually
+/// implemented.  Returns the tuple to store, or `None` for "no paramflags",
+/// which is also what an absent `_argtypes_` leaves the check with nothing to
+/// say about.
+fn validate_paramflags(
+    paramflags: PyObjectRef,
+    argtypes: Option<&[PyObjectRef]>,
+) -> Result<PyObjectRef, crate::PyError> {
+    if paramflags.is_null() || unsafe { pyre_object::is_none(paramflags) } {
+        return Ok(pyre_object::w_none());
+    }
+    if !unsafe { pyre_object::is_tuple(paramflags) } {
+        return Err(crate::PyError::type_error(
+            "paramflags must be a tuple or None",
+        ));
+    }
+    let Some(argtypes) = argtypes else {
+        return Ok(paramflags);
+    };
+    let len = unsafe { pyre_object::w_tuple_len(paramflags) };
+    if len != argtypes.len() {
+        return Err(crate::PyError::value_error(
+            "paramflags must have the same length as argtypes",
+        ));
+    }
+    let malformed = || {
+        crate::PyError::type_error(
+            "paramflags must be a sequence of (int [,string [,value]]) tuples",
+        )
+    };
+    for (i, &at) in argtypes.iter().enumerate() {
+        let item =
+            unsafe { pyre_object::w_tuple_getitem(paramflags, i as i64) }.ok_or_else(malformed)?;
+        if !unsafe { pyre_object::is_tuple(item) } {
+            return Err(malformed());
+        }
+        let item_len = unsafe { pyre_object::w_tuple_len(item) };
+        if !(1..=3).contains(&item_len) {
+            return Err(malformed());
+        }
+        let flag = unsafe { pyre_object::w_tuple_getitem(item, 0) }.ok_or_else(malformed)?;
+        if !unsafe { pyre_object::is_int(flag) } {
+            return Err(malformed());
+        }
+        if item_len > 1 {
+            let name = unsafe { pyre_object::w_tuple_getitem(item, 1) }.ok_or_else(malformed)?;
+            if !unsafe { pyre_object::is_none(name) } && !unsafe { pyre_object::is_str(name) } {
+                return Err(malformed());
+            }
+        }
+        let flag = unsafe { pyre_object::w_int_get_value(flag) };
+        match flag & PARAMFLAG_DIRECTION {
+            PARAMFLAG_FOUT => check_outarg_type(at, i + 1)?,
+            0 | PARAMFLAG_FIN | PARAMFLAG_FIN_FLCID | PARAMFLAG_FIN_FOUT => {}
+            _ => {
+                return Err(crate::PyError::type_error(format!(
+                    "paramflag value {flag} not supported"
+                )));
+            }
+        }
+    }
+    Ok(paramflags)
 }
 
 fn seq_to_vec(obj: PyObjectRef) -> Option<Vec<PyObjectRef>> {
@@ -486,9 +848,7 @@ pub(super) fn callback_result(
         Ret::Void => Ok(pyre_object::w_none()),
         Ret::Code(code) => {
             let bytes = cdata::encode_value_into(&code, result, obj, "result")?;
-            Ok(cdata::decoded_to_pyobject(host_ctypes::decode_type_code(
-                &code, &bytes,
-            )))
+            Ok(cdata::decode_slot(&code, &bytes))
         }
         Ret::Pointer(_) | Ret::Aggregate(_) => Ok(result),
     }
@@ -525,28 +885,51 @@ fn cfuncptr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         return Err(crate::PyError::type_error("__call__ requires self"));
     }
     let self_obj = args[0];
-    let (call_args, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
-    reject_kwargs(kwargs)?;
+    // A keyword argument only ever names a paramflag, and one that names
+    // nothing is not an error — it simply goes unread.
+    let (inargs, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
     if funcptr_addr(self_obj) == 0 && instance_get(self_obj, CALLABLE_KEY).is_some() {
-        return call_python_callback(self_obj, call_args);
+        return call_python_callback(self_obj, inargs);
     }
     match funcptr_addr(self_obj) {
-        INTERNAL_CAST_ADDR => return internal_cast(call_args),
-        INTERNAL_STRING_AT_ADDR => return internal_string_at(call_args),
-        INTERNAL_WSTRING_AT_ADDR => return internal_wstring_at(call_args),
-        INTERNAL_MEMORYVIEW_AT_ADDR => return internal_memoryview_at(call_args),
-        INTERNAL_PYBYTES_FROMSTRINGANDSIZE => return internal_pybytes_fromstringandsize(call_args),
-        INTERNAL_PYOS_SNPRINTF => return internal_pyos_snprintf(call_args),
+        INTERNAL_CAST_ADDR => return internal_cast(inargs),
+        INTERNAL_STRING_AT_ADDR => return internal_string_at(inargs),
+        INTERNAL_WSTRING_AT_ADDR => return internal_wstring_at(inargs),
+        INTERNAL_MEMORYVIEW_AT_ADDR => return internal_memoryview_at(inargs),
+        INTERNAL_PYBYTES_FROMSTRINGANDSIZE => return internal_pybytes_fromstringandsize(inargs),
+        INTERNAL_PYOS_SNPRINTF => return internal_pyos_snprintf(inargs),
+        #[cfg(windows)]
+        INTERNAL_PYERR_SETFROMWINDOWSERR => {
+            return internal_pyerr_setfromwindowserr(inargs);
+        }
         _ => {}
     }
+
+    // A COM method has no address of its own: the interface pointer passed as
+    // the first argument is what its vtable is read out of, and that pointer
+    // then leads the call.
+    #[cfg(windows)]
+    let com = match com_index(self_obj) {
+        Some(index) => Some(super::com::call_target(index, inargs)?),
+        None => None,
+    };
+    #[cfg(not(windows))]
+    let com: Option<(usize, usize)> = None;
+
+    let argtypes = resolve_argtypes(self_obj);
+    let callargs = build_callargs(self_obj, argtypes.as_deref(), inargs, kwargs, com.is_some())?;
+    let call_args = callargs.args.as_slice();
 
     // Marshal arguments into owned scalar data.  `keepalive` owns any
     // null-terminated `bytes` copies that pointer args address; `owned` owns
     // the typed buffers.  Both must outlive the borrowed `SimpleArg`s below.
-    let mut owned: Vec<OwnedArg> = Vec::with_capacity(call_args.len());
+    let mut owned: Vec<OwnedArg> = Vec::with_capacity(call_args.len() + 1);
     let mut keepalive: Vec<Vec<u8>> = Vec::new();
+    if let Some((this_ptr, _)) = com {
+        owned.push(OwnedArg::Pointer(this_ptr));
+    }
 
-    match resolve_argtypes(self_obj) {
+    match argtypes {
         Some(argtypes) => {
             for (i, at) in argtypes.iter().enumerate() {
                 let arg = *call_args.get(i).ok_or_else(|| {
@@ -587,51 +970,290 @@ fn cfuncptr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     };
 
     // Borrow the owned data as `CallArg`s; these borrows end with the call.
-    let host_args: Vec<host_ctypes::CallArg> = owned
-        .iter()
-        .map(|o| match o {
-            OwnedArg::Typed(code, buf) => host_ctypes::CallArg::Typed {
-                code: code.as_str(),
-                buffer: buf.as_slice(),
-            },
-            OwnedArg::Int(v) => host_ctypes::CallArg::Int(*v),
-            OwnedArg::Double(v) => host_ctypes::CallArg::Double(*v),
-            OwnedArg::Pointer(v) => host_ctypes::CallArg::Pointer(*v),
-            OwnedArg::Aggregate(layout, buf) => host_ctypes::CallArg::Aggregate {
-                layout,
-                buffer: buf.as_slice(),
-            },
-        })
-        .collect();
+    let host_args: Vec<host_ctypes::CallArg> = owned.iter().map(owned_arg_as_call_arg).collect();
 
-    let addr = funcptr_addr(self_obj);
-    let use_errno = funcptr_flags(self_obj) & FUNCFLAG_USE_ERRNO != 0;
+    let addr = match com {
+        Some((_, method)) => method,
+        None => funcptr_addr(self_obj),
+    };
+    let flags = funcptr_flags(self_obj);
     let options = host_ctypes::CallOptions {
-        use_errno,
-        ..Default::default()
+        use_errno: flags & FUNCFLAG_USE_ERRNO != 0,
+        use_last_error: flags & FUNCFLAG_USE_LASTERROR != 0,
     };
     // `clibffi.py:350-352` declares `ffi_call` with the default
     // `releasegil='auto'`, i.e. released: the callee is arbitrary foreign code
     // and may block on another Python thread's progress.  `owned` / `keepalive`
-    // hold the marshalled buffers across the released window.
+    // hold the marshalled buffers across the released window.  Being arbitrary
+    // foreign code is also why the call goes inside `seh::guard`, which is what
+    // stands between a faulting callee and the process.
     let result = {
         let _blocked = crate::module::thread::before_external_block();
-        host_ctypes::call(addr, &host_args, restype, options)
-    }
-    .map_err(|e| match e {
-        host_ctypes::CallError::NullFunctionPointer => {
-            crate::PyError::value_error("NULL function pointer")
-        }
-        host_ctypes::CallError::UnknownTypeCode(c) => {
-            crate::PyError::type_error(format!("unsupported type code {c:?}"))
-        }
-        host_ctypes::CallError::BufferTooSmall { expected, got } => crate::PyError::value_error(
-            format!("aggregate argument buffer too small: expected {expected}, got {got}"),
-        ),
-    });
+        super::seh::guard(|| host_ctypes::call(addr, &host_args, restype, options))
+    };
     // `owned` / `keepalive` must outlive the call above.
     drop(keepalive);
-    let result = result?;
+    let result = result?.map_err(call_error)?;
+    // A COM method constructed with an interface id answers the plain status,
+    // and asks the callee what went wrong when that status is a failure; the
+    // restype never gets a look in.
+    let value = match com_status(self_obj, com, &result) {
+        Some(status) => status?,
+        None => {
+            let value = build_return_value(ret, result)?;
+            match resolve_checker(self_obj) {
+                Some(checker) => crate::call::call_function_impl_result(checker, &[value])?,
+                None => value,
+            }
+        }
+    };
+    match apply_errcheck(self_obj, value, call_args)? {
+        Some(forced) => Ok(forced),
+        None => build_result(value, &callargs),
+    }
+}
+
+/// The status word a returned scalar carries.  A COM method answers an
+/// `HRESULT` whatever its declared restype would otherwise make of the bytes.
+fn scalar_int_result(result: &host_ctypes::CallValue) -> i32 {
+    let mut word = [0u8; 4];
+    if let host_ctypes::CallValue::Scalar(bytes) = result {
+        let n = bytes.len().min(word.len());
+        word[..n].copy_from_slice(&bytes[..n]);
+    }
+    i32::from_ne_bytes(word)
+}
+
+/// The status a COM method constructed with an interface id answers, and the
+/// callee's own account of a failed one.  `None` for a method without an id
+/// and for every ordinary function, which go through the restype instead.
+///
+/// A COM method only exists on Windows — `_ctypes.c` builds the whole form
+/// under `MS_WIN32` — so off it there is no status to read and `com` is
+/// already `None` at every call.
+#[cfg(windows)]
+fn com_status(
+    obj: PyObjectRef,
+    com: Option<(usize, usize)>,
+    result: &host_ctypes::CallValue,
+) -> Option<Result<PyObjectRef, crate::PyError>> {
+    let (this_ptr, iid) = com_error_iid(obj, com)?;
+    let hresult = scalar_int_result(result);
+    Some(if hresult < 0 {
+        Err(super::com::error(hresult, iid, this_ptr))
+    } else {
+        Ok(pyre_object::w_int_new(hresult as i64))
+    })
+}
+
+#[cfg(not(windows))]
+fn com_status(
+    _obj: PyObjectRef,
+    _com: Option<(usize, usize)>,
+    _result: &host_ctypes::CallValue,
+) -> Option<Result<PyObjectRef, crate::PyError>> {
+    None
+}
+
+/// The `this` pointer and interface id a failed COM call reports through, when
+/// the method was constructed with an id at all.
+#[cfg(windows)]
+fn com_error_iid(obj: PyObjectRef, com: Option<(usize, usize)>) -> Option<(usize, usize)> {
+    let (this_ptr, _) = com?;
+    let iid = instance_get(obj, IID_KEY)?;
+    let (addr, len) = if unsafe { pyre_object::is_bytes(iid) } {
+        let data = unsafe { pyre_object::bytesobject::w_bytes_data(iid) };
+        (data.as_ptr() as usize, data.len())
+    } else {
+        (cdata::cdata_addr(iid)?, cdata::cdata_len(iid)?)
+    };
+    // Anything that is not `GUID`-sized is not an interface id, and is passed
+    // over the way an unrecognised one is.
+    (len == 16).then_some((this_ptr, addr))
+}
+
+/// The arguments a call is made with, and which of them the caller gets back.
+struct CallArgs {
+    args: Vec<PyObjectRef>,
+    /// Arguments the callee alone fills in, by index.
+    outmask: u32,
+    /// Arguments the caller supplies and the callee writes back through.
+    inoutmask: u32,
+    numretvals: u32,
+}
+
+/// `_build_callargs` — with no `paramflags` the call is made with the
+/// arguments the caller passed (less the COM `this`, which leads the call
+/// separately) and nothing comes back through them.  With `paramflags` every
+/// declared argtype gets a value: from the call, from a keyword, from a
+/// default, or from a fresh instance for the callee to write into.
+fn build_callargs(
+    self_obj: PyObjectRef,
+    argtypes: Option<&[PyObjectRef]>,
+    inargs: &[PyObjectRef],
+    kwargs: Option<PyObjectRef>,
+    is_com: bool,
+) -> Result<CallArgs, crate::PyError> {
+    let passed = if is_com { &inargs[1..] } else { inargs };
+    let plain = |args: Vec<PyObjectRef>| CallArgs {
+        args,
+        outmask: 0,
+        inoutmask: 0,
+        numretvals: 0,
+    };
+    let (Some(paramflags), Some(argtypes)) = (instance_get(self_obj, PARAMFLAGS_KEY), argtypes)
+    else {
+        return Ok(plain(passed.to_vec()));
+    };
+    if argtypes.is_empty() || !unsafe { pyre_object::is_tuple(paramflags) } {
+        return Ok(plain(passed.to_vec()));
+    }
+    let mut out = plain(Vec::with_capacity(argtypes.len()));
+    let mut index = 0;
+    for (i, &at) in argtypes.iter().enumerate() {
+        let malformed =
+            || crate::PyError::value_error("paramflags must have the same length as argtypes");
+        let item =
+            unsafe { pyre_object::w_tuple_getitem(paramflags, i as i64) }.ok_or_else(malformed)?;
+        if !unsafe { pyre_object::is_tuple(item) } {
+            return Err(malformed());
+        }
+        let item_len = unsafe { pyre_object::w_tuple_len(item) };
+        let flag = unsafe { pyre_object::w_tuple_getitem(item, 0) }.ok_or_else(malformed)?;
+        let flag = unsafe { pyre_object::w_int_get_value(flag) };
+        let name = (item_len > 1)
+            .then(|| unsafe { pyre_object::w_tuple_getitem(item, 1) })
+            .flatten()
+            .filter(|&n| unsafe { pyre_object::is_str(n) })
+            .map(|n| unsafe { pyre_object::w_str_get_value(n) }.to_string());
+        let defval = if item_len > 2 {
+            unsafe { pyre_object::w_tuple_getitem(item, 2) }
+        } else {
+            None
+        };
+        let value = match flag & PARAMFLAG_DIRECTION {
+            // A locale id never comes from the call.
+            PARAMFLAG_FIN_FLCID => defval.unwrap_or_else(|| pyre_object::w_int_new(0)),
+            PARAMFLAG_FOUT => {
+                out.outmask |= 1 << i;
+                out.numretvals += 1;
+                match defval {
+                    Some(defval) => defval,
+                    None => out_parameter(at)?,
+                }
+            }
+            direction => {
+                if direction == PARAMFLAG_FIN_FOUT {
+                    out.inoutmask |= 1 << i;
+                    out.numretvals += 1;
+                }
+                get_arg(&mut index, name.as_deref(), defval, passed, kwargs)?
+            }
+        };
+        out.args.push(value);
+    }
+    Ok(out)
+}
+
+/// `_get_arg` — the next positional argument, else the keyword of that name,
+/// else the declared default.
+fn get_arg(
+    index: &mut usize,
+    name: Option<&str>,
+    defval: Option<PyObjectRef>,
+    inargs: &[PyObjectRef],
+    kwargs: Option<PyObjectRef>,
+) -> Result<PyObjectRef, crate::PyError> {
+    if *index < inargs.len() {
+        let value = inargs[*index];
+        *index += 1;
+        return Ok(value);
+    }
+    if let (Some(kwargs), Some(name)) = (kwargs, name)
+        && let Some(value) = unsafe { pyre_object::w_dict_getitem_str(kwargs, name) }
+    {
+        *index += 1;
+        return Ok(value);
+    }
+    if let Some(defval) = defval {
+        return Ok(defval);
+    }
+    Err(match name {
+        Some(name) => crate::PyError::type_error(format!("required argument '{name}' missing")),
+        None => crate::PyError::type_error("not enough arguments"),
+    })
+}
+
+/// The instance an `out` parameter is given for the callee to write into.  The
+/// argtype points at the thing written, so that is what gets built — an array
+/// type being its own such thing.
+fn out_parameter(at: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let info = stginfo::stginfo_of(at);
+    if info.is_some_and(|info| stginfo::stginfo_paramfunc(info) == "array") {
+        return crate::call::type_call_instantiate(at, &[]);
+    }
+    match info.and_then(stginfo::stginfo_proto) {
+        Some(proto) if unsafe { pyre_object::is_type(proto) } => {
+            crate::call::type_call_instantiate(proto, &[])
+        }
+        // A simple pointer code points at no type there is an instance of.
+        _ => Err(crate::PyError::type_error(format!(
+            "{} 'out' parameter must be passed as default value",
+            type_display_name(at)
+        ))),
+    }
+}
+
+/// `_build_result` — with no `out` parameters the call's own result stands;
+/// with one it is that parameter, and with several a tuple of them.
+fn build_result(result: PyObjectRef, callargs: &CallArgs) -> Result<PyObjectRef, crate::PyError> {
+    if callargs.numretvals == 0 {
+        return Ok(result);
+    }
+    // `__ctypes_from_outparam__` is arbitrary Python and the tuple allocates,
+    // so every value still wanted lives in a root slot across both.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    for &arg in &callargs.args {
+        pyre_object::gc_roots::pin_root(arg);
+    }
+    let returned_base = pyre_object::gc_roots::shadow_stack_len();
+    let mut returned = 0;
+    for i in 0..callargs.args.len().min(u32::BITS as usize) {
+        let bit = 1 << i;
+        let value = if callargs.inoutmask & bit != 0 {
+            pyre_object::gc_roots::shadow_stack_get(base + i)
+        } else if callargs.outmask & bit != 0 {
+            from_outparam(pyre_object::gc_roots::shadow_stack_get(base + i))?
+        } else {
+            continue;
+        };
+        pyre_object::gc_roots::pin_root(value);
+        returned += 1;
+        if returned == callargs.numretvals as usize {
+            break;
+        }
+    }
+    if returned == 1 {
+        return Ok(pyre_object::gc_roots::shadow_stack_get(returned_base));
+    }
+    Ok(pyre_object::w_tuple_new(
+        (0..returned)
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(returned_base + i))
+            .collect(),
+    ))
+}
+
+fn from_outparam(value: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let method = crate::baseobjspace::getattr_str(value, "__ctypes_from_outparam__")?;
+    crate::call::call_function_impl_result(method, &[])
+}
+
+/// The Python value a returned `CallValue` becomes under return type `ret`.
+fn build_return_value(
+    ret: Ret,
+    result: host_ctypes::CallValue,
+) -> Result<PyObjectRef, crate::PyError> {
     match ret {
         Ret::Pointer(rt) => {
             let p = match result {
@@ -650,18 +1272,17 @@ fn cfuncptr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         }
         Ret::Void => Ok(cdata::decoded_to_pyobject(host_ctypes::DecodedValue::None)),
         Ret::Code(c) => {
-            // Reconstruct the raw result bytes and decode exactly as before:
-            // a scalar carries its register image, a pointer-code result its
-            // address bytes.
-            let decoded = match result {
-                host_ctypes::CallValue::Scalar(b) => host_ctypes::decode_type_code(&c, &b),
-                host_ctypes::CallValue::Pointer(p) => {
-                    host_ctypes::decode_type_code(&c, &p.to_ne_bytes())
+            // Reconstruct the raw result bytes and read them as a slot of that
+            // type: a scalar carries its register image, a pointer-code result
+            // its address bytes.
+            let bytes = match result {
+                host_ctypes::CallValue::Void => {
+                    return Ok(cdata::decoded_to_pyobject(host_ctypes::DecodedValue::None));
                 }
-                host_ctypes::CallValue::Void => host_ctypes::DecodedValue::None,
-                host_ctypes::CallValue::Aggregate(b) => host_ctypes::decode_type_code(&c, &b),
+                host_ctypes::CallValue::Scalar(b) | host_ctypes::CallValue::Aggregate(b) => b,
+                host_ctypes::CallValue::Pointer(p) => p.to_ne_bytes().to_vec(),
             };
-            Ok(cdata::decoded_to_pyobject(decoded))
+            Ok(cdata::decode_slot(&c, &bytes))
         }
     }
 }
@@ -827,6 +1448,71 @@ fn internal_pybytes_fromstringandsize(args: &[PyObjectRef]) -> Result<PyObjectRe
     Ok(pyre_object::bytesobject::w_bytes_from_bytes(
         &bytes[..size.min(bytes.len())],
     ))
+}
+
+/// `PyErr_SetFromWindowsErr(ierr)` — raise the OSError a Win32 error code
+/// names, or the one `GetLastError()` names when the code is 0.  The parameter
+/// is a C `int`, so a code with the top bit set arrives as the negative number
+/// `.winerror` reports; a code the system has no message for is spelled
+/// `Windows Error 0x<code>`, which is what `test_windows_message` reads.
+#[cfg(windows)]
+fn internal_pyerr_setfromwindowserr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let code = match args.first() {
+        Some(&arg) => crate::baseobjspace::int_w(arg)? as i32,
+        None => std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+    };
+    Err(crate::PyError::os_error_win32_syscall2(
+        code,
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+    ))
+}
+
+/// `_ctypes.call_function(address, args)` — call an address that carries no
+/// argtypes, no restype and no flags, so every argument converts by the
+/// default rules and the result is read as a C `int`.  `call_cdeclfunction` is
+/// the same call under `FUNCFLAG_CDECL`, which on this architecture is the
+/// only calling convention there is.
+pub(super) fn call_function(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (Some(&addr), Some(&arguments)) = (args.first(), args.get(1)) else {
+        return Err(crate::PyError::type_error(
+            "call_function() takes exactly 2 arguments",
+        ));
+    };
+    if !unsafe { pyre_object::is_tuple(arguments) } {
+        return Err(crate::PyError::type_error(format!(
+            "argument 2 must be tuple, not {}",
+            cdata::value_type_name(arguments)
+        )));
+    }
+    let addr = cdata::pointer_word(addr)?;
+    let mut keepalive: Vec<Vec<u8>> = Vec::new();
+    let owned = seq_to_vec(arguments)
+        .expect("a tuple")
+        .into_iter()
+        .map(|arg| marshal_default_arg(arg, &mut keepalive))
+        .collect::<Result<Vec<_>, _>>()?;
+    let host_args: Vec<host_ctypes::CallArg> = owned.iter().map(owned_arg_as_call_arg).collect();
+    let result = {
+        let _blocked = crate::module::thread::before_external_block();
+        super::seh::guard(|| {
+            host_ctypes::call(
+                addr,
+                &host_args,
+                host_ctypes::CallRet::Code("i"),
+                host_ctypes::CallOptions::default(),
+            )
+        })
+    };
+    drop(keepalive);
+    let bytes = match result?.map_err(call_error)? {
+        host_ctypes::CallValue::Scalar(b) => b,
+        host_ctypes::CallValue::Pointer(p) => p.to_ne_bytes().to_vec(),
+        _ => Vec::new(),
+    };
+    Ok(cdata::decoded_to_pyobject(host_ctypes::decode_type_code(
+        "i", &bytes,
+    )))
 }
 
 fn internal_pyos_snprintf(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -1051,7 +1737,9 @@ fn marshal_typed_arg(
     keepalive: &mut Vec<Vec<u8>>,
 ) -> Result<OwnedArg, crate::PyError> {
     if argtype_is_pointer_kind(at) {
-        return Ok(OwnedArg::Pointer(resolve_pointer_addr(arg, keepalive)?));
+        return Ok(OwnedArg::Pointer(pointer_argument_addr(
+            arg, at, keepalive,
+        )?));
     }
     // A by-value struct/union argtype.
     if is_aggregate_type(at) {
@@ -1059,8 +1747,12 @@ fn marshal_typed_arg(
     }
     let tc = cdata::type_code_of(at)
         .ok_or_else(|| crate::PyError::type_error("argtype has no valid '_type_'"))?;
-    // `encode_value` copies a same-typed cdata's bytes and otherwise converts,
-    // so a mismatched cdata cannot be reinterpreted through the wrong argtype.
+    // `PyCSimpleType.from_param` hands an instance of the argtype itself
+    // straight through and converts anything else, so a mismatched cdata
+    // cannot be reinterpreted through the wrong argtype.
+    if let Some(bytes) = cdata::same_type_bytes(&tc, arg) {
+        return Ok(OwnedArg::Typed(tc, bytes));
+    }
     let buf = cdata::encode_value(&tc, arg)?;
     Ok(OwnedArg::Typed(tc, buf))
 }
@@ -1109,7 +1801,7 @@ fn marshal_default_arg(
     } else if unsafe { pyre_object::is_bytes(arg) } {
         Ok(OwnedArg::Pointer(bytes_pointer_addr(arg, keepalive)))
     } else if unsafe { pyre_object::is_str(arg) } {
-        Err(str_arg_unsupported())
+        Ok(OwnedArg::Pointer(wstr_pointer_addr(arg, keepalive)))
     } else if unsafe { pyre_object::is_float(arg) } {
         Ok(OwnedArg::Double(crate::baseobjspace::float_w(arg)?))
     } else if unsafe { pyre_object::is_int(arg) } {
@@ -1119,6 +1811,28 @@ fn marshal_default_arg(
             "Don't know how to convert parameter",
         ))
     }
+}
+
+/// The address a pointer-kind argtype takes its argument as.
+///
+/// `PyCPointerType.from_param` accepts an instance of the type a `POINTER(T)`
+/// argtype points at by taking its address, which is what lets `f(c_int(5))`
+/// fill in a callee's `int *` — the address of the box, not the number in it.
+fn pointer_argument_addr(
+    arg: PyObjectRef,
+    at: PyObjectRef,
+    keepalive: &mut Vec<Vec<u8>>,
+) -> Result<usize, crate::PyError> {
+    if let Some(info) = stginfo::stginfo_of(at)
+        && stginfo::stginfo_paramfunc(info) == "pointer"
+        && let Some(proto) = stginfo::stginfo_proto(info)
+        && unsafe { pyre_object::is_type(proto) }
+        && unsafe { crate::baseobjspace::isinstance_w(arg, proto) }
+        && let Some(addr) = cdata::cdata_addr(arg)
+    {
+        return Ok(addr);
+    }
+    resolve_pointer_addr(arg, keepalive)
 }
 
 /// Resolve the address a pointer-kind argument lowers to: `byref()` carriers,
@@ -1151,12 +1865,12 @@ pub(super) fn resolve_pointer_addr(
     }
     if unsafe { pyre_object::is_none(arg) } {
         Ok(0)
-    } else if unsafe { pyre_object::is_int(arg) } {
-        Ok(crate::baseobjspace::int_w(arg)? as usize)
+    } else if unsafe { pyre_object::pyobject::is_int_or_long(arg) } {
+        Ok(cdata::pointer_word(arg)?)
     } else if unsafe { pyre_object::is_bytes(arg) } {
         Ok(bytes_pointer_addr(arg, keepalive))
     } else if unsafe { pyre_object::is_str(arg) } {
-        Err(str_arg_unsupported())
+        Ok(wstr_pointer_addr(arg, keepalive))
     } else {
         Err(crate::PyError::type_error(
             "expected bytes, integer address, ctypes instance, or None",
@@ -1173,9 +1887,14 @@ fn bytes_pointer_addr(arg: PyObjectRef, keepalive: &mut Vec<Vec<u8>>) -> usize {
     keepalive.last().unwrap().as_ptr() as usize
 }
 
-fn str_arg_unsupported() -> crate::PyError {
-    crate::PyError::type_error(
-        "str argument marshalling (wchar_t*) is not implemented in this ctypes slice; \
-         pass bytes for char* arguments",
-    )
+/// Copy a `str` into a NUL-terminated `wchar_t` buffer, keep the copy alive,
+/// and return its address.  `_conv_param` reaches the same place by building
+/// a `c_wchar_p(arg)` and taking its ffi parameter, and `ConvParam` by
+/// `PyUnicode_AsWideCharString` with the buffer held in a capsule for the
+/// duration of the call; `c_wchar_p`'s own setter (`encode_value_into`, the
+/// `Z` arm) spells the copy the same way.
+fn wstr_pointer_addr(arg: PyObjectRef, keepalive: &mut Vec<Vec<u8>>) -> usize {
+    let raw = unsafe { pyre_object::w_str_get_wtf8(arg) };
+    keepalive.push(host_ctypes::wchar_null_terminated_bytes(raw));
+    keepalive.last().unwrap().as_ptr() as usize
 }

@@ -179,7 +179,24 @@ pub unsafe fn walk_signal_handler_roots_area(
 /// valid signal in its low 32 bits — `(1 << 32) | SIGINT` — would pass the
 /// check and act on the signal it aliases.
 fn signum_arg(w_signum: PyObjectRef) -> Result<i64, crate::PyError> {
-    crate::baseobjspace::gateway_int_w(w_signum)
+    let signum = crate::baseobjspace::gateway_int_w(w_signum).map_err(|err| {
+        if err.kind == crate::PyErrorKind::OverflowError {
+            c_int_overflow()
+        } else {
+            err
+        }
+    })?;
+    if i32::try_from(signum).is_err() {
+        return Err(c_int_overflow());
+    }
+    Ok(signum)
+}
+
+/// `signalnum: int` lands in a C `int`, so a number too large for one is an
+/// OverflowError from the conversion rather than a signal number out of range
+/// (`PyLong_AsInt`).
+fn c_int_overflow() -> crate::PyError {
+    crate::PyError::overflow_error("Python int too large to convert to C int")
 }
 
 /// interp_signal.py:285-288 `check_signum_in_range`.
@@ -189,6 +206,23 @@ fn check_signum_in_range(signum: i64) -> Result<(), crate::PyError> {
     } else {
         Err(crate::PyError::value_error("signal number out of range"))
     }
+}
+
+/// Whether the runtime has a signal under this number at all.  `SIGBREAK` is
+/// its own, so the set is spelled out rather than taken from `libc`.
+#[cfg(windows)]
+fn windows_handles_signal(signum: i32) -> bool {
+    const SIGBREAK: i32 = 21;
+    matches!(
+        signum,
+        libc::SIGINT
+            | libc::SIGILL
+            | libc::SIGFPE
+            | libc::SIGSEGV
+            | libc::SIGTERM
+            | SIGBREAK
+            | libc::SIGABRT
+    )
 }
 
 /// interp_signal.py:291-326 `signal(signum, handler) -> previous`.
@@ -204,6 +238,15 @@ fn signal_signal(
         return Err(crate::PyError::value_error(
             "signal only works in main thread or with _signals_enabled",
         ));
+    }
+    // The runtime handles seven numbers and reports any other through the
+    // invalid parameter handler.  `signal_signal_impl` spells that set out
+    // ahead of the range check, so a number outside it is refused as an
+    // invalid value rather than as one out of range — and the conversion
+    // above has already bounded it to a C `int`.
+    #[cfg(windows)]
+    if !windows_handles_signal(signum as i32) {
+        return Err(crate::PyError::value_error("invalid signal value"));
     }
     check_signum_in_range(signum)?;
     // The range check bounds it to `1..NSIG`, so the narrowing is exact.
@@ -246,6 +289,13 @@ fn signal_getsignal(w_signum: PyObjectRef) -> Result<PyObjectRef, crate::PyError
     let signum = signum_arg(w_signum)?;
     check_signum_in_range(signum)?;
     let signum = signum as i32;
+    // A number the runtime has no signal under was never anyone's to handle,
+    // which `signal_module_exec` records as no handler at all rather than as
+    // the default one.
+    #[cfg(windows)]
+    if !windows_handles_signal(signum) {
+        return Ok(pyre_object::w_none());
+    }
     let h = get_handler(signum);
     Ok(if h.is_null() {
         pyre_object::w_int_new(0)
@@ -494,7 +544,7 @@ pub fn install_signal_handling(ec: &mut ExecutionContext) {
         signalstate::register_ticker(ticker_addr);
 
         // app_main.py:926 — `signal.signal(SIGINT, default_int_handler)`.
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             let sigint = libc::SIGINT;
             if signalstate::pypysig_setflag(sigint) {
@@ -612,7 +662,50 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         )));
                     }
                 }
-                #[cfg(not(unix))]
+                // `getsockopt` is how the descriptor is asked whether it is
+                // a socket (`signal_set_wakeup_fd_impl`).  WinSock answers
+                // every call with `WSANOTINITIALISED` until `WSAStartup` has
+                // run, which is why the import of `_socket` there is not just
+                // for the constants.
+                #[cfg(all(windows, not(feature = "sandbox")))]
+                {
+                    use crate::module::_socket::rsocket_rffi as rffi;
+                    rffi::init();
+                    let mut error: libc::c_int = 0;
+                    let mut len = size_of_val(&error) as rffi::SockLen;
+                    let queried = unsafe {
+                        rffi::getsockopt(
+                            rffi::socket_from_i64(i64::from(fd)),
+                            rffi::SOL_SOCKET,
+                            rffi::SO_ERROR,
+                            (&raw mut error).cast(),
+                            &raw mut len,
+                        )
+                    };
+                    if queried != 0 {
+                        let code = rffi::last_error_code();
+                        // `WSAENOTSOCK` is the descriptor answering that it
+                        // is not a socket, which is not a refusal: a file
+                        // descriptor is taken as well, and `_Py_fstat` is
+                        // what answers for that one — an unopened number
+                        // has no handle behind it.  A descriptor is always
+                        // blocking here, so there is nothing else to check.
+                        if code != rffi::WSAENOTSOCK {
+                            return Err(crate::PyError::os_error_win32_syscall2(
+                                code,
+                                pyre_object::PY_NULL,
+                                pyre_object::PY_NULL,
+                            ));
+                        }
+                        if crate::builtins::crt_call!(libc::get_osfhandle(fd)) == -1 {
+                            return Err(crate::PyError::os_error_syscall(
+                                libc::EBADF,
+                                pyre_object::PY_NULL,
+                            ));
+                        }
+                    }
+                }
+                #[cfg(all(not(unix), any(not(windows), feature = "sandbox")))]
                 if fd < -1 {
                     return Err(crate::PyError::value_error(
                         "set_wakeup_fd(): fd must be -1 or a valid file descriptor",
@@ -647,7 +740,25 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             "raise_signal() missing argument",
                         ));
                     };
-                    match rustpython_host_env::signal::raise_signal(signum) {
+                    // The MSVC runtime reports a signal number it does not
+                    // have through its invalid parameter handler, whose
+                    // default action ends the process before `raise` can
+                    // return.  Silenced, it answers -1 and sets `EINVAL`
+                    // (`signal_raise_signal_impl`).
+                    #[cfg(windows)]
+                    let raised = {
+                        crate::builtins::clear_crt_errno();
+                        if crate::builtins::crt_call!(libc::raise(signum)) == 0 {
+                            Ok(())
+                        } else {
+                            Err(std::io::Error::from_raw_os_error(
+                                crate::builtins::crt_errno(),
+                            ))
+                        }
+                    };
+                    #[cfg(not(windows))]
+                    let raised = rustpython_host_env::signal::raise_signal(signum);
+                    match raised {
                         Ok(()) => {
                             // interp_signal.py:583-584 — the signal may
                             // have been delivered to this thread; run the
@@ -682,11 +793,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             |args| {
                 #[cfg(feature = "host_env")]
                 {
-                    let signum = if let Some(&a) = args.first() {
-                        unsafe { pyre_object::w_int_get_value(a) }
-                    } else {
+                    let Some(&a) = args.first() else {
                         return Err(crate::PyError::type_error("strsignal() missing argument"));
                     };
+                    let signum = signum_arg(a)?;
                     // interp_signal.py:593-594 spells this bound inline rather
                     // than calling `check_signum_in_range`, and its `signalnum
                     // > NSIG` admits `NSIG` itself.  3.14 rejects it — its own
@@ -737,23 +847,24 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             0,
         ),
     );
-    // moduledef.py:17 `'ItimerError': 'interp_signal.get_itimer_error(space)'`
-    // — `signal.new_exception_class("signal.ItimerError", space.w_IOError)`.
-    // An OSError subclass so `setitimer`'s `exception_from_saved_errno`
-    // instance carries errno / strerror.
-    let w_os_error = crate::builtins::lookup_exc_class("OSError")
-        .expect("OSError must be installed before _signal init");
-    crate::module_ns_store(
-        ns,
-        "ItimerError",
-        crate::builtins::make_exc_type(
-            "signal.ItimerError",
-            crate::builtins::exc_os_error_new,
-            w_os_error,
-        ),
-    );
     #[cfg(unix)]
     {
+        // moduledef.py:17 `'ItimerError': 'interp_signal.get_itimer_error(space)'`
+        // — `signal.new_exception_class("signal.ItimerError", space.w_IOError)`.
+        // An OSError subclass so `setitimer`'s `exception_from_saved_errno`
+        // instance carries errno / strerror.  It is published beside the
+        // itimers it reports on, so a platform without them does not carry it.
+        let w_os_error = crate::builtins::lookup_exc_class("OSError")
+            .expect("OSError must be installed before _signal init");
+        crate::module_ns_store(
+            ns,
+            "ItimerError",
+            crate::builtins::make_exc_type(
+                "signal.ItimerError",
+                crate::builtins::exc_os_error_new,
+                w_os_error,
+            ),
+        );
         crate::module_ns_store(
             ns,
             "alarm",
@@ -1266,8 +1377,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     }
     crate::module_ns_store(ns, "SIG_DFL", pyre_object::w_int_new(0));
     crate::module_ns_store(ns, "SIG_IGN", pyre_object::w_int_new(1));
-    // libc crate doesn't surface NSIG portably; use POSIX 64-signal cap.
-    crate::module_ns_store(ns, "NSIG", pyre_object::w_int_new(64));
+    crate::module_ns_store(
+        ns,
+        "NSIG",
+        pyre_object::w_int_new(i64::from(signalstate::NSIG)),
+    );
     // Common signal numbers (POSIX subset, sourced from libc so numerics
     // match the host — Linux SIGUSR1=10 / macOS SIGUSR1=30, etc.).
     #[cfg(unix)]
@@ -1309,5 +1423,23 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         );
         crate::module_ns_store(ns, "SIGIO", pyre_object::w_int_new(libc::SIGIO as i64));
         crate::module_ns_store(ns, "SIGSYS", pyre_object::w_int_new(libc::SIGSYS as i64));
+    }
+    // The seven the MSVC runtime defines, and the two console events
+    // `os.kill` sends in place of a signal.  `Lib/signal.py` builds its
+    // `Signals` enum out of exactly these names, so `valid_signals()` and
+    // `Signals(2)` answer from here.
+    #[cfg(windows)]
+    {
+        // `SIGBREAK` is the runtime's own, absent from the libc crate.
+        const SIGBREAK: i64 = 21;
+        crate::module_ns_store(ns, "SIGINT", pyre_object::w_int_new(libc::SIGINT as i64));
+        crate::module_ns_store(ns, "SIGILL", pyre_object::w_int_new(libc::SIGILL as i64));
+        crate::module_ns_store(ns, "SIGFPE", pyre_object::w_int_new(libc::SIGFPE as i64));
+        crate::module_ns_store(ns, "SIGSEGV", pyre_object::w_int_new(libc::SIGSEGV as i64));
+        crate::module_ns_store(ns, "SIGTERM", pyre_object::w_int_new(libc::SIGTERM as i64));
+        crate::module_ns_store(ns, "SIGBREAK", pyre_object::w_int_new(SIGBREAK));
+        crate::module_ns_store(ns, "SIGABRT", pyre_object::w_int_new(libc::SIGABRT as i64));
+        crate::module_ns_store(ns, "CTRL_C_EVENT", pyre_object::w_int_new(0));
+        crate::module_ns_store(ns, "CTRL_BREAK_EVENT", pyre_object::w_int_new(1));
     }
 }

@@ -81,6 +81,12 @@ fn init_cdata_type(ns: PyObjectRef) {
             ),
         );
     }
+    // What an `out` parameter hands back once the callee has written it.
+    type_ns_store(
+        ns,
+        "__ctypes_from_outparam__",
+        crate::make_builtin_function("__ctypes_from_outparam__", |args| Ok(args[0])),
+    );
 }
 
 pub(super) fn cdata_in_dll(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -258,6 +264,21 @@ fn init_simplecdata_type(ns: PyObjectRef) {
         "__new__",
         crate::typedef::make_new_descr(simplecdata_new),
     );
+    // A scalar `out` parameter hands back the value rather than the box; one
+    // whose type is a user subclass hands back the instance, because the
+    // subclass is the thing the caller asked for.
+    type_ns_store(
+        ns,
+        "__ctypes_from_outparam__",
+        crate::make_builtin_function("__ctypes_from_outparam__", |args| {
+            let obj = args[0];
+            if super::funcptr::is_simple_subclass(unsafe { pyre_object::w_instance_get_type(obj) })
+            {
+                return Ok(obj);
+            }
+            value_getter(&[pyre_object::PY_NULL, obj])
+        }),
+    );
     type_ns_store(
         ns,
         "__repr__",
@@ -316,10 +337,7 @@ fn simplecdata_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let value = if tc == "O" {
         host_ctypes::read_pointer_from_buffer(cdata_bytes(obj).unwrap_or(&[])) as PyObjectRef
     } else {
-        decoded_to_pyobject(host_ctypes::decode_type_code(
-            &tc,
-            cdata_bytes(obj).unwrap_or(&[]),
-        ))
+        decode_slot(&tc, cdata_bytes(obj).unwrap_or(&[]))
     };
     let rendered = unsafe { crate::display::py_repr_wtf8(value) }?;
     let name = unsafe { pyre_object::typeobject::w_type_get_name(cls) };
@@ -460,15 +478,19 @@ fn value_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             address as PyObjectRef
         });
     }
+    // A BSTR carries no swapped spelling — `X` has no entry in the byte-order
+    // tables — so it is read before the reversal below could reach it.
+    #[cfg(windows)]
+    if tc == "X" {
+        return Ok(decode_slot(&tc, bytes));
+    }
     let swapped = unsafe { crate::baseobjspace::lookup_in_type(cls, "_swappedbytes_") }.is_some();
     let owned;
     if swapped {
         owned = bytes.iter().rev().copied().collect::<Vec<_>>();
         bytes = &owned;
     }
-    Ok(decoded_to_pyobject(host_ctypes::decode_type_code(
-        &tc, bytes,
-    )))
+    Ok(decode_slot(&tc, bytes))
 }
 
 /// `_SimpleCData.value` setter — `(descr, instance, value)`.
@@ -483,6 +505,7 @@ fn value_setter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let value_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(value);
+    release_bstr_slot(&tc, cdata_addr(obj).unwrap_or(0));
     let mut bytes = encode_value_into(&tc, value, obj, "0")?;
     if unsafe { crate::baseobjspace::lookup_in_type(cls, "_swappedbytes_") }.is_some() {
         bytes.reverse();
@@ -1230,20 +1253,129 @@ pub(super) fn invalid_type_code_error() -> crate::PyError {
 
 // ── scalar value ⇄ bytes ──────────────────────────────────────────────
 
+/// The `str` a BSTR slot holds, or `None` for a null one.
+///
+/// `X_get` reads the length out of the string itself (`SysStringLen`) rather
+/// than stopping at the first NUL, because a BSTR may carry one; a null
+/// pointer and a zero-length string are the same value here.
+#[cfg(windows)]
+pub(super) fn bstr_to_pyobject(bytes: &[u8]) -> PyObjectRef {
+    let addr = host_ctypes::read_pointer_from_buffer(bytes);
+    if addr == 0 {
+        return pyre_object::w_none();
+    }
+    let units = unsafe {
+        std::slice::from_raw_parts(
+            addr as *const u16,
+            windows_sys::Win32::Foundation::SysStringLen(addr as *const u16) as usize,
+        )
+    };
+    pyre_object::w_str_from_wtf8(rustpython_wtf8::Wtf8Buf::from_wide(units))
+}
+
+/// The Python value the bytes of a slot of type code `tc` hold.
+///
+/// The host's decode table answers None for a code it does not know, and it
+/// does not know the BSTR one; `X_get` reads that out of the length the string
+/// itself records.
+pub(super) fn decode_slot(tc: &str, bytes: &[u8]) -> PyObjectRef {
+    #[cfg(windows)]
+    if tc == "X" {
+        return bstr_to_pyobject(bytes);
+    }
+    // `P_get` reads a null pointer as `None`, the way `z_get` and `Z_get` read
+    // a null string as one; the host's table answers the address either way.
+    if tc == "P" && host_ctypes::read_pointer_from_buffer(bytes) == 0 {
+        return pyre_object::w_none();
+    }
+    decoded_to_pyobject(host_ctypes::decode_type_code(tc, bytes))
+}
+
+/// Release the BSTR a slot holds before something else is written over it.
+///
+/// A BSTR is the one value a ctypes buffer owns outright: `SysAllocStringLen`
+/// allocated it, nothing else refers to it, and `X_set` frees the previous
+/// contents on every store.  `addr` is the slot's own address, which is what
+/// every caller has — the object's buffer for a `value` store, that buffer
+/// plus the field offset for a struct or array slot, and the item address for
+/// a pointer store.
+#[cfg(windows)]
+pub(super) fn release_bstr_slot(tc: &str, addr: usize) {
+    if tc != "X" || addr == 0 {
+        return;
+    }
+    let previous = unsafe { (addr as *const usize).read_unaligned() };
+    if previous != 0 {
+        unsafe { windows_sys::Win32::Foundation::SysFreeString(previous as *const u16) };
+    }
+}
+
+#[cfg(not(windows))]
+pub(super) fn release_bstr_slot(_tc: &str, _addr: usize) {}
+
+/// `Py_TYPE(value)->tp_name` — the class an instance reports itself as, which
+/// for an instance-layout object is its `w_class` rather than the layout type
+/// its `ob_type` names.
+pub(super) fn value_type_name(obj: PyObjectRef) -> String {
+    match crate::typedef::r#type(obj) {
+        Some(tp) => unsafe { pyre_object::w_type_get_name(tp.as_ptr()) }.to_string(),
+        None => unsafe { pyre_object::type_name_of(obj) }.to_string(),
+    }
+}
+
+/// The pointer-width word an `int` names, over the whole unsigned range.
+/// `PyLong_AsVoidPtr` reads the value as a signed word and falls back to the
+/// unsigned conversion when that overflows, so an address with the top bit set
+/// — every Windows pseudo-handle, `GetCurrentProcess()` among them — is an
+/// address like any other rather than an integer too large to be one.
+pub(super) fn pointer_word(obj: PyObjectRef) -> Result<usize, crate::PyError> {
+    match crate::baseobjspace::int_w(obj) {
+        Ok(value) => Ok(value as usize),
+        Err(err) if err.kind == crate::PyErrorKind::OverflowError => {
+            Ok(crate::baseobjspace::uint_w(obj)? as usize)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// The bytes of a `_SimpleCData` whose own type code is `tc`, which a
+/// destination that takes an *instance* copies byte-for-byte
+/// (`_PyCData_set`, the `PyObject_IsInstance` arm reached when the field
+/// carries no setfunc of its own).
+pub(super) fn same_type_bytes(tc: &str, obj: PyObjectRef) -> Option<Vec<u8>> {
+    if !is_simplecdata_instance(obj) {
+        return None;
+    }
+    let src_cls = unsafe { pyre_object::w_instance_get_type(obj) };
+    (type_code_of(src_cls).as_deref() == Some(tc)).then(|| cdata_bytes(obj).unwrap_or(&[]).to_vec())
+}
+
+/// Store into a destination that takes an instance — a struct field, an array
+/// item, a pointer item.  `_PyCData_set` reaches those with a null field
+/// setfunc, so a same-typed instance is copied and everything else falls to
+/// the type's own setter.  `Simple_init` and the `value` setter call that
+/// setter directly (`Simple_set_value`) and so take no instance at all:
+/// `c_long(c_long(42))` is a TypeError from `PyNumber_Index`.
+pub(super) fn encode_instance_or_value(
+    tc: &str,
+    value: PyObjectRef,
+    dest: PyObjectRef,
+    key: &str,
+) -> Result<Vec<u8>, crate::PyError> {
+    match same_type_bytes(tc, value) {
+        Some(bytes) => Ok(bytes),
+        None => encode_value_into(tc, value, dest, key),
+    }
+}
+
 /// Encode a Python scalar into the native-endian buffer bytes for `tc`.
 ///
-/// A `_SimpleCData` instance of the *same* type code is copied byte-for-byte; a
-/// differently-typed one falls through to normal conversion (which rejects it
-/// unless it is int/float-like), so a larger scalar cannot overwrite a smaller
-/// field with its raw buffer.
+/// This is the type's own setter (`setfunc`), which takes a value and not a
+/// cdata: a `_SimpleCData` instance is converted like anything else, and so
+/// rejected unless it is int/float-like.  A destination that also accepts an
+/// instance of its own type reaches it through `encode_instance_or_value`.
 pub(super) fn encode_value(tc: &str, obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
     use host_ctypes::SimpleStorageValue as V;
-    if is_simplecdata_instance(obj) {
-        let src_cls = unsafe { pyre_object::w_instance_get_type(obj) };
-        if type_code_of(src_cls).as_deref() == Some(tc) {
-            return Ok(cdata_bytes(obj).unwrap_or(&[]).to_vec());
-        }
-    }
     let val = match tc {
         "c" => {
             if unsafe { pyre_object::is_bytes(obj) } {
@@ -1300,11 +1432,53 @@ pub(super) fn encode_value(tc: &str, obj: PyObjectRef) -> Result<Vec<u8>, crate:
         "P" | "z" | "Z" => {
             if unsafe { pyre_object::is_none(obj) } {
                 V::Pointer(0)
-            } else if unsafe { pyre_object::is_int(obj) } {
-                V::Pointer(crate::baseobjspace::int_w(obj)? as usize)
+            } else if unsafe { pyre_object::pyobject::is_int_or_long(obj) } {
+                V::Pointer(pointer_word(obj)?)
             } else {
-                return Err(crate::PyError::type_error("cannot be converted to pointer"));
+                // Each of the three says what it takes.  `z_set` and `Z_set`
+                // name the type that was passed instead
+                // (`Py_TYPE(value)->tp_name`, the bare name); `P_set` takes
+                // nothing but an address and says only that.
+                let refused = |what: &str| {
+                    let got = value_type_name(obj);
+                    format!("{what} or integer address expected instead of {got} instance")
+                };
+                return Err(crate::PyError::type_error(match tc {
+                    "z" => refused("bytes"),
+                    "Z" => refused("unicode string"),
+                    _ => "cannot be converted to pointer".to_string(),
+                }));
             }
+        }
+        #[cfg(windows)]
+        "X" => {
+            // `X_set` takes a `str` and nothing else — not even the `bytes`
+            // every other pointer code accepts — and allocates the BSTR the
+            // slot will own.  Freeing what the slot held is the caller's,
+            // because only it knows where the slot is.
+            let addr = if unsafe { pyre_object::is_none(obj) } {
+                0
+            } else if unsafe { pyre_object::is_str(obj) } {
+                let units: Vec<u16> = unsafe { pyre_object::w_str_get_wtf8(obj) }
+                    .encode_wide()
+                    .collect();
+                let Ok(len) = u32::try_from(units.len()) else {
+                    return Err(crate::PyError::value_error("String too long for BSTR"));
+                };
+                let bstr = unsafe {
+                    windows_sys::Win32::Foundation::SysAllocStringLen(units.as_ptr(), len)
+                };
+                bstr as usize
+            } else {
+                return Err(crate::PyError::type_error(format!(
+                    "unicode string expected instead of {} instance",
+                    value_type_name(obj)
+                )));
+            };
+            // The host's storage table has no entry for this code and answers
+            // a single zero byte for one it does not know, so the pointer is
+            // written here — `read_pointer_from_buffer` reads it back.
+            return Ok(addr.to_ne_bytes().to_vec());
         }
         "O" => V::ObjectId(obj as usize),
         _ => V::Signed(crate::baseobjspace::int_w(obj)? as i128),
