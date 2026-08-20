@@ -3640,6 +3640,70 @@ mod tests {
     /// apart, so a registry that passes here can still feed
     /// `runtime_fnaddr_patch` an ambiguous build address — that direction is
     /// what its own assertion catches.
+    /// Whether two registered paths are two spellings of one item, which is
+    /// the only legitimate reason for them to share an address.
+    fn are_alias_spellings(a: &str, b: &str) -> bool {
+        /// One path is the other with more leading segments, on a `::`
+        /// boundary — the shape a registry entry recorded with its crate
+        /// segment has against the same entry recorded without one.
+        fn extends(a: &str, b: &str) -> bool {
+            let (short, long) = if a.len() > b.len() { (b, a) } else { (a, b) };
+            long == short
+                || long
+                    .strip_suffix(short)
+                    .is_some_and(|prefix| prefix.ends_with("::"))
+        }
+        fn split_head(path: &str) -> Option<(&str, &str)> {
+            path.split_once("::")
+        }
+        // A crate-root re-export (`pyre_interpreter::acquire_buffered_lock`)
+        // beside its defining path (`pyre_interpreter::module::_io::
+        // acquire_buffered_lock`) is related by neither suffix while the crate
+        // segment leads both, so drop that segment — but only when the two
+        // paths lead with the same one. No crate re-exports another crate's
+        // item, so `pyre_object::module::x::f` and
+        // `pyre_interpreter::module::x::f` are two functions whose modules are
+        // spelled alike, and comparing their tails would call them one.
+        //
+        // Comparing only the last segment would accept far more than either
+        // rule: `module::a::type_object` and `module::b::type_object` would
+        // read as aliases while address-keyed patching between them stays
+        // ambiguous. Those are related by no suffix here and are reported.
+        if extends(a, b) {
+            return true;
+        }
+        match (split_head(a), split_head(b)) {
+            (Some((head_a, rest_a)), Some((head_b, rest_b))) => {
+                head_a == head_b && extends(rest_a, rest_b)
+            }
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn two_distinct_items_sharing_an_address_are_not_alias_spellings() {
+        // The pair the leaf-name grouping used to accept.
+        assert!(!are_alias_spellings(
+            "pyre_interpreter::module::a::type_object",
+            "pyre_interpreter::module::b::type_object",
+        ));
+        // Both shapes the registry actually produces.
+        assert!(are_alias_spellings(
+            "pyre_interpreter::acquire_buffered_lock",
+            "pyre_interpreter::module::_io::acquire_buffered_lock",
+        ));
+        assert!(are_alias_spellings(
+            "module::_io::stringio::type_object",
+            "pyre_interpreter::module::_io::stringio::type_object",
+        ));
+        // Two crates cannot re-export one another's item, so identical module
+        // paths under different crates are two functions, not two spellings.
+        assert!(!are_alias_spellings(
+            "pyre_object::module::x::type_object",
+            "pyre_interpreter::module::x::type_object",
+        ));
+    }
+
     #[test]
     fn registered_paths_sharing_an_address_are_alias_spellings() {
         let mut by_addr: HashMap<i64, Vec<&'static str>> = HashMap::new();
@@ -3652,12 +3716,17 @@ mod tests {
         // names a different pair.
         let mut collisions: Vec<String> = Vec::new();
         for (addr, paths) in &by_addr {
-            let leaves: std::collections::BTreeSet<&str> = paths
-                .iter()
-                .map(|p| p.rsplit("::").next().unwrap_or(p))
-                .collect();
-            if leaves.len() > 1 {
-                collisions.push(format!("{addr:#x} {leaves:?}"));
+            let mut unrelated: Vec<(&str, &str)> = Vec::new();
+            for (i, a) in paths.iter().enumerate() {
+                for b in &paths[i + 1..] {
+                    if !are_alias_spellings(a, b) {
+                        unrelated.push((a, b));
+                    }
+                }
+            }
+            if !unrelated.is_empty() {
+                unrelated.sort_unstable();
+                collisions.push(format!("{addr:#x} {unrelated:?}"));
             }
         }
         collisions.sort();

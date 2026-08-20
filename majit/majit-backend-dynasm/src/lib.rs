@@ -406,6 +406,32 @@ pub fn stack_check_addresses() -> Option<StackCheckAddresses> {
 /// Output: the int interpretation of the handled result (the caller
 ///         re-casts to the portal's return type).
 ///
+/// Removes a `gc_add_root` registration on every exit path.
+///
+/// The rooted cell is a local of the trampoline below, and the hooks it calls
+/// trace, compile and run Python — any of which can unwind. An unwind past a
+/// bare `gc_remove_root` frees the cell while the registration still names it,
+/// leaving the collector writing through freed stack.
+struct GcRootScope(*mut majit_ir::GcRef);
+
+impl Drop for GcRootScope {
+    fn drop(&mut self) {
+        majit_gc::gc_remove_root(self.0);
+    }
+}
+
+/// Restores the resume-root stack depth on every exit path.
+///
+/// Same hazard as [`GcRootScope`]: the registered slots point into the
+/// trampoline's `raw_values`, which an unwind frees.
+struct ResumeRefRootScope(usize);
+
+impl Drop for ResumeRefRootScope {
+    fn drop(&mut self) {
+        majit_gc::shadow_stack::pop_resume_ref_roots_to(self.0);
+    }
+}
+
 /// The callee jitframe is GC-managed by the rewriter's
 /// `handle_call_assembler` path, so the helper must not free it here.
 #[expect(
@@ -732,9 +758,46 @@ fn handle_fail_resume_guard(
     // depend on `majit-metainterp`, and `BridgeFn` does not carry the
     // exception, so the bridge hook cannot park a value it never receives.
     // Either fix costs more machinery than the root pair it would delete.
-    let guard_exc_rooted = guard_exc_root.0 != 0;
-    if guard_exc_rooted {
-        unsafe { majit_gc::gc_add_root(&mut guard_exc_root as *mut majit_ir::GcRef) };
+    let _guard_exc_scope = (guard_exc_root.0 != 0).then(|| {
+        let slot = &mut guard_exc_root as *mut majit_ir::GcRef;
+        unsafe { majit_gc::gc_add_root(slot) };
+        GcRootScope(slot)
+    });
+
+    // `raw_values` is a host copy of the jitframe slots, and only the jitframe
+    // itself is walked (`jitframe_trace`).  The bridge hook below traces and
+    // compiles, so it allocates: a moving collection forwards the frame's own
+    // slots and leaves this copy naming the addresses the objects have left,
+    // which the blackhole call further down then reads.  Register the copy's
+    // GC slots for the hook's duration so the collector writes the forwarded
+    // addresses back through them.
+    //
+    // `pyre-jit`'s other guard-failure path already does this around its own
+    // bridge decision (`DeadFrameRefRoots::enter`, `eval.rs handle_fail`); that
+    // type sits behind `majit-metainterp`, which this crate does not depend on,
+    // so the same shadow-stack primitives are used directly here.
+    //
+    // The scope ends before the blackhole call rather than wrapping it: the
+    // blackhole receiver registers the same buffer itself, and a slot left
+    // registered across the resumed run pins whatever the guard happened to
+    // leave in it (`blackhole.py:1782-1796` ends `deadframe`'s live range at
+    // `_prepare_resume_from_failure`, before `_run_forever`).
+    //
+    // The rooted set is `compute_gcmap`'s: every `Ref`-typed exit slot, force
+    // tokens included — one is the jitframe pointer, and the jitframe moves.
+    let resume_ref_roots = ResumeRefRootScope(majit_gc::shadow_stack::resume_ref_roots_depth());
+    let fail_arg_types = descr.fail_arg_types();
+    for slot in 0..raw_values.len() {
+        if matches!(fail_arg_types.get(slot), Some(majit_ir::Type::Ref)) {
+            // SAFETY: `slot` indexes `raw_values`, which outlives the pop below
+            // and is not resized while the roots are registered.
+            unsafe {
+                majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_raw_parts_mut(
+                    raw_values.as_mut_ptr().add(slot),
+                    1,
+                ));
+            }
+        }
     }
 
     // compile.py:704-709 `_trace_and_compile_from_bridge`.
@@ -743,6 +806,7 @@ fn handle_fail_resume_guard(
     if let (Some(_jct), Some(bridge_fn)) = (owning_jct.as_ref(), CA_BRIDGE_FN.get()) {
         bridge_fn(raw_values.as_ptr(), raw_values.len(), descr_raw);
     }
+    drop(resume_ref_roots);
 
     // compile.py:710-716 `resume_in_blackhole(descr, deadframe)`: the
     // descr is the sole identity carrier; the receiver derives green_key /
@@ -764,9 +828,6 @@ fn handle_fail_resume_guard(
             guard_exc_root.0 as i64,
         )
     });
-    if guard_exc_rooted {
-        majit_gc::gc_remove_root(&mut guard_exc_root as *mut majit_ir::GcRef);
-    }
     if let Some(bh_result) = bh_result {
         if majit_log_enabled() {
             eprintln!(
