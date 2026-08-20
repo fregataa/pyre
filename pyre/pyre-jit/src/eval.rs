@@ -335,6 +335,9 @@ unsafe fn pyre_object_eq_w_trampoline(
         Ok(v) => v,
         Err(e) => {
             pyre_interpreter::baseobjspace::set_pending_hash_error(e);
+            // `a` outlived a user `__eq__` and so may name the pre-collection
+            // copy.  It is stored as a presence token — `take_eq_error` only
+            // tests the slot for null — and never followed.
             pyre_object::dict_eq_hook::signal_eq_error(a);
             false
         }
@@ -355,6 +358,8 @@ unsafe fn pyre_object_hash_w_trampoline(obj: pyre_object::PyObjectRef) -> i64 {
         Ok(h) => h,
         Err(e) => {
             pyre_interpreter::baseobjspace::set_pending_dict_hash_error(e);
+            // A presence token, as in `pyre_object_eq_w_trampoline`: stale
+            // after a user `__hash__`, and only ever tested for null.
             pyre_object::dict_eq_hook::signal_hash_error(obj);
             0
         }
@@ -8415,14 +8420,24 @@ fn deliver_exit_frame_exception(
     frame: &mut PyFrame,
     mut err: pyre_interpreter::PyError,
 ) -> PyResult {
-    let mut handler_instr = frame.next_instr();
-    if exit_frame_handler_needs_unwritten_stack(frame) {
+    // `handle_exception` normalizes the exception, records a traceback and can
+    // run a trace function, all of which allocate.  The frame reaching this
+    // entry is the movable kind — `ll_portal_runner_shim` carries the nursery
+    // `PyFrame` a trace built — so the argument names the abandoned copy once a
+    // minor collection has run.  Read it back out of the root for the handler
+    // pc write and for the resumed interpretation, which would otherwise pin
+    // the dead address into `handle_jitexception`'s own root.
+    let mut frame_root = FrameRoot::new(frame);
+    let mut handler_instr = frame_root.frame().next_instr();
+    if exit_frame_handler_needs_unwritten_stack(frame_root.frame()) {
         return Err(err);
     }
-    screen_frame_already_recorded(frame as *const PyFrame, &mut err);
-    if pyre_interpreter::eval::handle_exception(frame, &mut err, &mut handler_instr) {
-        frame.set_last_instr_from_next_instr(handler_instr);
-        handle_jitexception(frame)
+    screen_frame_already_recorded(frame_root.frame() as *const PyFrame, &mut err);
+    if pyre_interpreter::eval::handle_exception(frame_root.frame(), &mut err, &mut handler_instr) {
+        frame_root
+            .frame()
+            .set_last_instr_from_next_instr(handler_instr);
+        handle_jitexception(frame_root.frame())
     } else {
         Err(err)
     }
@@ -8469,14 +8484,26 @@ pub(crate) fn portal_runner_result(frame: &mut PyFrame) -> PyResult {
     let mut frame_root = FrameRoot::new(frame);
     frame_root.frame().fix_array_ptrs();
     let _frame_guard = pyre_interpreter::eval::install_current_frame(frame_root.frame());
-    portal_runner_dispatch(frame_root.frame())
+    portal_runner_dispatch(&mut frame_root)
 }
 
-fn portal_runner_dispatch(frame: &mut PyFrame) -> PyResult {
-    if let Some(result) = try_function_entry_jit(frame) {
+/// The dispatch half of `portal_runner_result`, taking the caller's
+/// [`FrameRoot`] rather than a raw frame.
+///
+/// `try_function_entry_jit` runs compiled code, and it roots the frame only for
+/// its own body: the root is gone by the time it hands back `None`.  The frame
+/// reaching this entry is the one kind that moves — `ll_portal_runner_shim`
+/// receives the nursery `PyFrame` `emit_new_pyframe_inline_with_params` built,
+/// not an interpreter frame allocated old-gen and stationary — so a collection
+/// inside that compiled run leaves the address passed in naming a corpse whose
+/// `locals_cells_stack_w` is a pre-collection array.  Read the frame back out
+/// of the root, the way `eval_with_jit_inner` already does at its own
+/// `try_function_entry_jit` / `handle_jitexception` pair.
+fn portal_runner_dispatch(frame_root: &mut FrameRoot) -> PyResult {
+    if let Some(result) = try_function_entry_jit(frame_root.frame()) {
         result
     } else {
-        handle_jitexception(frame)
+        handle_jitexception(frame_root.frame())
     }
 }
 

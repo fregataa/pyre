@@ -5,12 +5,45 @@
 
 use majit_translate::memory::gctransform::{framework, liveness};
 
+const PYTHON_DISPATCH_SEEDS_REF: &[&str] = framework::PYTHON_DISPATCH_SEEDS;
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
         eprintln!("usage: gc-root-reachability <file.ullbc>...");
         std::process::exit(2);
     }
+    // Artefacts whose call graph is joined in but whose bodies are not scanned.
+    // One artefact is not one program: `pyre-jit.ullbc` carries the portal and
+    // the blackhole but hardly any of the interpreter they hand control to, so
+    // asked alone it answers that nothing reaches a collection.  Naming
+    // `pyre-interpreter.ullbc` here is what makes that answer mean anything.
+    // Donors are loaded once and their `Llbc` dropped: only the graph is kept,
+    // because holding two multi-hundred-megabyte artefacts open at once is what
+    // the memory goes to.
+    let donors: Vec<String> = std::env::var("GC_JOIN_WITH")
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let donor_graphs: Vec<(String, framework::CallGraph)> = donors
+        .iter()
+        .map(|path| {
+            let llbc = match majit_charon_reader::Llbc::load(path) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("{path}: {e:?}");
+                    std::process::exit(1);
+                }
+            };
+            (path.clone(), framework::build(&llbc))
+        })
+        .collect();
+
     for path in &args {
         let llbc = match majit_charon_reader::Llbc::load(path) {
             Ok(l) => l,
@@ -45,19 +78,87 @@ fn main() {
             shown.join(" "),
             if per_crate.len() > 6 { " …" } else { "" }
         );
+        // Every question below — the seeds, the closure, the opaque taint — is
+        // asked of the joined graph and the answer projected back onto this
+        // artefact's ids, because the liveness scan walks *these* bodies.  With
+        // no donors the join is a renumbering of `cg` and nothing changes.
+        let mut parts: Vec<&framework::CallGraph> = vec![&cg];
+        parts.extend(donor_graphs.iter().map(|(_, g)| g));
+        let joined = framework::Joined::build(&parts);
+        for (donor, g) in &donor_graphs {
+            println!(
+                "   joined with          : {} ({} fun_decls)",
+                donor,
+                g.names.len()
+            );
+        }
+        if !donor_graphs.is_empty() {
+            println!(
+                "   joined graph          : {} nodes; {} spelling(s) merged across artefacts, \
+                 {} held apart as ambiguous",
+                joined.graph.names.len(),
+                joined.joined_names,
+                joined.ambiguous_names
+            );
+        }
+        // A seed that matches nothing empties half the closure silently, and
+        // the name table is the only place to see why.  Substring, not the
+        // anchored form the seeds use, so a near-miss spelling still shows up.
+        if let Ok(pat) = std::env::var("GC_NAME_GREP") {
+            let mut hits: Vec<&String> = joined
+                .graph
+                .names
+                .values()
+                .filter(|n| n.contains(&pat))
+                .collect();
+            hits.sort();
+            println!("   names containing {pat:?}: {}", hits.len());
+            for n in hits.iter().take(60) {
+                println!("       {n}");
+            }
+        }
+        // "Can this particular helper collect?" is the question every
+        // adjudication of an opaque finding turns on, and a reachability bit
+        // is worthless without the chain behind it.
+        if let Ok(pat) = std::env::var("GC_PATH_FROM") {
+            let (py0, _) = joined.graph.seeds_for(PYTHON_DISPATCH_SEEDS_REF);
+            let (col0, _) = joined.graph.seeds_for(framework::COLLECTING_SEEDS);
+            let mut sd = py0;
+            sd.extend(col0);
+            let mut hits: Vec<(&u64, &String)> = joined
+                .graph
+                .names
+                .iter()
+                .filter(|(_, n)| n.contains(&pat))
+                .collect();
+            hits.sort_by_key(|(_, n)| n.as_str());
+            for (id, n) in hits.iter().take(20) {
+                match joined.graph.path_to(**id, &sd) {
+                    Some(chain) => println!("   {n}\n       REACHES: {}", chain.join(" -> ")),
+                    None => println!("   {n}\n       reaches no seed"),
+                }
+            }
+        }
         println!(
             "   python-dispatch seeds : {}",
-            cg.seed_report(framework::PYTHON_DISPATCH_SEEDS)
+            joined.graph.seed_report(framework::PYTHON_DISPATCH_SEEDS)
         );
         println!(
             "   collecting-alloc seeds: {}",
-            cg.seed_report(framework::COLLECTING_SEEDS)
+            joined.graph.seed_report(framework::COLLECTING_SEEDS)
         );
+        let (jpy, _) = joined.graph.seeds_for(framework::PYTHON_DISPATCH_SEEDS);
+        let (jcol, _) = joined.graph.seeds_for(framework::COLLECTING_SEEDS);
+        let mut joined_seeds = jpy;
+        joined_seeds.extend(jcol);
+        let reach = joined.project(0, &joined.graph.reaching(&joined_seeds));
+        // The seeds as *this* artefact spells them.  The tiering below compares
+        // a finding's `callee_id`, which is an id in this artefact, so it needs
+        // the local set; the closure above needs the joined one.
         let (py, _) = cg.seeds_for(framework::PYTHON_DISPATCH_SEEDS);
         let (col, _) = cg.seeds_for(framework::COLLECTING_SEEDS);
         let mut seeds = py;
         seeds.extend(col);
-        let reach = cg.reaching(&seeds);
         println!(
             "   can reach a collection: {} / {} ({}%)",
             reach.len(),
@@ -68,6 +169,15 @@ fn main() {
                 reach.len() * 100 / total
             }
         );
+        // What the join bought, so a run without donors is never mistaken for
+        // the whole-program answer this one is.
+        if !donor_graphs.is_empty() {
+            let alone = cg.reaching(&seeds).len();
+            println!(
+                "       without the join  : {alone} / {total} — the join admits {} more",
+                reach.len().saturating_sub(alone)
+            );
+        }
         println!(
             "   unresolved-callee fns : {} (call through fn-ptr / dyn / unresolved trait)",
             cg.indirect.len()
@@ -100,7 +210,7 @@ fn main() {
         // dispatches through a `global_hook!` function pointer makes every one
         // of its callers undecidable too, not just itself.  Without this the
         // "cannot reach a collection" bucket silently absorbs them.
-        let opaque = cg.reaching(&cg.indirect);
+        let opaque = joined.project(0, &joined.graph.reaching(&joined.graph.indirect));
         let (mut justified, mut undecidable, mut unjustified) = (0usize, 0usize, Vec::new());
         for id in &bracketed {
             if reach.contains(id) {
@@ -179,11 +289,22 @@ fn main() {
             continue;
         }
         let push_root_ids: std::collections::HashSet<u64> = pin_ids.iter().copied().collect();
-        let (found, stats) = liveness::scan(&llbc, &cg, &reach, &push_root_ids, &gc_tys);
+        let (found, stats) = liveness::scan(
+            &llbc,
+            &cg,
+            &reach,
+            &push_root_ids,
+            &gc_tys,
+            liveness::MOVABLE_GC_MARKERS,
+        );
         println!(
             "   liveness scan: {} bodies; {} with a terminator this reader could not parse; \
              {} call(s) withheld as dominated by a push_roots",
             stats.bodies_scanned, stats.unparsed_terminator_bodies, stats.withheld_under_a_bracket
+        );
+        println!(
+            "       and {} body/bodies with a statement this reader could not parse",
+            stats.unparsed_statement_bodies
         );
         // The resolved graph is an *under*-approximation of what collects: a
         // call whose dispatch edge is unresolved is excluded, so a clean
@@ -191,8 +312,14 @@ fn main() {
         // folded in and report both, rather than let the difference go unsaid.
         let mut conservative = reach.clone();
         conservative.extend(opaque.iter().copied());
-        let (found_conservative, _) =
-            liveness::scan(&llbc, &cg, &conservative, &push_root_ids, &gc_tys);
+        let (found_conservative, stats_conservative) = liveness::scan(
+            &llbc,
+            &cg,
+            &conservative,
+            &push_root_ids,
+            &gc_tys,
+            liveness::MOVABLE_GC_MARKERS,
+        );
         let conservative_fns: std::collections::BTreeSet<&str> = found_conservative
             .iter()
             .map(|f| f.func_name.as_str())
@@ -216,6 +343,18 @@ fn main() {
             "       counting unresolved dispatch as collecting too: {} in {} fn(s)",
             found_conservative.len(),
             conservative_fns.len()
+        );
+        // The conservative scan covers a superset of bodies, so its own
+        // withheld and unparsed figures are the ones its finding count has to
+        // be read against; quoting the resolved scan's line next to it would
+        // pair a count with another scan's accounting.
+        println!(
+            "           over {} bodies; {} with an unparsable terminator, {} with an \
+             unparsable statement; {} call(s) withheld under a push_roots",
+            stats_conservative.bodies_scanned,
+            stats_conservative.unparsed_terminator_bodies,
+            stats_conservative.unparsed_statement_bodies,
+            stats_conservative.withheld_under_a_bracket
         );
         println!(
             "       of which hold a NON-ARGUMENT live pointer: {} fn(s)",
@@ -287,15 +426,101 @@ fn main() {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
         for name in non_arg_fns.iter().take(show) {
-            let v = &by_fn[**name];
-            let f = v.iter().find(|f| !f.live_non_arg.is_empty()).unwrap();
-            println!(
-                "           {}:{}  across {}  live: {:?}",
-                name,
-                f.line,
-                f.callee_name.rsplit("::").next().unwrap_or(""),
-                f.live_non_arg
-            );
+            // Every such call in the body, not the first one found.  A single
+            // row per function hides a second unrooted use further down the
+            // same body — and that is precisely the one a repair pass, working
+            // from this list, then leaves behind.
+            for f in by_fn[**name].iter().filter(|f| !f.live_non_arg.is_empty()) {
+                println!(
+                    "           {}:{}  across {}  live: {:?}",
+                    name,
+                    f.line,
+                    f.callee_name.rsplit("::").next().unwrap_or(""),
+                    f.live_non_arg
+                );
+            }
+        }
+
+        // The same question asked of the running frame.  A `PyObjectRef` has a
+        // root stack to be pinned on; the frame is carried as a bare
+        // `&mut PyFrame` no walker reaches, so the only repair is to re-read it
+        // out of a `FrameAnchor` after the call.  That reload kills the stale
+        // local at the call, so no bracket set is passed — a body that reloads
+        // correctly simply has nothing live across the call to report.
+        let frame_tys = liveness::frame_ptr_type_ids(&llbc);
+        if frame_tys.is_empty() {
+            println!("   (no PyFrame pointer type id found — frame scan skipped)");
+            continue;
+        }
+        let no_bracket: std::collections::HashSet<u64> = Default::default();
+        let (frames, frame_stats) =
+            liveness::scan(&llbc, &cg, &reach, &no_bracket, &frame_tys, &[]);
+        let (frames_conservative, _) =
+            liveness::scan(&llbc, &cg, &conservative, &no_bracket, &frame_tys, &[]);
+        let frame_fns: std::collections::BTreeSet<&str> =
+            frames.iter().map(|f| f.func_name.as_str()).collect();
+        println!(
+            "   frame carried across a call that can collect: {} in {} fn(s)",
+            frames.len(),
+            frame_fns.len()
+        );
+        println!(
+            "       counting unresolved dispatch as collecting too: {} call(s)",
+            frames_conservative.len()
+        );
+        println!(
+            "           over {} bodies; {} with an unparsable terminator, {} with an \
+             unparsable statement",
+            frame_stats.bodies_scanned,
+            frame_stats.unparsed_terminator_bodies,
+            frame_stats.unparsed_statement_bodies
+        );
+        // The frame reaches the callee as an argument in most of these, and an
+        // argument goes just as stale as any other local here (the module
+        // header records why upstream can drop them and pyre cannot).  Both
+        // columns are therefore hazards; they are split only because a frame
+        // the call does not even see is the more obviously wrong shape.
+        let mut frame_tier1: Vec<&liveness::Finding> = frames
+            .iter()
+            .filter(|f| seeds.contains(&f.callee_id))
+            .collect();
+        frame_tier1.sort_by(|a, b| a.func_name.cmp(&b.func_name).then(a.line.cmp(&b.line)));
+        let ft1_fns: std::collections::BTreeSet<&str> =
+            frame_tier1.iter().map(|f| f.func_name.as_str()).collect();
+        println!(
+            "       tier 1 (callee IS a dispatch seed): {} call(s) in {} fn(s)",
+            frame_tier1.len(),
+            ft1_fns.len()
+        );
+        if let Ok(filter) = std::env::var("GC_FRAME_SCAN") {
+            // A whole-crate list is not a work item; the filter is how a
+            // surface (`OpcodeStepExecutor`, say) is cut out of it and read.
+            // The resolved rows are marked, so the ones only the conservative
+            // scan finds — a body whose dispatch this reader cannot follow —
+            // are adjudicated as the weaker claim they are rather than read
+            // beside the others.
+            let resolved: std::collections::HashSet<(u64, u64, u64)> = frames
+                .iter()
+                .map(|f| (f.func, f.line, f.callee_id))
+                .collect();
+            for f in &frames_conservative {
+                if !filter.is_empty() && !f.func_name.contains(&filter) {
+                    continue;
+                }
+                let mark = if resolved.contains(&(f.func, f.line, f.callee_id)) {
+                    "resolved"
+                } else {
+                    "opaque  "
+                };
+                println!(
+                    "           [{mark}] {}:{}  across {}  live: {:?} arg: {:?}",
+                    f.func_name,
+                    f.line,
+                    f.callee_name.rsplit("::").next().unwrap_or(""),
+                    f.live_non_arg,
+                    f.live_arg
+                );
+            }
         }
     }
 }

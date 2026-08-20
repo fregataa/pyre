@@ -150,12 +150,28 @@ pub const PYTHON_DISPATCH_SEEDS: &[&str] = &[
     "call::call_builtin_code_positional",
     // The gateway's indirect call into a builtin's Rust body.
     "gateway::builtin_code_call",
-    // The frame executors.
+    // The frame executors.  `execute_frame` and its resumed twin are inherent
+    // methods, so the `impl` block sits in the path as an opaque segment and
+    // the bare `pyframe::execute_frame` spelling can never match.
     "eval::eval_frame_plain",
     "eval::eval_frame_plain_with_operr",
     "eval::eval_frame_plain_with_resume",
     "eval::eval_loop",
-    "pyframe::execute_frame",
+    "pyframe::<Impl>::execute_frame",
+    "pyframe::<Impl>::resume_execute_frame",
+    // The JIT layer's routes back into interpretation.  An artefact extracted
+    // for `pyre-jit` carries only part of `pyre-interpreter`, so most of the
+    // entries above are absent from it and the closure comes out at 0% -- a
+    // scan over that is vacuous rather than clean.  These are the portal and
+    // blackhole entries that artefact does carry.
+    "call_jit::ll_portal_runner_shim",
+    "call_jit::run_frame_through_portal",
+    "call_jit::bh_portal_runner",
+    "call_jit::bh_call_self_recursive_portal",
+    "eval::portal_runner",
+    "eval::portal_runner_dispatch",
+    "eval::portal_runner_result",
+    "eval::eval_loop_jit",
     // The space-level helpers most builtins reach Python through.
     "baseobjspace::call_function",
     "baseobjspace::call_method",
@@ -163,10 +179,43 @@ pub const PYTHON_DISPATCH_SEEDS: &[&str] = &[
     "descroperation::try_call_special",
 ];
 
-/// Explicit collection entry points and the one collecting host allocator.
+/// Explicit collection entry points and the collecting host allocator.
+///
+/// These are the same external symbols `majit-translate`'s call control marks
+/// `canmallocgc` (`lib.rs`, the `mark_canmallocgc` loop): the `*_collecting_*`
+/// allocators run a minor collection when the nursery cannot satisfy the
+/// request, and the `collect_*` entries are requested collections outright.
+/// They carry no lowered body, so nothing reaches them transitively — they have
+/// to be named, or every direct caller (`pyre_object_gc_alloc_collecting_trampoline`
+/// in `pyre-jit/src/eval.rs`, say) is classified non-collecting and so is
+/// everything above it.
+///
+/// ⛔ The plain host allocator is deliberately **not** here.  `try_gc_alloc`
+/// routes to `alloc_nursery_typed` and on through the backend's
+/// `dynasm_alloc_nursery_typed`, which falls back to old-gen rather than
+/// collect precisely because its caller holds an unregistered raw pointer; so
+/// no host-side `w_*_new` is a collection point, and seeding one would report
+/// every allocating body in the interpreter.  A minor runs from compiled code
+/// allocating inline in the nursery, from the elidable bigint payload helpers,
+/// and from a requested collection — which is why an artefact carrying only
+/// interpreter bodies legitimately matches none of the allocator entries and
+/// takes its whole closure from [`PYTHON_DISPATCH_SEEDS`].
 pub const COLLECTING_SEEDS: &[&str] = &[
-    "gc_hook::try_gc_alloc_collecting",
+    "majit_gc::alloc_nursery_collecting_typed",
+    "majit_gc::alloc_nursery_collecting_typed_rooted",
+    "majit_gc::alloc_fast_nursery_collecting_typed_rooted",
+    "majit_gc::standalone_alloc_nursery_collecting_typed_rooted",
+    "majit_gc::standalone_alloc_fast_nursery_collecting_typed_rooted",
+    "majit_gc::collect_full",
+    "majit_gc::collect_step",
+    "majit_gc::collect_oldgen_nonmoving",
+    // The host hook the interpreter reaches them through.
     "gc_hook::try_gc_alloc_collecting_rooted",
+    // A requested collection, which is the one collection point an interpreter
+    // body reaches without running Python at all (`gc.collect()`).
+    "gc_hook::try_gc_collect",
+    "gc_hook::try_gc_collect_step",
+    "gc_hook::try_gc_collect_oldgen",
 ];
 
 impl CallGraph {
@@ -260,6 +309,141 @@ impl CallGraph {
             s.push_str(&format!("; UNMATCHED patterns: {unmatched:?}"));
         }
         s
+    }
+}
+
+/// Several artefacts' call graphs, joined on fully qualified name.
+///
+/// A charon artefact carries only what rustc monomorphised into that crate, so
+/// `pyre-jit.ullbc` holds the portal and the blackhole and almost none of the
+/// interpreter they call into: its own closure comes out at 1%, and a scan over
+/// it reports nothing because nothing in it reaches a seed — not because the
+/// crate is clean.  Upstream never meets this: RPython analyses one translated
+/// program, and `collect_analyzer` closes over the whole call graph at once.
+/// So the artefacts are joined back into one graph here.
+///
+/// # The join key does not always identify a function
+///
+/// `ItemMeta::name_path` renders an inherent `impl` block as the opaque segment
+/// `<Impl>`, so `PyFrame::new` and `FrameDebugData::new` are both spelled
+/// `pyframe::<Impl>::new`.  Joining on that spelling merges them into one node
+/// and invents an edge from every caller of one to every callee of the other —
+/// which is how a `getorcreatedebug` that only allocates came out reaching
+/// `call_user_function_with_args`.  Widening is not automatically safe here:
+/// `framework.py` over-brackets rather than under-brackets, but a fabricated
+/// path is not conservatism, it is a wrong answer with a citation.
+///
+/// So a name **one artefact carries more than once** is not a join key at all:
+/// each occurrence keeps its own node, exactly as it had before the join.  What
+/// is joined is the unambiguous majority — the free functions the JIT reaches
+/// the interpreter through (`finditem_str`, `call_function_impl_result`) — and
+/// [`Self::ambiguous_names`] reports what that rule held back.
+pub struct Joined {
+    /// The joined graph.  Its `opaque` census is left empty: an opaque *count*
+    /// is per-artefact accounting, and summing two of them double-counts every
+    /// body both artefacts carry.  `indirect` is joined, being a per-function
+    /// fact.
+    pub graph: CallGraph,
+    /// `part index -> (that artefact's def id -> node id)`.
+    canonical: Vec<HashMap<u64, u64>>,
+    /// Unambiguous names carried by more than one artefact — what the join
+    /// actually merged.
+    pub joined_names: usize,
+    /// Names some artefact carries more than once, kept apart.
+    pub ambiguous_names: usize,
+}
+
+impl Joined {
+    pub fn build(parts: &[&CallGraph]) -> Self {
+        let mut ambiguous: HashSet<&str> = HashSet::new();
+        for part in parts {
+            let mut seen: HashSet<&str> = HashSet::new();
+            for name in part.names.values() {
+                if !seen.insert(name.as_str()) {
+                    ambiguous.insert(name.as_str());
+                }
+            }
+        }
+        let mut shared: HashMap<&str, u64> = HashMap::new();
+        let mut names: HashMap<u64, String> = HashMap::new();
+        let mut canonical: Vec<HashMap<u64, u64>> = Vec::with_capacity(parts.len());
+        let mut next = 0u64;
+        let mut joined_names = 0usize;
+        for part in parts {
+            // Sorted, so the numbering does not depend on hash order and two
+            // runs over the same inputs print the same ids.
+            let mut sorted: Vec<(&u64, &String)> = part.names.iter().collect();
+            sorted.sort_unstable_by(|a, b| a.1.cmp(b.1).then(a.0.cmp(b.0)));
+            let mut mine: HashMap<u64, u64> = HashMap::new();
+            for (&def_id, name) in sorted {
+                let id = if ambiguous.contains(name.as_str()) {
+                    let id = next;
+                    next += 1;
+                    names.insert(id, name.clone());
+                    id
+                } else if let Some(&id) = shared.get(name.as_str()) {
+                    joined_names += 1;
+                    id
+                } else {
+                    let id = next;
+                    next += 1;
+                    names.insert(id, name.clone());
+                    shared.insert(name.as_str(), id);
+                    id
+                };
+                mine.insert(def_id, id);
+            }
+            canonical.push(mine);
+        }
+        let mut callees: HashMap<u64, HashSet<u64>> = HashMap::new();
+        let mut callers: HashMap<u64, HashSet<u64>> = HashMap::new();
+        let mut indirect: HashSet<u64> = HashSet::new();
+        for (part, map) in parts.iter().zip(&canonical) {
+            for (caller, cs) in &part.callees {
+                let Some(&from) = map.get(caller) else {
+                    continue;
+                };
+                let entry = callees.entry(from).or_default();
+                for callee in cs {
+                    if let Some(&to) = map.get(callee) {
+                        entry.insert(to);
+                    }
+                }
+            }
+            for id in &part.indirect {
+                if let Some(&c) = map.get(id) {
+                    indirect.insert(c);
+                }
+            }
+        }
+        for (&caller, cs) in &callees {
+            for &c in cs {
+                callers.entry(c).or_default().insert(caller);
+            }
+        }
+        Self {
+            graph: CallGraph {
+                names,
+                callees,
+                callers,
+                indirect,
+                opaque: OpaqueCensus::default(),
+            },
+            canonical,
+            joined_names,
+            ambiguous_names: ambiguous.len(),
+        }
+    }
+
+    /// Project a set of joined nodes back onto one artefact's def ids, so the
+    /// liveness scan — which walks that artefact's bodies — can be asked the
+    /// whole-program question.  `part` indexes the slice `build` was given.
+    pub fn project(&self, part: usize, joined: &HashSet<u64>) -> HashSet<u64> {
+        self.canonical[part]
+            .iter()
+            .filter(|(_, cid)| joined.contains(cid))
+            .map(|(&def_id, _)| def_id)
+            .collect()
     }
 }
 

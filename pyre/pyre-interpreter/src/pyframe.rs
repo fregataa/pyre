@@ -966,11 +966,22 @@ impl FrameBox {
     /// Rust has no such pass, and a running opcode holds a `&mut PyFrame`
     /// across its own allocations, so this allocation standing still is what
     /// takes the place of that rewrite.  It is not a rule about every frame —
-    /// a compiled trace's inlined-callee frame is a nursery allocation, and
-    /// making that uniform times `fib_recursive` out of its gate — so the
-    /// crossing into raw-pointer territory is guarded at the seams instead
-    /// (`gate-triage.md`, which also records why the ratio that experiment is
-    /// often quoted with is not reproducible).
+    /// a compiled trace's inlined-callee frame is a nursery allocation
+    /// (`emit_new_pyframe_inline_with_params` -> `NewWithVtable`), so the
+    /// crossing into raw-pointer territory is guarded at the seams instead,
+    /// by `crate::eval::FrameAnchor` and the JIT layer's `FrameRoot`.
+    ///
+    /// Making it uniform is one line —
+    /// `PYFRAME_DESCR_GROUP.size_descr.set_non_moving(true)` sends
+    /// `NewWithVtable` down `gen_malloc_fixedsize` to the old generation —
+    /// and it costs 3.6x on `bench/fib_recursive.py`: 0.39s against 1.43s,
+    /// user CPU, five samples per arm, arm64 darwin, 2026-08-20.  An old-gen
+    /// frame holding young argument boxes joins the remembered set and is
+    /// re-traced every minor collection, and each returned frame is old-gen
+    /// garbage only a major reclaims.  Pinning is not an alternative:
+    /// `GcAllocator::pin` ports `gctypelayout.py:88-92 q_cannot_pin` and
+    /// refuses any type carrying GC pointers or a custom trace, which a
+    /// `PyFrame` does both.
     ///
     /// Before the hook is wired (bootstrap, tests) `try_gc_alloc_stable`
     /// returns `None`; fall back to the `std::alloc` `GcFramePrefix` box,
@@ -1293,12 +1304,17 @@ fn capture_coroutine_origin(ec: *const PyExecutionContext) -> PyObjectRef {
             break;
         }
         // `fget_f_lineno` below reads `last_instr`, a virtualizable field.
+        // The force and the filename object both sit between the reads of this
+        // frame, so it is read back out of the anchor at each of them.
+        let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
         crate::executioncontext::force_frame(frame);
-        let w_code = unsafe { (*frame).fget_f_code() };
+        let w_code = unsafe { (*anchor.live()).fget_f_code() };
         let filename_slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(unsafe { crate::pycode::w_code_filename_obj(w_code) });
         let lineno_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(w_int_new(unsafe { (*frame).fget_f_lineno() } as i64));
+        pyre_object::gc_roots::pin_root(w_int_new(
+            unsafe { (*anchor.live()).fget_f_lineno() } as i64
+        ));
         let funcname_slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(unsafe { crate::pycode::w_code_name_obj(w_code) });
         let summary = w_tuple_new(vec![
@@ -1308,7 +1324,7 @@ fn capture_coroutine_origin(ec: *const PyExecutionContext) -> PyObjectRef {
         ]);
         pyre_object::gc_roots::pin_root(summary);
         summary_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
-        frame = crate::executioncontext::ExecutionContext::getnextframe_nohidden(frame);
+        frame = crate::executioncontext::ExecutionContext::getnextframe_nohidden(anchor.live());
     }
     w_tuple_new(
         summary_slots
@@ -5231,6 +5247,65 @@ pub extern "C" fn jit_locals_dict_snapshot(w_locals: i64) -> i64 {
         Ok(()) => pyre_object::gc_roots::shadow_stack_get(snapshot_slot) as i64,
         Err(_) => pyre_object::PY_NULL as i64,
     }
+}
+
+/// Name whichever frame on the current call chain still points at a
+/// `locals_cells_stack_w` array a collection has already moved.
+///
+/// Installed as `pyre_object::gc_hook`'s stale-array holder reporter: the
+/// object-space store site sees only the array, while the holder's generation
+/// is the datum that separates the two causes.  An old-generation holder means
+/// the minor collection never scanned it — a remembered-set miss.  A holder
+/// that is itself forwarded means the frame was never traced, so every field
+/// read out of it names pre-collection memory.  Walks `f_backref` because a
+/// JIT-built inline callee frame sits on that chain and nowhere else.
+///
+/// This runs on an already-fatal path, so it stops rather than chase an
+/// unvalidated `f_backref`: losing the walk costs one line, while faulting
+/// inside it would cost the whole report.
+pub fn report_stale_locals_array_holder(stale_addr: usize) -> bool {
+    let mut frame = crate::eval::current_frame();
+    let mut depth = 0usize;
+    let mut found = false;
+    while !frame.is_null() && depth < 64 {
+        let frame_addr = frame as usize;
+        let owned = pyre_object::gc_hook::try_gc_owns_object(frame_addr as *mut u8);
+        if depth > 0 && !owned {
+            crate::host_seam::emit_stderr(
+                format!(
+                    "STALE ARRAY holder scan: depth={depth} frame={frame_addr:#x} is not \
+GC-owned; stopping rather than dereferencing an unvalidated f_backref\n"
+                )
+                .as_bytes(),
+            );
+            break;
+        }
+        let array = unsafe { (*frame).locals_cells_stack_w } as usize;
+        let nursery = majit_gc::gc_is_nursery_object(frame_addr);
+        let (type_id, forwarded, tracks_young) = if owned {
+            let header = unsafe { *majit_gc::header::header_of(frame_addr) };
+            (
+                header.type_id(),
+                header.is_forwarded(),
+                header.has_flag(majit_gc::flags::TRACK_YOUNG_PTRS),
+            )
+        } else {
+            (u32::MAX, false, false)
+        };
+        let holds = array == stale_addr;
+        found |= holds;
+        crate::host_seam::emit_stderr(
+            format!(
+                "STALE ARRAY holder scan: depth={depth} frame={frame_addr:#x} \
+locals={array:#x} holds_stale={holds} gc_owned={owned} nursery={nursery} \
+type_id={type_id} frame_forwarded={forwarded} track_young_ptrs={tracks_young}\n"
+            )
+            .as_bytes(),
+        );
+        frame = unsafe { (*frame).f_backref };
+        depth += 1;
+    }
+    found
 }
 
 #[cfg(test)]
