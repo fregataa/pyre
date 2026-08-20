@@ -3042,6 +3042,24 @@ impl TraceCtx {
     /// That null is a pyre-upstream parity gap, not a shadow bug — the
     /// shadow faithfully reflects the caller's Box.
     pub fn set_virtualizable_entry_at(&mut self, index: usize, opref: OpRef, value: Value) {
+        // The precondition above, checked rather than only stated.  A
+        // `Value::Int` in a Ref slot is not a wrong number — it is a pointer
+        // the shadow will hand to `value_as_ref_bits`, which decodes it as 0,
+        // so a later `BC_GETARRAYITEM_VABLE_R` reads NULL out of a slot that
+        // holds a live object.  `Value::Void` is the absence of a live
+        // concrete and is legal in every slot; a slot whose type is not
+        // declared (no `virtualizable_info`, or an index past the layout)
+        // yields `None` and is left to the range assert below.
+        debug_assert!(
+            matches!(value, Value::Void)
+                || self
+                    .virtualizable_slot_type(index)
+                    .is_none_or(|declared| declared == value.get_type()),
+            "set_virtualizable_entry_at: slot {index} is declared {:?} but the caller wrote a \
+             {:?}; a mismatched Ref slot decodes to NULL through `value_as_ref_bits`",
+            self.virtualizable_slot_type(index),
+            value.get_type(),
+        );
         let (boxes_opt, values_opt) = (
             &mut self.virtualizable_boxes,
             &mut self.virtualizable_values,
@@ -6540,5 +6558,38 @@ mod tests {
                 Some(info.array_item_descr(0).index())
             );
         }
+    }
+
+    /// `vable_snapshot_buildable` is the precondition the walker checks
+    /// before capturing a resume snapshot; a false answer is reported as
+    /// `GuardSnapshotVableUntyped` and aborts to interpretation.  What it
+    /// guards is `build_vable_snapshot_boxes`, whose two `.expect()` calls
+    /// panic on an untyped entry — see
+    /// `build_vable_snapshot_boxes_panics_on_an_untyped_entry`, which pins
+    /// the other half of the pair.
+    ///
+    /// `OpRef::ty()` answers `None` for exactly `None` and `TempVar`
+    /// (resoperation.rs), so an unseeded slot is what makes a box untyped.
+    #[test]
+    fn an_untyped_virtualizable_box_is_not_snapshot_buildable() {
+        let mut ctx = TraceCtx::for_test(0);
+
+        // No virtualizable at all: vacuously buildable, so a walk that never
+        // seeded `virtualizable_boxes` must not take the abort.
+        assert!(ctx.virtualizable_boxes.is_none());
+        assert!(ctx.vable_snapshot_buildable());
+
+        // Every slot typed, identity last: buildable.
+        let identity = OpRef::ref_op(7);
+        ctx.virtualizable_boxes = Some(vec![OpRef::int_op(3), identity]);
+        assert!(ctx.vable_snapshot_buildable());
+
+        // A non-identity slot left unseeded.
+        ctx.virtualizable_boxes = Some(vec![OpRef::NONE, identity]);
+        assert!(!ctx.vable_snapshot_buildable());
+
+        // The identity slot itself left unseeded.
+        ctx.virtualizable_boxes = Some(vec![OpRef::int_op(3), OpRef::NONE]);
+        assert!(!ctx.vable_snapshot_buildable());
     }
 }

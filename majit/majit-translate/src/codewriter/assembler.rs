@@ -2317,6 +2317,46 @@ impl Assembler {
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
             }
+            OpKind::VableArrayLen {
+                base,
+                array_index,
+                item_ty,
+                array_itemsize,
+                array_is_signed,
+            } => {
+                let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
+                state.code.push(reg);
+                argcodes.push(kc);
+                // The same descr pair its read and write siblings carry, in
+                // the same order: fielddescr (vable array field) + arraydescr.
+                // `arraylen_vable/rdd>i` takes the length off the first at
+                // run time, but `vable_array_index_pair_at` reads both and
+                // rejects anything that is not `(VableArray, Array)`.
+                let descr_idx = self.emit_ready_descr(crate::jitcode::BhDescr::VableArray {
+                    index: *array_index,
+                });
+                state.code.push((descr_idx & 0xFF) as u8);
+                state.code.push((descr_idx >> 8) as u8);
+                argcodes.push('d');
+                let descr_idx2 = self.emit_ready_descr(vable_arraydescrof(
+                    item_ty,
+                    *array_itemsize,
+                    *array_is_signed,
+                ));
+                state.code.push((descr_idx2 & 0xFF) as u8);
+                state.code.push((descr_idx2 >> 8) as u8);
+                argcodes.push('d');
+                if let Some(result) = op.result.as_ref() {
+                    argcodes.push('>');
+                    let (reg, kc) = self.lookup_reg_with_kind_var(result, regallocs);
+                    argcodes.push(kc);
+                    state.code.push(reg);
+                }
+                let opname = op_kind_to_opname(&op.kind);
+                let key = format!("{opname}/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
             OpKind::VableForce { base } => {
                 let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
                 assert_eq!(kc, 'r', "hint_force_virtualizable expects a Ref base");
@@ -2788,6 +2828,7 @@ impl Assembler {
                 OpKind::VableFieldWrite { .. } => "VableFieldWrite",
                 OpKind::VableArrayRead { .. } => "VableArrayRead",
                 OpKind::VableArrayWrite { .. } => "VableArrayWrite",
+                OpKind::VableArrayLen { .. } => "VableArrayLen",
                 OpKind::BinOp { .. } => "BinOp",
                 OpKind::UnaryOp { .. } => "UnaryOp",
                 OpKind::VableForce { .. } => "VableForce",
@@ -4673,6 +4714,9 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::VableArrayWrite { item_ty, .. } => {
             format!("setarrayitem_vable_{}", value_type_to_kind(item_ty))
         }
+        // `jtransform.py:814-817` — one opname with no kind suffix: a
+        // length is a `Signed` whatever the element kind is.
+        OpKind::VableArrayLen { .. } => "arraylen_vable".into(),
         // RPython `blackhole.py:500` canonical opnames for bitwise ints are
         // `int_and` / `int_or` / `int_xor`. When an `OpKind::BinOp.op`
         // arrives spelled with Rust's `syn::BinOp` trait names
@@ -6914,6 +6958,152 @@ mod tests {
                 asm.insns.keys().collect::<Vec<_>>()
             );
         }
+    }
+
+    /// `arraylen_vable` is a cross-layer contract: the codewriter picks the
+    /// key, `insns.rs` assigns its byte, and `MIFrame::read_vable_arraylen`
+    /// decodes `1B vable_reg + 2B fdescr + 2B adescr + 1B dest` and asserts
+    /// the descr pair is `(VableArray, Array)`.  Three files have to agree on
+    /// one wire shape, so pin the whole shape here rather than the opname
+    /// alone.
+    #[test]
+    fn assemble_vable_arraylen_emits_the_rdd_to_i_wire_shape() {
+        use crate::flatten::{FlatOp, flatten_graph};
+        use crate::jtransform::{GraphTransformConfig, Transformer, VirtualizableFieldDescriptor};
+        use crate::model::{FieldDescriptor, FunctionGraph, OpKind, ValueType};
+
+        let mut graph = FunctionGraph::new("vable_arraylen");
+        let base_var = push_input_var(&mut graph, "frame", ValueType::Ref(None));
+        let array_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: base_var.clone(),
+                    field: FieldDescriptor::new("locals_stack_w", Some("Frame".into())),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        let len_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::ArrayLen {
+                    base: array_var,
+                    array_type_id: None,
+                    nolength: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(len_var.clone()));
+        FunctionGraph::set_concretetype_of_inline(
+            &base_var,
+            crate::codewriter::type_state::ConcreteType::GcRef,
+        );
+        // The driver that normally supplies this is
+        // `type_state::authoritative_result_types`, which answers `Signed` for
+        // `VableArrayLen`; this test drives `Transformer` directly, so state
+        // it here rather than depend on a pass it does not run.
+        FunctionGraph::set_concretetype_of_inline(
+            &len_var,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+
+        let config = GraphTransformConfig {
+            vable_arrays: vec![VirtualizableFieldDescriptor::new_with_arraydescr(
+                "locals_stack_w",
+                Some("Frame".into()),
+                0,
+                crate::layout::target_word_size(),
+                false,
+            )],
+            ..Default::default()
+        };
+        let mut rewritten = Transformer::new(&config).transform(&graph).graph;
+        regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten);
+        let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
+        let mut flat = flatten_graph(&rewritten, &mut regallocs);
+        let mut asm = Assembler::new();
+        let body = asm.assemble(&mut flat, &regallocs);
+
+        assert!(
+            asm.insns.contains_key("arraylen_vable/rdd>i"),
+            "a vable array length must assemble to `arraylen_vable/rdd>i`, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !asm.insns.keys().any(|k| k.starts_with("arraylen_gc")),
+            "the raw `arraylen_gc` must be gone, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+
+        // The two descrs, in the order the decoder reads them.
+        let ready: Vec<&crate::jitcode::BhDescr> = asm
+            .descrs
+            .iter()
+            .filter_map(|d| match d {
+                AssemblerDescr::Ready(b) => Some(&**b),
+                _ => None,
+            })
+            .collect();
+        let vable_at = ready
+            .iter()
+            .position(|d| matches!(d, crate::jitcode::BhDescr::VableArray { index: 0 }))
+            .unwrap_or_else(|| panic!("no VableArray descr minted, got {ready:?}"));
+        let array_at = ready
+            .iter()
+            .position(|d| matches!(d, crate::jitcode::BhDescr::Array { .. }))
+            .unwrap_or_else(|| panic!("no Array descr minted, got {ready:?}"));
+        assert!(
+            vable_at < array_at,
+            "the vable-array descr must precede the array descr, got {ready:?}"
+        );
+        let crate::jitcode::BhDescr::Array {
+            base_size,
+            itemsize,
+            len_offset,
+            is_array_of_pointers,
+            ..
+        } = ready[array_at]
+        else {
+            unreachable!("checked by the position above");
+        };
+        let word = crate::layout::target_word_size();
+        assert_eq!((*base_size, *itemsize, *len_offset), (word, word, Some(0)));
+        assert!(is_array_of_pointers);
+
+        // The pool order above only says which descr was minted first.  What
+        // the decoder follows is the pair of indexes in the instruction's own
+        // operand bytes, so read them: `1B opcode + 1B vable_reg + 2B fdescr +
+        // 2B adescr + 1B dest`, each index little-endian.  A swapped emission
+        // would still leave the pool in this order and still key
+        // `arraylen_vable/rdd>i`.
+        let op_index = flat
+            .insns
+            .iter()
+            .position(|flat_op| {
+                matches!(flat_op, FlatOp::Op(inner)
+                    if matches!(inner.kind, OpKind::VableArrayLen { .. }))
+            })
+            .expect("the flattened graph must carry the VableArrayLen");
+        let offset = flat.insns_pos.as_ref().expect("assemble records insns_pos")[op_index];
+        let wire = &body.code[offset..offset + 7];
+        assert_eq!(
+            wire[0], asm.insns["arraylen_vable/rdd>i"],
+            "the instruction at its recorded position must be the vable arraylen"
+        );
+        assert_eq!(
+            u16::from_le_bytes([wire[2], wire[3]]) as usize,
+            vable_at,
+            "the first descr operand must be the vable-array descr"
+        );
+        assert_eq!(
+            u16::from_le_bytes([wire[4], wire[5]]) as usize,
+            array_at,
+            "the second descr operand must be the array descr"
+        );
     }
 
     #[test]

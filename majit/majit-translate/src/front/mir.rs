@@ -2252,10 +2252,17 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // simplified graph; fail-safe — an unpaired / multi-consumer range
         // aggregate stays the ordinary ADT ctor (census Skip).
         if !lo.range_iter_new_sites.is_empty() && !lo.next_call_results.is_empty() {
+            // The range rewrite only locates the `next()` producer; the
+            // element kind recorded beside it belongs to the diamond fold.
+            let next_vars: Vec<Variable> = lo
+                .next_call_results
+                .iter()
+                .map(|(var, _)| var.clone())
+                .collect();
             crate::front::range_iter::rewire_range_iter_sites(
                 &mut lo.graph,
                 &lo.range_iter_new_sites,
-                &lo.next_call_results,
+                &next_vars,
             );
         }
         let next_rewritten = if lo.next_call_results.is_empty() {
@@ -2945,8 +2952,11 @@ struct Lowering<'a> {
     result_exc_call_results: Vec<(Variable, Option<String>, ValueType)>,
     /// `Iterator::next()` call results (`Option<T>`-typed) recorded for
     /// the `next`-diamond rewiring pass (`front::iter_next`) that runs
-    /// after the body lowering completes.
-    next_call_results: Vec<Variable>,
+    /// after the body lowering completes.  The paired [`ValueType`] is the
+    /// element `T` with the `&` a slice iterator adds peeled off — the only
+    /// place the element's kind is still readable, since the fold's op
+    /// carries the iterator and not the container's item type.
+    next_call_results: Vec<(Variable, ValueType)>,
     /// `i64::checked_{add,sub,mul}()` call results (`Option<i64>`-typed)
     /// recorded for the checked-arith rewiring pass
     /// (`front::checked_arith`) that runs after the body lowering
@@ -9200,7 +9210,34 @@ impl<'a> Lowering<'a> {
             && crate::front::iter_next::is_iterator_next_target(target)
             && crate::front::result_exc::tyref_is_option(&call.dest.ty, self.llbc)
         {
-            self.next_call_results.push(result_var.clone());
+            // A slice iterator yields `Option<&T>`; peel that one `&` so the
+            // recorded kind is the item's own, the way `ll_listnext` hands
+            // back the list's item repr rather than a pointer to it — and
+            // only that one, so an element that is itself a reference stays
+            // reference-typed.  Which iterator this is decides whether there
+            // is a reference to peel at all: the receiver names the iterator
+            // ADT, and a by-value one yields the element directly.  An
+            // unreadable shape records `Ref(None)` — the answer the fold
+            // assumed unconditionally before this was carried, so an
+            // unreadable type keeps today's behaviour instead of inventing a
+            // new one.
+            let iterator_added_a_reference = first_arg_ty
+                .as_ref()
+                .and_then(|receiver| self.tyref_ref_adt_path(receiver))
+                .is_some_and(|path| iterator_adds_a_reference(&path));
+            let item_ty = crate::front::result_exc::tyref_option_payload(&call.dest.ty, self.llbc)
+                .and_then(|payload| {
+                    let body = match &payload {
+                        TyRef::Inline { value: (_, v) } | TyRef::Other(v) => v,
+                        TyRef::Dedup { id } => self.llbc.dedup_body(*id)?,
+                    };
+                    let item =
+                        iterator_payload_element(body, self.llbc, iterator_added_a_reference)?;
+                    serde_json::from_value::<TyRef>(item.clone()).ok()
+                })
+                .map(|ty| tyref_to_value_type(&ty, self.llbc))
+                .unwrap_or(ValueType::Ref(None));
+            self.next_call_results.push((result_var.clone(), item_ty));
         }
         // Capture `i64::checked_{add,sub,mul}()` results (`Option<i64>`-
         // typed) for the checked-arith rewiring pass
@@ -11397,6 +11434,15 @@ impl<'a> Lowering<'a> {
             }
             return inline_adt_def_id(v);
         }
+    }
+
+    /// The full name path of the ADT behind a signature [`TyRef`], peeling
+    /// the same wrappers [`Self::tyref_ref_adt_def_id`] does — a desugared
+    /// `it.next()` passes its iterator as `&mut Iter<'_, T>`, so the receiver
+    /// reaches [`iterator_adds_a_reference`] behind one reference.
+    fn tyref_ref_adt_path(&self, ty: &TyRef) -> Option<String> {
+        let id = self.tyref_ref_adt_def_id(ty)?;
+        Some(self.llbc.type_by_id(id)?.item_meta.name_path())
     }
 
     /// Peel `Ref` / `RawPtr` wrappers (through dedup / hash-cons
@@ -16773,6 +16819,83 @@ fn strip_ty_wrappers<'l>(
         return Some(node);
     }
     None
+}
+
+/// Strip only the indirection wrappers — `{"Deduplicated": id}` and
+/// `{"HashConsedValue": [id, ty]}` — leaving any `Ref` in place.
+///
+/// [`strip_ty_wrappers`] peels `Ref` too, and peels it repeatedly.  A caller
+/// that must account for exactly one reference level cannot use it: over
+/// `&&i64` it answers `i64`, which is the item type of neither.
+fn strip_ty_indirections<'l>(
+    mut node: &'l serde_json::Value,
+    llbc: &'l Llbc,
+) -> Option<&'l serde_json::Value> {
+    for _ in 0..24 {
+        let obj = node.as_object()?;
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            node = llbc.dedup_body(id)?;
+            continue;
+        }
+        if let Some(arr) = obj
+            .get("HashConsedValue")
+            .and_then(serde_json::Value::as_array)
+            && arr.len() == 2
+        {
+            node = &arr[1];
+            continue;
+        }
+        return Some(node);
+    }
+    None
+}
+
+/// Does the iterator ADT named by `path` hand back a reference *it* added,
+/// rather than the element itself?
+///
+/// `core::slice::iter::Iter<'a, T>` yields `Option<&'a T>`: that `&` is the
+/// iterator's, and peeling it is what leaves `&[i64]`'s element an `i64`.
+/// The by-value iterators [`Lowering::is_concrete_iter_constructor`] admits
+/// alongside it — `alloc::vec::into_iter::IntoIter<T>` for `Vec<T>` and
+/// `core::array::iter::IntoIter<T, N>` for `[T; N]` — yield `Option<T>`
+/// instead, so their payload is already the element and the same peel would
+/// strip a reference the element owns.
+///
+/// Recognition is positive-only: an unlisted or unreadable receiver does not
+/// peel, which leaves a `&T` payload typed `Ref` — the answer the fold
+/// assumed unconditionally before any element type was carried.
+fn iterator_adds_a_reference(path: &str) -> bool {
+    matches!(
+        path,
+        "core::slice::iter::Iter" | "core::slice::iter::IterMut"
+    )
+}
+
+/// The element type behind an iterator's `next()` payload.
+///
+/// When the iterator added a reference ([`iterator_adds_a_reference`]),
+/// exactly one reference level belongs to it and the rest belongs to the
+/// element: over `&[i64]` the payload is `&i64` and the element is `i64`,
+/// but over `&[&i64]` it is `&&i64` and the element is `&i64` — a pointer,
+/// which belongs in the Ref bank.  Peeling every `Ref` would put that
+/// pointer in the integer bank.
+///
+/// When it did not, the payload is the element already, and peeling would
+/// commit the mirror-image error: `Vec<&i64>::into_iter()` yields
+/// `Option<&i64>`, whose `&i64` is the element itself.
+fn iterator_payload_element<'l>(
+    payload: &'l serde_json::Value,
+    llbc: &'l Llbc,
+    iterator_adds_a_reference: bool,
+) -> Option<&'l serde_json::Value> {
+    let node = strip_ty_indirections(payload, llbc)?;
+    if !iterator_adds_a_reference {
+        return Some(node);
+    }
+    let Some(arr) = node.get("Ref").and_then(serde_json::Value::as_array) else {
+        return Some(node);
+    };
+    strip_ty_indirections(arr.get(1)?, llbc)
 }
 
 /// De Bruijn *index* of a `{"TypeVar": {"Bound": [depth, index]}}` node.

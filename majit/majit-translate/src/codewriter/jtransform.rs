@@ -990,6 +990,25 @@ impl<'a> Transformer<'a> {
                     "link argument",
                 );
             }
+            // The catch-all behind the four positional routes.  Registering a
+            // variable in `vable_array_vars` drops the `getfield` that defined
+            // it, so an operand the block kept and no rewrite replaced is a
+            // variable used and never defined; regalloc reports that against a
+            // register kind, not against the read that went missing.
+            //
+            // Nothing between here and regalloc prunes dead operations —
+            // `finalize_rewritten_graph_to_jitcode` goes straight to regalloc,
+            // flatten, assemble — so a surviving operand always reaches it.
+            // That is what makes this safe to assert rather than merely warn:
+            // it cannot fire on a graph that would otherwise have compiled.
+            for op in &block.operations {
+                let operands = crate::inline::op_variable_refs(&op.kind);
+                self.check_no_vable_array(
+                    operands.iter(),
+                    graph_name,
+                    "surviving operation operand",
+                );
+            }
         }
 
         // Upstream `rpython/translator/backendopt/canraise.py:25-47
@@ -1115,21 +1134,30 @@ impl<'a> Transformer<'a> {
     /// pass a green test while escaping by the one route that test did not
     /// look at.
     ///
-    /// `route` names which of the four the escape took.  Upstream's
+    /// `route` names which of the five the escape took.  Upstream's
     /// message does not carry it, and the extra line is a deliberate pyre
-    /// addition: the four call sites below share one panic body, this
+    /// addition: the five call sites below share one panic body, this
     /// function is small enough to be inlined into all of them in an
     /// optimised build, and the resulting backtrace then names whichever
     /// site the optimiser happened to keep.  A misread frame sent a whole
     /// diagnosis round after a residual call for what was a link argument.
     /// Keep the upstream block verbatim above and add the route last.
     ///
-    /// The four routes are closed — the call sites are the only ones —
-    /// and each passes its own literal: `"link argument"`,
-    /// `"fused exitswitch operand"`, `"call argument"`,
-    /// `"setfield operand"` (`jtransform.py:912`, the base or the stored
-    /// value of a `setfield`; there is no `setarrayitem` site, because
-    /// that one is the array access the protocol exists to allow).
+    /// Four of the routes name a specific operand position, each passing
+    /// its own literal: `"link argument"`, `"fused exitswitch operand"`,
+    /// `"call argument"`, `"setfield operand"` (`jtransform.py:912`, the
+    /// base or the stored value of a `setfield`; there is no
+    /// `setarrayitem` site, because that one is the array access the
+    /// protocol exists to allow).
+    ///
+    /// The fifth, `"surviving operation operand"`, is the catch-all behind
+    /// them: every operand of every operation the block kept, whatever its
+    /// kind.  It reports last and least precisely, and it is here because
+    /// an enumerated list of routes is the shape that let `_check_stack_index`
+    /// escape by the one route its test did not look at — the same reason
+    /// the paragraph above prefers a whole-graph assertion to a list of
+    /// escape hatches.  A route the four do not name (a `getfield` on the
+    /// array pointer, say) reaches it.
     fn check_no_vable_array<'v>(
         &self,
         list: impl IntoIterator<Item = &'v crate::flowspace::model::Variable>,
@@ -1446,6 +1474,10 @@ impl<'a> Transformer<'a> {
                 ..
             } if self.config.lower_virtualizable => {
                 self.rewrite_op_setarrayitem(op, base, index, value, item_ty, graph_name)
+            }
+            // ── rewrite_op_getarraysize ──
+            OpKind::ArrayLen { base, .. } if self.config.lower_virtualizable => {
+                self.rewrite_op_getarraysize(op, base, graph_name)
             }
             // ── rewrite_op_direct_call ──
             OpKind::Call {
@@ -3032,13 +3064,23 @@ impl<'a> Transformer<'a> {
         // of the field at all; tracking it would drop the op and leave the
         // address's consumer with an undefined operand.
         let fresh_virtualizable = fresh_virtualizable || field.suppresses_virtualizable();
+        // `lower_virtualizable` guards the four sibling dispatch arms —
+        // `rewrite_op_setfield`, `rewrite_op_getarrayitem`,
+        // `rewrite_op_setarrayitem`, `rewrite_op_getarraysize`.  This function
+        // runs whether or not the flag is set, because the quasi-immutable
+        // tail below is independent of virtualizable lowering; the two
+        // virtualizable arms here are not.  With the flag off, the array arm
+        // would register a base no consumer will ever read and drop a read
+        // those consumers still reference, leaving regalloc an undefined
+        // variable.  The field's own doc covers "field/array accesses" — both.
+        let lower_vable = self.config.lower_virtualizable && !fresh_virtualizable;
         // Track virtualizable array field reads
         if let Some(array_field) = self
             .config
             .vable_arrays
             .iter()
             .find(|c| c.matches(field))
-            .filter(|_| !fresh_virtualizable)
+            .filter(|_| lower_vable)
             && let Some(result) = op.result.clone()
         {
             // RPython: vable_array_vars[result] = (v_base, arrayfielddescr, arraydescr)
@@ -3055,6 +3097,16 @@ impl<'a> Transformer<'a> {
             let is_signed = array_field.array_is_signed.unwrap_or(false);
             self.vable_array_vars
                 .insert(result, (base_var, array_field.index, itemsize, is_signed));
+            // `rewrite_op_getfield`'s `except VirtualizableArrayField:` handler
+            // ends in `return []` — registering the base is the whole rewrite
+            // and the read itself is dropped.  `rewrite_op_getarrayitem` emits
+            // `VableArrayRead` against the *frame* variable, never against this
+            // result, and `check_no_vable_array` rejects every other consumer
+            // route, so the op is dead the moment its uses are rewritten.
+            // Keeping it left a `getfield_gc_r` of the array pointer in the
+            // jitcode and exposed it to the immutability-rank rewrite below,
+            // neither of which upstream reaches.
+            return RewriteResult::Replace(Vec::new());
         }
         // Virtualizable scalar field → VableFieldRead
         if let Some(vable_field) = self
@@ -3062,7 +3114,7 @@ impl<'a> Transformer<'a> {
             .vable_fields
             .iter()
             .find(|c| c.matches(field))
-            .filter(|_| !fresh_virtualizable)
+            .filter(|_| lower_vable)
         {
             self.notes.push(GraphTransformNote {
                 function: graph_name.to_string(),
@@ -3360,6 +3412,66 @@ impl<'a> Transformer<'a> {
             }]);
         }
         RewriteResult::Keep
+    }
+
+    /// `jtransform.py:808-817 rewrite_op_getarraysize` — the third and last
+    /// consumer of `vable_array_vars`.
+    ///
+    /// Without it a `len()` on a virtualizable array is the one route that
+    /// still reads the raw array pointer, so the field read that produced it
+    /// cannot be dropped the way `rewrite_op_getfield`'s
+    /// `except VirtualizableArrayField:` handler drops it (`return []`).
+    /// The other two consumers, `rewrite_op_getarrayitem` and
+    /// `rewrite_op_setarrayitem`, have answered against the vable base since
+    /// they were ported.
+    ///
+    /// The macro lowering has emitted this instruction all along
+    /// (`majit-macros` `lower_vable_array_len`), and the whole run-time side
+    /// — the `arraylen_vable/rdd>i` key, the assembler, `opimpl_arraylen_vable`,
+    /// `bhimpl_arraylen_vable` — was already in place; only the codewriter
+    /// path never reached it.
+    fn rewrite_op_getarraysize(
+        &mut self,
+        op: &SpaceOperation,
+        base: &crate::flowspace::model::Variable,
+        graph_name: &str,
+    ) -> RewriteResult {
+        let Some((vable_base, arr_idx, itemsize, is_signed)) =
+            self.vable_array_vars.get(base).cloned()
+        else {
+            return RewriteResult::Keep;
+        };
+        self.notes.push(GraphTransformNote {
+            function: graph_name.to_string(),
+            detail: format!("rewrite: len(array) → VableArrayLen[{arr_idx}]"),
+        });
+        self.vable_rewrites += 1;
+        // `jtransform.py:814` — `-live-` leads the virtualizable array
+        // length read, as it leads its read and write siblings.
+        RewriteResult::Replace(vec![
+            SpaceOperation {
+                result: None,
+                kind: OpKind::Live,
+            },
+            SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::VableArrayLen {
+                    base: vable_base,
+                    array_index: arr_idx,
+                    // Upstream passes the `arraydescr` off `vinfo`
+                    // (`jtransform.py:816`), not one derived at the access —
+                    // an `arraylen_gc` carries no element type to derive one
+                    // from.  `vable_arraydescrof` asserts the block behind a
+                    // virtualizable array is a `FixedObjectArray` of
+                    // word-wide `PyObjectRef`s, which is the one shape this
+                    // mint accepts, so the element type is that and the pair
+                    // `vable_array_index_pair_at` checks holds.
+                    item_ty: ValueType::Ref(None),
+                    array_itemsize: itemsize,
+                    array_is_signed: is_signed,
+                },
+            },
+        ])
     }
 
     /// RPython: rewrite_op_setarrayitem
@@ -4303,6 +4415,17 @@ impl<'a> Transformer<'a> {
     /// Returns `None` for any oopspec spelling this does not handle, so
     /// the caller falls through to the residual path
     /// (`jtransform.py:1796` raises `NotSupported`).
+    ///
+    /// No arm here checks `vable_array_vars`, and none is owed.  Upstream
+    /// splits on `resizable`: the `do_fixed_list_len/getitem/setitem` arms
+    /// take a `lltype.GcArray` receiver — which is what a virtualizable array
+    /// field holds — and so open with that check, while the
+    /// `do_resizable_list_*` arms take a `GcStruct` and do not.  Every
+    /// spelling below is of the resizable family, its receiver a
+    /// `W_ListObject`.  pyre reaches a fixed array through
+    /// `getarrayitem` / `setarrayitem` / `getarraysize` instead, which carry
+    /// the check in their own dispatch arms and emit the same three
+    /// instructions the fixed arms do.
     fn _handle_list_call(
         &mut self,
         oopspec_name: &str,
@@ -6912,6 +7035,19 @@ fn remap_op(
             array_itemsize: *array_itemsize,
             array_is_signed: *array_is_signed,
         },
+        OpKind::VableArrayLen {
+            base,
+            array_index,
+            item_ty,
+            array_itemsize,
+            array_is_signed,
+        } => OpKind::VableArrayLen {
+            base: remap_value(base, aliases),
+            array_index: *array_index,
+            item_ty: item_ty.clone(),
+            array_itemsize: *array_itemsize,
+            array_is_signed: *array_is_signed,
+        },
         OpKind::VableArrayWrite {
             base,
             array_index,
@@ -8446,14 +8582,23 @@ mod tests {
         };
         let result = transform_graph(&graph, &config);
         assert_eq!(result.vable_rewrites, 1);
-        // `jtransform.py:764-767` — `-live-` leads the vable array read.
+        // The field read that produced the array is gone: registering the
+        // base is the whole rewrite, and `rewrite_op_getfield`'s
+        // `except VirtualizableArrayField:` handler ends in `return []`.
         let ops = &result.graph.block(graph.startblock).operations;
         assert!(
-            matches!(ops[1].kind, OpKind::Live),
-            "virtualizable array read must be led by -live-, got {:?}",
-            ops[1].kind
+            !ops.iter()
+                .any(|op| matches!(op.kind, OpKind::FieldRead { .. })),
+            "the virtualizable array field read must be dropped, got {:?}",
+            ops.iter().map(|op| &op.kind).collect::<Vec<_>>(),
         );
-        let rewritten_op = &ops[2];
+        // `jtransform.py:764-767` — `-live-` leads the vable array read.
+        assert!(
+            matches!(ops[0].kind, OpKind::Live),
+            "virtualizable array read must be led by -live-, got {:?}",
+            ops[0].kind
+        );
+        let rewritten_op = &ops[1];
         let OpKind::VableArrayRead {
             base: rewritten_base,
             array_index,
@@ -8464,6 +8609,259 @@ mod tests {
                 "expected VableArrayRead with explicit base, got {:?}",
                 rewritten_op.kind
             );
+        };
+        assert_eq!(*array_index, 0);
+        assert_eq!(rewritten_base, &base_var_held);
+    }
+
+    /// With `lower_virtualizable` off, the array field read stays: the four
+    /// consumer arms are gated on that flag, so dropping the read would leave
+    /// them referencing a variable nothing defines.
+    ///
+    /// `rewrite_op_getfield` is the one member of the family that runs
+    /// ungated — the quasi-immutable tail below it does not depend on
+    /// virtualizable lowering — which is exactly why its two virtualizable
+    /// arms need the check the dispatch would otherwise have made.
+    #[test]
+    fn a_vable_array_read_is_kept_when_virtualizable_lowering_is_off() {
+        let mut graph = FunctionGraph::new("test");
+        let base_var = graph.alloc_value_var();
+        let index_var = graph.alloc_value_var();
+        let array_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: base_var,
+                    field: crate::model::FieldDescriptor::new(
+                        "locals_stack_w",
+                        Some("Frame".into()),
+                    ),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::ArrayRead {
+                base: array_var.clone(),
+                index: index_var,
+                item_ty: ValueType::Int,
+                array_type_id: None,
+                nolength: false,
+                pure: false,
+            },
+            true,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let config = GraphTransformConfig {
+            lower_virtualizable: false,
+            vable_arrays: vec![VirtualizableFieldDescriptor::new_with_arraydescr(
+                "locals_stack_w",
+                Some("Frame".into()),
+                0,
+                8,
+                true,
+            )],
+            ..Default::default()
+        };
+        let result = transform_graph(&graph, &config);
+        assert_eq!(result.vable_rewrites, 0);
+        let ops = &result.graph.block(graph.startblock).operations;
+        assert!(
+            ops.iter().any(|op| op.result.as_ref() == Some(&array_var)),
+            "with lowering off the array read must still be defined, got {:?}",
+            ops.iter().map(|op| &op.kind).collect::<Vec<_>>(),
+        );
+    }
+
+    /// An escape by a route the four positional checks do not name must
+    /// still be caught, and named, before regalloc sees it.
+    ///
+    /// The array pointer's defining read is dropped at registration, so the
+    /// three rewriting consumers are the only ones that may follow it.  A
+    /// `getfield` on the pointer itself is none of them and is none of the
+    /// four enumerated escapes either — it is not a call argument, a setfield
+    /// operand, a link argument or a fused exitswitch operand.  It reaches
+    /// the catch-all, which is the whole point of having one: the four
+    /// positional checks are an enumeration, and an enumeration is what an
+    /// unforeseen route walks past.
+    ///
+    /// Without it the symptom is one variable used and never defined,
+    /// surfacing in regalloc against a register kind rather than against the
+    /// read that went missing.
+    #[test]
+    #[should_panic(expected = "Escaped via: surviving operation operand")]
+    fn a_vable_array_escape_by_an_unenumerated_route_is_named() {
+        let mut graph = FunctionGraph::new("test");
+        let base_var = graph.alloc_value_var();
+        let array_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: base_var,
+                    field: crate::model::FieldDescriptor::new(
+                        "locals_stack_w",
+                        Some("Frame".into()),
+                    ),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::FieldRead {
+                base: array_var,
+                field: crate::model::FieldDescriptor::new("header", Some("SomeArray".into())),
+                ty: ValueType::Int,
+                pure: false,
+            },
+            true,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let config = GraphTransformConfig {
+            vable_arrays: vec![VirtualizableFieldDescriptor::new_with_arraydescr(
+                "locals_stack_w",
+                Some("Frame".into()),
+                0,
+                8,
+                true,
+            )],
+            ..Default::default()
+        };
+        transform_graph(&graph, &config);
+    }
+
+    /// The scalar-field half of the same gate.  Both virtualizable arms of
+    /// `rewrite_op_getfield` are gated, so the flag has to be exercised on
+    /// both: [`a_vable_array_read_is_kept_when_virtualizable_lowering_is_off`]
+    /// covers the array arm, and this one the field arm.
+    ///
+    /// The stakes differ.  The array arm drops the read outright, so an
+    /// ungated drop leaves regalloc an undefined variable.  The field arm
+    /// only rewrites in place, so the flag decides whether the graph carries
+    /// a `VableFieldRead` no lowering will consume — quieter, and pinned here
+    /// so the two arms cannot drift apart.
+    #[test]
+    fn a_vable_field_read_is_kept_when_virtualizable_lowering_is_off() {
+        let mut graph = FunctionGraph::new("test");
+        let frame_var = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, frame_var.clone());
+        let field_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: frame_var,
+                    field: crate::model::FieldDescriptor::new("next_instr", Some("Frame".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, None);
+
+        let config = GraphTransformConfig {
+            lower_virtualizable: false,
+            vable_fields: vec![VirtualizableFieldDescriptor::new(
+                "next_instr",
+                Some("Frame".into()),
+                0,
+            )],
+            ..Default::default()
+        };
+        let result = transform_graph(&graph, &config);
+        assert_eq!(result.vable_rewrites, 0);
+        let ops = &result.graph.block(graph.startblock).operations;
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op.kind, OpKind::VableFieldRead { .. })),
+            "with lowering off the read must stay a plain FieldRead, got {:?}",
+            ops.iter().map(|op| &op.kind).collect::<Vec<_>>(),
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::FieldRead { .. })
+                    && op.result.as_ref() == Some(&field_var)),
+            "with lowering off the field read must still be defined, got {:?}",
+            ops.iter().map(|op| &op.kind).collect::<Vec<_>>(),
+        );
+    }
+
+    /// `jtransform.py:808-817 rewrite_op_getarraysize` — the third
+    /// consumer of `vable_array_vars`.
+    ///
+    /// A `len()` over a virtualizable array answers against the frame, not
+    /// the array pointer, so the field read that produced the pointer has
+    /// no consumer left and is dropped with the other two.
+    #[test]
+    fn transform_graph_rewrites_a_vable_array_len_against_the_frame() {
+        let mut graph = FunctionGraph::new("test");
+        let base_var = graph.alloc_value_var();
+        let base_var_held = base_var.clone();
+        let array_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: base_var,
+                    field: crate::model::FieldDescriptor::new(
+                        "locals_stack_w",
+                        Some("Frame".into()),
+                    ),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::ArrayLen {
+                base: array_var,
+                array_type_id: None,
+                nolength: false,
+            },
+            true,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let config = GraphTransformConfig {
+            vable_arrays: vec![VirtualizableFieldDescriptor::new_with_arraydescr(
+                "locals_stack_w",
+                Some("Frame".into()),
+                0,
+                8,
+                true,
+            )],
+            ..Default::default()
+        };
+        let result = transform_graph(&graph, &config);
+        assert_eq!(result.vable_rewrites, 1);
+        let ops = &result.graph.block(graph.startblock).operations;
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op.kind, OpKind::FieldRead { .. } | OpKind::ArrayLen { .. })),
+            "the array field read and the raw arraylen must both be gone, got {:?}",
+            ops.iter().map(|op| &op.kind).collect::<Vec<_>>(),
+        );
+        // `jtransform.py:814` — `-live-` leads the vable array length read.
+        assert!(
+            matches!(ops[0].kind, OpKind::Live),
+            "vable array length must be led by -live-, got {:?}",
+            ops[0].kind
+        );
+        let OpKind::VableArrayLen {
+            base: rewritten_base,
+            array_index,
+            ..
+        } = &ops[1].kind
+        else {
+            panic!("expected VableArrayLen, got {:?}", ops[1].kind);
         };
         assert_eq!(*array_index, 0);
         assert_eq!(rewritten_base, &base_var_held);

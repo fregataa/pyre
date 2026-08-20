@@ -444,6 +444,86 @@ fn front_graph_carries_no_synthesized_exception_edges() {
     );
 }
 
+/// `branch_loop_sum` iterates `&[i64]`, so the element `[__iter_next]`
+/// yields is an `i64` — the list's item repr, the way
+/// `rlist.py ll_listnext` hands one back.
+///
+/// This is the corpus half of the element-type fix.  The fold used to
+/// answer `Ref` for every container that was not `front::range_iter`'s
+/// `range()` builtin, because the `iter` op carries the iterator and not
+/// the container's item type — so this graph typed a raw `i64` into the
+/// ref register bank.  `result_ty` is not a hint the rtyper can overrule:
+/// `resolve_call_result_kind` consults `concretetype` only when
+/// `result_ty` is `Unknown`, and `authoritative_result_types` stamps the
+/// derived kind back over it.
+#[test]
+fn branch_loop_sum_next_yields_an_int_element() {
+    use majit_translate::model::{CallTarget, OpKind, ValueType};
+    let llbc = load_corpus();
+    let graph = lower_function(llbc, "branch_loop_sum").expect("lowering");
+
+    let element_types: Vec<ValueType> = graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments },
+                result_ty,
+                ..
+            } if segments.len() == 1 && segments[0] == "__iter_next" => Some(result_ty.clone()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        element_types,
+        vec![ValueType::Int],
+        "the `&[i64]` element must keep its own kind, not be typed as a GC reference",
+    );
+}
+
+/// The element `[__iter_next]` yields is a `&i64` for both of these, and the
+/// two get there differently: `slice_of_refs_sum` iterates `&[&i64]`, whose
+/// `core::slice::iter::Iter` yields `Option<&&i64>` — one reference the
+/// iterator added over one the element owns — while `array_of_refs_sum`
+/// iterates `[&i64; 3]` by value, whose `core::array::iter::IntoIter` yields
+/// `Option<&i64>` with no reference of its own.
+///
+/// So neither a blanket peel nor a blanket keep answers both: peeling every
+/// reference types the first element `Int`, and peeling one unconditionally
+/// types the second `Int`.  Either way a pointer lands in the integer
+/// register bank, which is why the decision reads the receiver's iterator
+/// ADT rather than the payload's shape alone.
+#[test]
+fn a_reference_element_stays_a_reference_through_either_iterator() {
+    use majit_translate::model::{CallTarget, OpKind, ValueType};
+    let llbc = load_corpus();
+
+    for name in ["slice_of_refs_sum", "array_of_refs_sum"] {
+        let graph = lower_function(llbc, name).expect("lowering");
+        let element_types: Vec<ValueType> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    result_ty,
+                    ..
+                } if segments.len() == 1 && segments[0] == "__iter_next" => Some(result_ty.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            element_types,
+            vec![ValueType::Ref(None)],
+            "{name}: a `&i64` element is a pointer and must keep the ref bank",
+        );
+    }
+}
+
 /// `branch_loop_sum`'s `for &v in slice` lifts to the native `iter` +
 /// `[__iter_next]` ops: Layer 3 of the iterator vertical replaces the
 /// residual `Iterator::next()` call (an unregistered callee that would
