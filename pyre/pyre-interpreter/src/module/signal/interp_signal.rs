@@ -118,6 +118,15 @@ pub fn set_handler(signum: i32, handler: PyObjectRef) {
     unsafe { pyre_object::w_dict_setitem(d, signum as i64, handler) };
 }
 
+/// Drop every registered handler, at the point in teardown where running
+/// app-level code is no longer sound.  A signal recorded after this reaches
+/// `report_signal` with nothing to call, which is the case that returns
+/// without running anything.
+pub fn clear_handlers() {
+    let d = handlers_dict();
+    unsafe { pyre_object::w_dict_clear(d) };
+}
+
 /// GC root walker over the signal-handler table and its value slots.
 ///
 /// The HANDLERS dict pointer itself is visited as a root so the GC can

@@ -205,17 +205,24 @@ pub fn install_current_frame_tls_only(frame: &mut PyFrame) -> CurrentFrameGuard 
 /// Pushing the frame onto the shadow stack lets the root walker forward it in
 /// place during the collection; `live()` reads the forwarded pointer back.
 /// This mirrors the JIT eval layer's `FrameRoot`.
-pub(crate) struct FrameAnchor {
+pub struct FrameAnchor {
     depth: usize,
+    /// The shadow stack is per-thread, so a depth taken on one thread names a
+    /// different slot on another. The marker is what keeps an anchor from
+    /// being sent or shared across threads now that the type is public.
+    _not_send: std::marker::PhantomData<*const ()>,
 }
 
 impl FrameAnchor {
-    pub(crate) fn new(frame: &mut PyFrame) -> Self {
+    pub fn new(frame: &mut PyFrame) -> Self {
         let depth = majit_gc::shadow_stack::push(majit_ir::GcRef(frame as *mut PyFrame as usize));
-        Self { depth }
+        Self {
+            depth,
+            _not_send: std::marker::PhantomData,
+        }
     }
 
-    pub(crate) fn live(&self) -> *mut PyFrame {
+    pub fn live(&self) -> *mut PyFrame {
         majit_gc::shadow_stack::get(self.depth).0 as *mut PyFrame
     }
 }
@@ -2275,6 +2282,19 @@ pub(crate) fn finalize_failed_attr_receiver_now(obj: PyObjectRef) -> bool {
 
 impl SharedOpcodeHandler for PyFrame {
     type Value = PyObjectRef;
+
+    type Anchor = FrameAnchor;
+
+    fn anchor(&mut self) -> Self::Anchor {
+        FrameAnchor::new(self)
+    }
+
+    fn push_anchored(anchor: &Self::Anchor, value: Self::Value) -> Result<(), PyError> {
+        // A JIT-created frame lives in the nursery and the allocating step may
+        // have relocated it; push onto the forwarded live frame.
+        unsafe { &mut *anchor.live() }.push(value);
+        Ok(())
+    }
 
     fn push_value(&mut self, value: Self::Value) -> Result<(), PyError> {
         self.push(value);
