@@ -83,7 +83,7 @@ thread_local! {
     /// residual of the same opcode instance can follow one.
     static ESCAPE_OPCODE_WINDOW: std::cell::Cell<Option<(usize, bool)>> =
         const { std::cell::Cell::new(None) };
-    /// C3 S1 force-time image of the single live tracing frame.  The
+    /// Force-time image of the single live tracing frame.  The
     /// color-indexed concrete banks cease to exist when dispatch unwinds, so
     /// the MIFrame must be assembled beside `tracing_after_residual_call` and
     /// carried to the walk-end VableEscaped leg.
@@ -3191,6 +3191,18 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // stamping one would leave `tracing_after_residual_call` reading a token
     // nobody will clear.
     if is_may_force {
+        // How many pairs the bracket actually walks.  Both halves iterate
+        // `virtualref_boxes`, and nothing in-tree reports its length, so
+        // "the bracket iterates zero times" has never been a measured claim —
+        // only a restatement of which call sites populate it.  Report the
+        // count here so a sweep can settle it; gated like the rest of the
+        // walk's build reporting.
+        if fbw_debug_abort_enabled() {
+            eprintln!(
+                "[vref-bracket] pairs={}",
+                ctx.trace_ctx.virtualref_boxes_len() / 2
+            );
+        }
         ctx.trace_ctx.vrefs_before_residual_call();
     }
     let live_frame = if ctx.fbw_mode.snapshot_sym.is_null() {
@@ -3568,7 +3580,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                 // takes over the continuation.
                 mark_escape_flush_undo_pending();
             }
-            // C3 S1: the writes-live-heap force shape cannot safely resume AT
+            // The writes-live-heap force shape cannot safely resume AT
             // this opcode, but a top-level one-frame walk can resume PAST it
             // through the existing blackhole when every live color has a
             // concrete value.  Build here, before WalkContext's concrete banks
@@ -5084,10 +5096,20 @@ fn try_walker_force_quasi_immut_mapdict_write<Sym: WalkSym>(
 ///     that the converged walker would route through. Production reach
 ///     today is zero — `jtransform.rs jit.force_virtual` is the only
 ///     producer and pyre's interpreter does not emit it.
-///   - `vrefs_after_residual_call` is ported on `TraceCtx` but the walker
-///     never calls it; no `jit.virtual_ref` producers exist today, so the
-///     upstream loops are empty either way. Vable forces are detected by the
-///     residual-call execution path's heap-token bracket.
+///   - `vrefs_before_residual_call` / `vrefs_after_residual_call` ARE called
+///     by the walker, under the `is_may_force` gate that mirrors
+///     `do_residual_call`'s `assembler_call or effectinfo.check_forces_...`
+///     (`pyjitpl.py:2007`). Their loops are NOT empty: [`walker_ec_enter`]
+///     takes a vref of every seeded callee frame via
+///     `TraceCtx::opimpl_virtual_ref` — `ExecutionContext.enter`'s vref — and
+///     pairs it with `opimpl_virtual_ref_finish` when the frame leaves, so
+///     `virtualref_boxes` carries real entries whenever an inlined callee is
+///     live across a may-force call. Measured over 431 synth + 93 parity
+///     fixtures via the `[vref-bracket] pairs=` report: 5487 bracket entries,
+///     686 of them (12.5%) with at least one pair, 66 of the 316 emitting
+///     fixtures reaching a nonzero count, maximum 7 pairs. Vable forces are
+///     detected separately, by the residual-call execution path's heap-token
+///     bracket.
 ///   - `direct_libffi_call` (`pyjitpl.py`) — pyre's live
 ///     tracer also returns `None` from this helper unless a
 ///     `CIF_DESCRIPTION_P` parser + dynamic `calldescr` builder lands
@@ -5949,7 +5971,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
-    // B3: a `raise Type(args)` of a canonical
+    // A `raise Type(args)` of a canonical
     // builtin exception class arrives as two residuals — a `CallFn` that
     // constructs the exception, and a `RaiseVarargs`
     // (`normalize_raise_varargs_jit`) that publishes it.  The construct fold
@@ -6008,7 +6030,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
-    // B3 piece 3: lower the PUSH_EXC_INFO / POP_EXCEPT
+    // Lower the PUSH_EXC_INFO / POP_EXCEPT
     // exc-info-stack residuals to GETFIELD_GC_R / SETFIELD_GC on the EC's
     // `sys_exc_value` slot, and consume the interpreter-only propagation-root
     // clear without recording a runtime CallN. Recognised by the
@@ -6597,7 +6619,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // SUCCESSFUL fold provably can't raise NameError and dropping that guard
     // for this load is sound — the handler can never be entered from it.  We
     // therefore attempt the fold even in handler-bearing bodies and keep the
-    // residual (with its guard) only when the fold DECLINES.  The `B3`/builtin
+    // residual (with its guard) only when the fold DECLINES.  The builtin
     // raise+catch path needs this so the
     // `raise ValueError`/`except ValueError` class loads fold to const.
     //
@@ -7151,7 +7173,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         specialized
                     }
                 } else if op_tag == 10 && ctx.is_authoritative_executor {
-                    // B3: `op_tag == 10` is CHECK_EXC_MATCH
+                    // `op_tag == 10` is CHECK_EXC_MATCH
                     // (`bh_compare_fn(exc, match_type, 10)`,
                     // `call_jit.rs`).  Fold the match concretely to a
                     // const bool (the immortal TRUE/FALSE singleton) so the

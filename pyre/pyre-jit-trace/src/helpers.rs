@@ -1412,9 +1412,12 @@ pub fn emit_box_float_inline(
 /// `freevar_start..`, matching `PyFrame::finish_for_call_with_globals_obj`;
 /// callers that need fresh cellvars remain on the residual path. The frame is
 /// the callee MIFrame's `frame` red —
-/// `_opimpl_inline_call*` / `perform_call`+`setup_call` create a fresh frame
-/// per inlined call (`pyjitpl.py:2445-2476,1862-1874`); the box stays virtual
-/// on the hot path (the optimizer folds `NewWithVtable`+`SetfieldGc`) and is
+/// `_opimpl_inline_call*` / `perform_call`+`setup_call` push a fresh MIFrame
+/// per inlined call (`pyjitpl.py:2445-2476,1862-1874`) — the app-level frame
+/// emitted here has no upstream counterpart at that point, because upstream
+/// gets one from tracing the interpreter's own frame construction.  The box
+/// stays virtual on the hot path (the optimizer folds
+/// `NewWithVtable`+`SetfieldGc`) and is
 /// materialized lazily only on guard failure.  Carries every field the frame
 /// constructor assigns, so a forced materialization
 /// (`materialize_virtual_from_rd`) never dereferences a field the interpreter
@@ -1707,7 +1710,8 @@ mod tests {
 
     /// Verifies that `#[elidable_cannot_raise]` emits the
     /// `INT_ELIDABLE_CANNOT_RAISE = 19` policy byte (`call.py:299`
-    /// parity / `call_policy_byte.rs:96`) and produces non-null
+    /// parity / `call_policy_byte.rs`'s `INT_ELIDABLE_CANNOT_RAISE`) and
+    /// produces non-null
     /// trace_target / concrete_target trampolines.  Lives in-crate
     /// because external integration tests cannot reach the macro's
     /// `pub(crate)` `__majit_call_policy_*` symbol from outside.
@@ -1723,7 +1727,7 @@ mod tests {
     /// Confirms the helper still runs correctly under the elidable
     /// attribute and preserves the elidable invariant (same input →
     /// same output).  With the `WITHPREBUILTINT=false` default
-    /// (`intobject.rs:44`) every input returns false.
+    /// (`intobject.rs`) every input returns false.
     #[test]
     fn elidable_helper_is_deterministic_and_matches_pyre_object() {
         for &value in &[0i64, 7, -3, 42, i64::MIN, i64::MAX] {

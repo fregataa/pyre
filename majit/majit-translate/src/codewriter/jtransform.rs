@@ -1818,7 +1818,7 @@ impl<'a> Transformer<'a> {
             // pyre's lighter rtyper leaves the generic `BinOp` in place
             // with one or both operands defaulting to `'r'` kind, so the
             // unconditional `int_<op>` prefix at
-            // `assembler.rs:3160` would emit `int_eq/ir>i` /
+            // `assembler.rs`'s `op_kind_to_opname_with_kinds` would emit `int_eq/ir>i` /
             // `int_le/ri>i` opnames that no RPython blackhole handler
             // registers (see
             // `default_bh_builder_unwired_set_matches_task_85_snapshot`).
@@ -2092,7 +2092,7 @@ impl<'a> Transformer<'a> {
             //
             // Pre-existing optimisation passes
             // (`optimize_call_int_py_mod` /
-            // `optimize_call_int_py_div` at `optimizeopt/rewrite.rs:1788,1848`)
+            // `optimize_call_int_py_div` in `optimizeopt/rewrite.rs`)
             // stay parked for the future route-(b) path: pyre has no
             // Python-bytecode emitter that produces `int.py_mod` /
             // `int.py_div` oopspec calls today, so those passes are
@@ -2101,8 +2101,8 @@ impl<'a> Transformer<'a> {
             // pass is ported on top of the C-trunc helper.
             //
             // Without this rewrite the assembler encoder
-            // (`codewriter/assembler.rs:2778-2789
-            // `format!("int_{op}")``) would emit the bare opname,
+            // (`codewriter/assembler.rs`'s `op_kind_to_opname_with_kinds`
+            // `format!("int_{op}")`) would emit the bare opname,
             // leaking `int_mod/ii>i` / `int_floordiv/ii>i` into
             // `pipeline.insns` where no blackhole handler exists.
             OpKind::BinOp {
@@ -2209,7 +2209,7 @@ impl<'a> Transformer<'a> {
             //      (RPython `op.bool` before the rtyper).
             //   2. The rtyper itself emits `OpKind::UnaryOp { op:
             //      "float_is_true", .. }` from `FloatRepr.rtype_bool`
-            //      (`rfloat.rs:191-198`, mirror of upstream
+            //      (in `rfloat.rs`, mirror of upstream
             //      `rfloat.py:rtype_bool`).
             //
             // Both shapes must be rewritten here.  If neither is
@@ -2218,11 +2218,11 @@ impl<'a> Transformer<'a> {
             // `float_ne` — RPython jtransform.py:1627 collapses both
             // surfaces to the same canonical shape.  Pyre's rewriter
             // does not chain back into `rewrite_operation` the way
-            // upstream does (the loop at `jtransform.rs:446-462`
+            // upstream does (the per-op loop in `optimize_block`
             // consumes `Replace(ops)` without re-dispatch), so emit
             // the canonical `float_ne` opname here rather than
             // leaving an intermediate op for the float-comparison
-            // arm at `jtransform.rs:827-854`.
+            // arm in `rewrite_operation`.
             OpKind::UnaryOp {
                 op: unop_name,
                 operand,
@@ -4449,16 +4449,22 @@ impl<'a> Transformer<'a> {
                 )
             }
             "list.int_capacity" => {
-                // Capacity is `len(l.items)` (rlist.py:251) — the backing
-                // block's offset-0 length header, not a direct field of the
-                // list. Load `int_items.block` then read `ItemsBlock.capacity`
-                // off it, mirroring `list.obj_capacity`. The capacity descr is
-                // a block-kind-agnostic offset-0 scalar read, so it resolves
-                // the TypedItemsBlock (int storage) header the same way.
+                // Capacity is `len(l.items)` — `_ll_list_resize_hint`
+                // (rpython/rtyper/lltypesystem/rlist.py:251 `allocated =
+                // len(l.items)`) and `_ll_list_resize_ge`
+                // (rlist.py:286 `cond = len(l.items) < newsize`) both read the
+                // length of `l.items: Ptr(GcArray(ITEM))`.  The rtyper lowers
+                // that to `getarraysize`, which
+                // `jtransform.py:808 rewrite_op_getarraysize` rewrites to
+                // `arraylen_gc` — an ARRAY length, never a struct field read.
+                // Load `int_items.block` then take that block's length header,
+                // exactly as `list.obj_capacity` does; reading it as a struct
+                // field instead classified the block pointer as a
+                // `StructPtrInfo` and exported an unrelated struct identity.
                 let l = args.first()?.clone();
                 let block = graph.alloc_value_var_with_type(ConcreteType::GcRef);
                 (
-                    "list.int_capacity → getfield_gc_r(int_items.block) + getfield_gc_i(block.capacity)",
+                    "list.int_capacity → getfield_gc_r(int_items.block) + arraylen_gc(block)",
                     vec![
                         SpaceOperation {
                             result: Some(block.clone()),
@@ -4474,14 +4480,10 @@ impl<'a> Transformer<'a> {
                         },
                         SpaceOperation {
                             result: op.result.clone(),
-                            kind: OpKind::FieldRead {
+                            kind: OpKind::ArrayLen {
                                 base: block,
-                                field: FieldDescriptor::new(
-                                    "capacity",
-                                    Some("ItemsBlock".to_string()),
-                                ),
-                                ty: ValueType::Int,
-                                pure: false,
+                                array_type_id: None,
+                                nolength: false,
                             },
                         },
                     ],
@@ -4563,17 +4565,14 @@ impl<'a> Transformer<'a> {
                 )
             }
             "list.float_capacity" => {
-                // Capacity is `len(l.items)` (rlist.py:251) — the backing
-                // block's offset-0 length header, not a direct field of the
-                // list. Load `float_items.block` then read `ItemsBlock.capacity`
-                // off it, mirroring `list.int_capacity`/`list.obj_capacity`. The
-                // capacity descr is a block-kind-agnostic offset-0 scalar read,
-                // so it resolves the TypedItemsBlock (float storage) header the
-                // same way.
+                // Capacity is `len(l.items)` (rlist.py:251 / :286) — an ARRAY
+                // length that lowers to `arraylen_gc`, not a struct field read.
+                // See `list.int_capacity` above; the float strategy differs
+                // only in which backing block the length is taken from.
                 let l = args.first()?.clone();
                 let block = graph.alloc_value_var_with_type(ConcreteType::GcRef);
                 (
-                    "list.float_capacity → getfield_gc_r(float_items.block) + getfield_gc_i(block.capacity)",
+                    "list.float_capacity → getfield_gc_r(float_items.block) + arraylen_gc(block)",
                     vec![
                         SpaceOperation {
                             result: Some(block.clone()),
@@ -4589,14 +4588,10 @@ impl<'a> Transformer<'a> {
                         },
                         SpaceOperation {
                             result: op.result.clone(),
-                            kind: OpKind::FieldRead {
+                            kind: OpKind::ArrayLen {
                                 base: block,
-                                field: FieldDescriptor::new(
-                                    "capacity",
-                                    Some("ItemsBlock".to_string()),
-                                ),
-                                ty: ValueType::Int,
-                                pure: false,
+                                array_type_id: None,
+                                nolength: false,
                             },
                         },
                     ],
@@ -4825,7 +4820,7 @@ impl<'a> Transformer<'a> {
         // `function_graphs[["PyFrame", "pop_top"]]` entry. The stateless
         // `target_to_call_path` fallback only yields the bare method name,
         // which never matches `CallControl::register_inherent_method`'s
-        // qualified key (`call.rs:941`) and leaves the shell body-less in
+        // qualified key (in `call.rs`) and leaves the shell body-less in
         // `drain_pending_graphs`.
         let jitcode = if let Some(cc) = self.callcontrol.as_mut() {
             let path = cc
@@ -6154,7 +6149,7 @@ impl<'a> Transformer<'a> {
 /// - `Constant(link.llexitcase, lltype.Bool)`: pyre's `link.llexitcase`
 ///   may be `None` pre-rtyper, but the bool branch value is reliably in
 ///   `link.exitcase` as [`ExitCase::Bool`] (the same source
-///   `with_llexitcase_from_exitcase` reads, `model.rs:1244-1252`); the
+///   `with_llexitcase_from_exitcase` reads, in `model.rs`); the
 ///   substituted constant is
 ///   `Constant::with_concretetype(ConstValue::Bool(b), lltype.Bool)`,
 ///   carrying the `lltype.Bool` concretetype upstream stamps.
@@ -13522,11 +13517,13 @@ mod tests {
     }
 
     /// `list.int_capacity(l)` lowers to `getfield_gc_r(int_items.block) +
-    /// getfield_gc_i(block.capacity)` — capacity is `len(l.items)`
-    /// (rlist.py:251), the block's offset-0 length header, not a direct field
-    /// of the list.
+    /// arraylen_gc(block)` — capacity is `len(l.items)` (rlist.py:251), an
+    /// ARRAY length on the backing block, not a struct field read. The
+    /// `arraylen_gc` half is what keeps the block classified as an array, so
+    /// the item cache can pair an append's store with a pop's read; a struct
+    /// field read here made it a `StructPtrInfo` instead.
     #[test]
-    fn handle_list_call_int_capacity_lowers_to_block_capacity() {
+    fn handle_list_call_int_capacity_lowers_to_block_arraylen() {
         let config = GraphTransformConfig::default();
         let mut graph = FunctionGraph::new("list_int_capacity");
         let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
@@ -13561,15 +13558,11 @@ mod tests {
             other => panic!("expected FieldRead, got {other:?}"),
         };
         match &ops[1].kind {
-            OpKind::FieldRead {
-                base, field, ty, ..
-            } => {
+            OpKind::ArrayLen { base, nolength, .. } => {
                 assert_eq!(base, &block);
-                assert_eq!(field.name, "capacity");
-                assert_eq!(field.owner_root.as_deref(), Some("ItemsBlock"));
-                assert!(matches!(ty, ValueType::Int));
+                assert!(!*nolength, "the block carries its length header");
             }
-            other => panic!("expected FieldRead, got {other:?}"),
+            other => panic!("expected ArrayLen, got {other:?}"),
         }
         assert_eq!(ops[1].result, Some(result));
     }
@@ -13714,11 +13707,11 @@ mod tests {
     }
 
     /// `list.float_capacity(l)` lowers to `getfield_gc_r(float_items.block) +
-    /// getfield_gc_i(block.capacity)` — capacity is `len(l.items)`
-    /// (rlist.py:251), the block's offset-0 length header, not a direct field
-    /// of the list (mirrors `int_capacity`).
+    /// arraylen_gc(block)` — capacity is `len(l.items)` (rlist.py:251), an
+    /// ARRAY length on the backing block, not a struct field read (mirrors
+    /// `int_capacity`).
     #[test]
-    fn handle_list_call_float_capacity_lowers_to_block_capacity() {
+    fn handle_list_call_float_capacity_lowers_to_block_arraylen() {
         let config = GraphTransformConfig::default();
         let mut graph = FunctionGraph::new("list_float_capacity");
         let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
@@ -13753,15 +13746,11 @@ mod tests {
             other => panic!("expected FieldRead, got {other:?}"),
         };
         match &ops[1].kind {
-            OpKind::FieldRead {
-                base, field, ty, ..
-            } => {
+            OpKind::ArrayLen { base, nolength, .. } => {
                 assert_eq!(base, &block);
-                assert_eq!(field.name, "capacity");
-                assert_eq!(field.owner_root.as_deref(), Some("ItemsBlock"));
-                assert!(matches!(ty, ValueType::Int));
+                assert!(!*nolength, "the block carries its length header");
             }
-            other => panic!("expected FieldRead, got {other:?}"),
+            other => panic!("expected ArrayLen, got {other:?}"),
         }
         assert_eq!(ops[1].result, Some(result));
     }

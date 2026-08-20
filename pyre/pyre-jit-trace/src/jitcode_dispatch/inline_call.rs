@@ -429,15 +429,16 @@ pub(crate) fn inline_resolvable_seeded_frame_op(
     }
 }
 
-/// True iff `body_code` contains a `raise` op.  A callee that raises inline
-/// unwinds cleanly only at the top inline level (`inline_depth == 0`, directly
-/// under the real caller loop): a raise from a callee inlined BELOW another
-/// inlined frame must cross the suspended intermediate frame(s), which needs the
-/// cross-frame exception-unwind bridge (gh#343 / gh#467) the drain does not yet
-/// reconstruct — the trace instead drops the `NestedBreakBridgeResume` bridge
-/// and deopts the unwind to the blackhole.  Straight value-returning chains
-/// never raise, so they still inline to the full `fbw_max_multiframe_depth`; a
-/// raising callee is capped at the top level.
+/// True iff `body_code` contains a `raise` op.  A raise from a callee inlined
+/// BELOW another inlined frame has to cross the suspended intermediate
+/// frame(s) through the cross-frame exception-unwind bridge (gh#343 / gh#467),
+/// so the depth is bounded rather than unbounded: the call site caps a raising
+/// callee at TWO multiframe levels, not at the top level — see the measured
+/// note beside `effective_multiframe_depth`, where two levels are green and a
+/// third takes `selfrec_tail_exception_unwind`'s `guard_failures` from 937 to
+/// 7408 because the unwind then crosses two suspended copies of one frame.
+/// Straight value-returning chains never raise, so they still inline to the
+/// full `fbw_max_multiframe_depth`.
 pub(crate) fn callee_body_contains_raise(body_code: &[u8]) -> bool {
     let mut pc = 0usize;
     while pc < body_code.len() {
@@ -4856,8 +4857,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // so a callee that never runs leaves no half-entered chain behind.  A
     // seeded level is the only one with a frame object to enter with; an
     // unseeded (register-resident) inline has none, which is the remaining gap
-    // between this chain and upstream's, where `perform_call` builds a frame
-    // for every inlined call (`pyjitpl.py:2445-2476, 1862-1874`).
+    // between this chain and upstream's.  Upstream always has an app-level
+    // frame here because it traces the interpreter's own frame construction,
+    // so `enter` runs on a real frame object.  The frame `perform_call` →
+    // `newframe` pushes (`pyjitpl.py:2445-2476, 1862-1874`) is the tracer's
+    // `MIFrame` instead, and is not what `enter` takes its vref of.
     let entered_ec = callee_frame_seeded && !ca_concrete_frame.is_null() && {
         let concrete_ec = unsafe { (*ca_concrete_frame).execution_context }
             as *mut pyre_interpreter::PyExecutionContext;

@@ -584,7 +584,7 @@ fn resolve_midbody_flush_words(
         payload.outer_jitcode_index as i32,
         payload.call_jitcode_pc as i32,
     ) as usize;
-    // #73 walker-as-tracer P1: the callee resume py is read from the scalar
+    // #73 walker-as-tracer: the callee resume py is read from the scalar
     // forward-carried on the MidBodyPayload (`callee_py_pc`, stamped at capture
     // from the same jitcode->py inversion this once performed). The `callee`
     // pjc lookup above stays for its null-code decline (`?`) and feeds the
@@ -848,7 +848,7 @@ fn try_commit_midbody_abort_inner(
         (words.call_py_pc as u32) * 2,
     );
     {
-        // E-G2: this specialization reconstructs only the exact empty
+        // This specialization reconstructs only the exact empty
         // operand-stack level used by statement-position calls. A handler
         // preserving any operand below the call remains on legacy replay.
         if let Some((_target, depth, _lasti)) = outer_handler {
@@ -863,7 +863,7 @@ fn try_commit_midbody_abort_inner(
                 ));
             }
         }
-        // G7: materialize every outer local before the rebuilt callee can run.
+        // Materialize every outer local before the rebuilt callee can run.
         // `can_flush_walk_end_state_after_outer_call` already proved all
         // shadow entries sourceable, so no post-effect decline remains.
         if !crate::state::write_back_outer_locals(ctx, cf_addr) {
@@ -1151,7 +1151,7 @@ pub fn trace_bytecode<Sym: WalkSym>(
     //
     // The former snapshot double-apply (inline-frame SHARED-heap STOREs
     // leaking during tracing and re-applying on the compiled loop's re-run)
-    // is resolved by gap 10: the concrete executor is deleted so STOREs are
+    // is resolved because the concrete executor is deleted so STOREs are
     // record-only, and `flush_walk_end_state_to_frame`
     // (`raise_continue_running_normally` parity) advances the real frame so
     // the interpreter resumes AFTER the walked region, not from its start.
@@ -1170,13 +1170,13 @@ pub fn trace_bytecode<Sym: WalkSym>(
     // `live_vable_frame_addr` field doc (state.rs).  Set before the
     // full-body-walk leg below so the production tracer sees it.
     //
-    // gap 10 slice 2b: set this BEFORE `init_symbolic` so the root vable
+    // Set this BEFORE `init_symbolic` so the root vable
     // identity (seed_virtualizable_boxes) is baked against the live frame
     // address, not the discarded snapshot's.
     sym.set_live_vable_frame_addr(live_frame_addr);
     // pyjitpl.py:65 MIFrame.__init__: sym fields populated once at frame
-    // construction. Callee (inline) frames are set up by perform_call
-    // (trace_opcode.rs) and don't call init_symbolic; this path
+    // construction. Callee (inline) frames are set up by `inline_call.rs`'s
+    // `setup_call` port and don't call init_symbolic; this path
     // handles the root frame push.
     sym.init_symbolic(ctx, cf_addr);
     if let Some(ref carrier) = carrier {
@@ -1498,7 +1498,7 @@ fn pending_call_result_semantic_slot(nlocals: usize, post_call_depth: usize) -> 
         .and_then(|top| nlocals.checked_add(top))
 }
 
-/// Issue #215 item 2 (P2 drain): drive a multiframe bridge-carrier resume via
+/// Issue #215 item 2: drive a multiframe bridge-carrier resume via
 /// the full-body walker instead of aborting to a no-JIT re-interpret.
 ///
 /// The carrier reconstructs the in-flight callee framestack
@@ -1755,7 +1755,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     }
     let Some(recipe) = carrier.recipes.last() else {
         crate::jitcode_dispatch::census_record("P2Drain::NoRecipes");
-        // Churn guard (Task 8): making this class transient retried the same
+        // Churn guard: making this class transient retried the same
         // guard 500 times in inline_chain_depth_typeflip.py and
         // p2_local_result_bridge.py (loops_aborted 6 -> 505), so keep only
         // this measured P2 class permanently declined.
@@ -3479,7 +3479,7 @@ fn run_perfn_walk<Sym: WalkSym>(
     // entry seeded as r0 (= `sym.frame`, and
     // `sym.frame == OpRef::input_arg_typed(SYM_FRAME_IDX, Ref)`).  A fresh
     // `const_ref(cf_addr)` would be a DIFFERENT OpRef than the identity box,
-    // so `concrete_of_opref`'s standard-vable resolution (trace_ctx.rs:1842,
+    // so `concrete_of_opref`'s standard-vable resolution (trace_ctx.rs,
     // keyed on `== standard_virtualizable_box()`) would miss and every vable
     // read would fall through to the nonstandard GETFIELD_GC leg.  Falls back
     // to `const_ref` only when no virtualizable is bound.
@@ -3533,7 +3533,7 @@ fn run_perfn_walk<Sym: WalkSym>(
         // not overwrite these (a kept temp never lives in a red-input color).
         let mut reserved_red_colors: Vec<u8> = Vec::new();
         if !is_bridge_trace {
-            // C1 marker entry starts at the static sidecar coordinate BEFORE
+            // The marker entry starts at the static sidecar coordinate BEFORE
             // the source marker.  Seed only the root JitCode's formal red
             // inputs at their per-JitCode metadata colors. The marker's Int
             // greens remain in the constant region; its Ref green is seeded
@@ -3709,7 +3709,8 @@ fn run_perfn_walk<Sym: WalkSym>(
                             // the portal EC color for a live operand at PCs where
                             // the trace has no live EC read (the same collision the
                             // guard-failure resume handles at
-                            // jitcode_dispatch.rs:6994 via `semantic_idx.is_none()`
+                            // `collect_outer_active_boxes` via
+                            // `semantic_idx.is_none()`
                             // — otherwise `fib(n-1) + fib(n-2)` resumes the left
                             // operand as the EC and SIGSEGVs).  When the bridge
                             // names a genuine operand here (an opref other than the
@@ -3914,7 +3915,7 @@ fn run_perfn_walk<Sym: WalkSym>(
             entry,
         );
         if let Some((bank, color)) = uncovered {
-            // read_int_reg/read_float_reg (jitcode_dispatch/mod.rs:1907-1936)
+            // read_int_reg/read_float_reg (jitcode_dispatch/mod.rs)
             // only bounds-check. An uncovered color would record OpRef::NONE
             // into an operation and can become a SIGSEGV or miscompile; retain
             // this cold decline as the release airbag.
@@ -4122,27 +4123,68 @@ fn run_perfn_walk<Sym: WalkSym>(
         // `LoopBearingCalleeInlineUnsupported` and
         // `AbortPermanentMarkerReached` route to the gh#467 CALL-forward
         // carrier, which resumes the OUTER frame at its CALL rather than
-        // inside the discarded callee attempt.  The nested-residual variant
-        // marked `blackhole_required: true` owns a complete per-frame image
-        // and so passes `leaves_complete_image`, but the image it hands the
-        // blackhole is not a valid forward resume for every shape that reaches
-        // it.  Two `bench/synth` fixtures are the standing witnesses, both
-        // wrong-code rather than a decline: `inline_subwalk_user_iterator`
-        // (the inlined callee's return value comes back as an untyped ref, so
-        // the caller's `acc += v` raises `TypeError: ... 'int' and 'object'`)
-        // and `list_append_write_barrier_gc` (`stack underflow during
-        // interpreter peek` — the resumed frame's operand stack is short).
-        // `PYRE_WALKABORT_OFF=1` is the control: both pass with the leg
-        // disabled.  The `frame_finished_execution` store the handoff used to
-        // skip is NO LONGER one of the reasons — the drive now performs it at
-        // every level it leaves (`state::finish_blackhole_level_frame`, wired
-        // as `on_leave_level`), which is what
-        // `parity_tests/jit_inline_traceback_frame_clear.py` needs on
-        // `sys._getframe().clear()`.  Restore the carrier for this variant
-        // until the two image defects above are closed;
-        // `ForceQuasiImmutable` resumes AT the forcing opcode via
-        // `flush_qmut_abort_state` (arm below), which re-runs the write the
-        // walk stopped in front of instead of finishing the frame past it.
+        // inside the discarded callee attempt.  Only the first of those two is
+        // named below: `AbortPermanentMarkerReached` never reaches this leg
+        // because it is absent from `leaves_complete_image`'s allow-list, which
+        // gates the `matches!` entirely.  `ForceQuasiImmutable` resumes AT the
+        // forcing opcode via `flush_qmut_abort_state` (arm below), which re-runs
+        // the write the walk stopped in front of instead of finishing the frame
+        // past it.
+        //
+        // The `LoopBearingCalleeInlineUnsupported` arm only ever excludes the
+        // nested-residual variant marked `blackhole_required: true`: the plain
+        // decline is already outside `leaves_complete_image`'s allow-list and
+        // keeps the carrier either way.  That variant DOES own a complete
+        // per-frame image, and it had two separate blockers.  The first is
+        // closed: the blackhole did not publish `PyFrame.finish_value`'s
+        // `frame_finished_execution` store, which this codewriter lowers into
+        // the `*_return` operation instead of emitting — the walker re-emits it
+        // (`finish_current_frame_execution`) and the interpreter performs it on
+        // RETURN_VALUE, and the drive now performs it at every level it leaves
+        // (`state::finish_blackhole_level_frame`, wired as `on_leave_level`),
+        // so a frame it finished no longer reads back as executing.  That is
+        // what `parity_tests/jit_inline_traceback_frame_clear.py` needs on
+        // `sys._getframe().clear()`.
+        //
+        // The second blocker is PERMANENT, and it is why this arm stays.  A
+        // multi-frame image stacks the CALLEE above its CALLER, so every frame
+        // but the bottom one has a `nextblackholeinterp`.  `bhimpl_jit_merge_point`
+        // (`blackhole.py:1066-1093`) reads exactly that as the RECURSIVE PORTAL
+        // level: with a next interpreter present it takes
+        // `bhimpl_recursive_call_{i,r,f,v}`, parks the portal's result in
+        // `tmpreg_*`, sets `return_type`, and raises `LeaveFrame`.  That is
+        // correct upstream, where a portal jitdriver's merge point occurs only in
+        // the portal frame — but this decline is
+        // `LoopBearingCalleeInlineUnsupported`, which reports that the callee
+        // bears a loop, and a loop-bearing callee carries its own
+        // merge point at that loop's header.  The callee therefore hits its merge
+        // point BEFORE it ever reaches a `*_return`, and the caller below it
+        // receives that `tmpreg_*` as the callee's return value.
+        //
+        // Measured on `inline_subwalk_user_iterator`, whose `step` bears the
+        // `for x in it` loop: the image is `[run@1054, step@260]`, `step` runs a
+        // straight line from its resume to the `jit_merge_point` at its loop
+        // header and leaves there with `ret_type=Ref`, and `run` resumes holding
+        // the iterator — the ref live in the merge point's red list — where its
+        // call result belongs, ending in `unsupported operand type(s) for +:
+        // 'int' and 'object'`.  `list_append_write_barrier_gc` reproduces it
+        // independently on `[big_live_len_regrow@1191, churn@162]`, where `churn`
+        // leaves at the merge point of its own `for i in range(k)` loop — the very
+        // frame the failing traceback ends on — surfacing instead as `stack
+        // underflow during interpreter peek` off a traceback whose frames are
+        // interleaved, `str(i)` appearing to call `churn`.  Ten further
+        // fixtures answer `fbw_blackhole_adopted_multi_frame 0 -> 1`, so the
+        // handoff is reached broadly; the two failures are the shapes whose
+        // callee reaches its own merge point first, not a corner.
+        // `PYRE_WALKABORT_OFF=1` is the control: both fixtures pass with the
+        // leg disabled.
+        //
+        // So the handoff cannot represent "callee paused inside its own loop with
+        // its caller below it" at all, and the gh#467 CALL-forward carrier — which
+        // rewinds the OUTER frame to its CALL and re-runs the callee whole — is
+        // the only correct route for this decline.  Narrowing the arm to "refuse
+        // when a non-bottom frame can reach a merge point before returning" would
+        // exclude the same set, since bearing a loop is what this decline reports.
         //
         // And only for an abort whose image is COMPLETE
         // (`DispatchError::leaves_complete_image`).  Pyre's walker has a whole
@@ -4610,10 +4652,20 @@ fn run_perfn_walk<Sym: WalkSym>(
                     };
                 if !walk_end_resume_provable(resume) {
                     if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                        // The two ways this leg can be unprovable are different
+                        // failures and want different fixes, so name which one
+                        // happened.  `RewindUnproven` means no opcode-entry
+                        // sample was taken at all (no boundary crossed, or a
+                        // different opcode); a `Rewind` that is still unprovable
+                        // means the sample exists but the opcode had already
+                        // applied an effect by the resume point.
+                        let reason = match resume {
+                            WalkEndResume::RewindUnproven => "no opcode-entry sample",
+                            _ => "opcode already applied an effect",
+                        };
                         eprintln!(
                             "[fbw-qmut-flush] declined at resume_py_pc={resume_py_pc} \
-                             (opcode already applied an effect, or no entry sample) \
-                             — legacy replay kept"
+                             ({reason}) — legacy replay kept"
                         );
                     }
                 } else if crate::jitcode_dispatch::flush_qmut_abort_state(
@@ -4644,7 +4696,7 @@ fn run_perfn_walk<Sym: WalkSym>(
             }
         }
 
-        // #32 S2: a kept-stack branch guard whose not-taken arm cannot be
+        // #32: a kept-stack branch guard whose not-taken arm cannot be
         // restored for the COMPILED trace aborts (`AbortPermanent` for the
         // unrestorable-Ref shape, decline + `Abort` for the depth>1
         // invalid-mirror shape), but the authoritative walk's symbolic shadow
@@ -5377,7 +5429,7 @@ fn loop_inlines_abort_permanent_callee(
             return None;
         }
         // A FUNCTION_TYPE object can wrap a BuiltinCode, not a CodeObject:
-        // `make_builtin_function*` (gateway.rs:701) puts such a function into
+        // `make_builtin_function*` (gateway.rs) puts such a function into
         // module globals (e.g. `from sys import getsizeof`).  Feeding its
         // BuiltinCode to `sub_jitcode_body_for_code` / `w_code_get_ptr` casts it
         // as a PyCode and derefs garbage, so reject it before the scan — a
@@ -6318,8 +6370,10 @@ pub mod fbw_diag {
     pub const ROLLED_BACK_WITH_EFFECTS: usize = 1;
     /// Reachability of the two walk-end flush legs whose resume pc can precede
     /// an effect the walk already recorded, and of the hazardous subset of
-    /// each.  The native corpus reaches neither leg, so these say whether the
-    /// wasm target does.
+    /// each.  The native corpus reached neither leg when these were added — so
+    /// a nonzero value on native is itself the news, and both readers print
+    /// them (a native run that starts reaching a leg must not be the run that
+    /// says nothing).
     pub const MIDBODY_LATCH: usize = 2;
     pub const MIDBODY_LATCH_NEW_UNJOURNALED: usize = 3;
     pub const ESCAPE_PLAIN_FALLBACK: usize = 4;
@@ -6336,6 +6390,44 @@ pub mod fbw_diag {
     /// Successful multi-frame blackhole adoptions. A fall means the walk
     /// stopped handing the interpreter an image and went back to legacy replay.
     pub const BLACKHOLE_ADOPTED_MULTI_FRAME: usize = 13;
+
+    /// The `[jit-stats]` key for each tally slot, in index order, so a slot
+    /// cannot be added without naming it and no reader can print a subset of
+    /// them by accident.  Both readers join these against `get(i)`:
+    /// `pyre/pyrex` reads them directly, `pyre-wasm-runner` mirrors the array
+    /// positionally (it links no pyre crate), so a native and a wasm
+    /// `[jit-stats] fbw_diag` line carry the same keys in the same order and
+    /// diff field by field.
+    ///
+    /// Two of the pairs are a subset and its population, and the subset is the
+    /// hazardous half: `..._NEW_UNJOURNALED` counts inside `MIDBODY_LATCH`, and
+    /// `..._UNCLEAN` inside `ESCAPE_PLAIN_FALLBACK`.  They are named rather
+    /// than printed as a `subset/total` fraction because `check.py`'s
+    /// `_jit_stats_merged` folds every `[jit-stats]` line into one flat
+    /// `key -> value` map and reads each value as an integer.
+    ///
+    /// Every key is `fbw_`-prefixed for that same reason: that map is flat and
+    /// shared with every other counter, so a bare name like `portal_only`
+    /// collides with whatever else ever picks it.
+    ///
+    /// The length is `RING_BASE` because the tallies are exactly the slots
+    /// below the ring.
+    pub const LABELS: [&str; RING_BASE] = [
+        "fbw_walks",
+        "fbw_rolled_back_with_effects",
+        "fbw_midbody_latch",
+        "fbw_midbody_latch_new_unjournaled",
+        "fbw_escape_plain_fallback",
+        "fbw_escape_plain_fallback_unclean",
+        "fbw_escape_portal_only",
+        "fbw_escape_published_callee_only",
+        "fbw_escape_portal_and_published_callee",
+        "fbw_force_by_portal",
+        "fbw_force_by_callee_only",
+        "fbw_store_journal_rollback_failed",
+        "fbw_blackhole_adopted_single_frame",
+        "fbw_blackhole_adopted_multi_frame",
+    ];
 
     /// One ring entry per walk: four slots of outcome name (8 ASCII bytes per
     /// slot, little-endian) followed by one slot of packed counters.  A `u64`

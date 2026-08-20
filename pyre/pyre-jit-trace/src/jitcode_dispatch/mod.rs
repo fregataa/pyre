@@ -41,12 +41,12 @@
 //! | `float_<binop>/ff>f` + `float_neg/f>f` | PARITY | float_add/float_sub/float_truediv binops + float_neg unary (4 ops total — float_mul, float comparisons, float_abs all absent from codewriter today, would land mechanically when emitted). Read on `registers_f` bank, record `OpCode::Float<Binop>`, write dst (`pyjitpl.py:284-292`). |
 //! | `int_neg/i>i`, `int_invert/i>i` | PARITY | unary i→i ops via `unop_int_record`. RPython `pyjitpl.py:356-368` exec-generated unary opimpls. `int_same_as/i>i` has a dormant walker arm for forward-prep, but the generated table should not contain it because RPython `jtransform.py:246 rewrite_op_same_as` removes `same_as` before assembly. |
 //! | `cast_int_to_float/i>f` | PARITY | i-bank read, record `CastIntToFloat`, f-bank write. RPython `pyjitpl.py:357 cast_int_to_float` (same exec-generated unary opimpl loop). |
-//! | `ptr_eq/rr>i`, `ptr_ne/rr>i` | PARITY | r-bank pair → record PtrEq/PtrNe → i-bank dst via `binop_ref_to_int_record`. RPython `pyjitpl.py:326-336` exec-generated comparison opimpls (b1 is b2 fast path omitted, same rationale as int comparisons). |
+//! | `ptr_eq/rr>i`, `ptr_ne/rr>i` | PARITY | r-bank pair → record PtrEq/PtrNe → i-bank dst via `binop_ref_to_int_record`. RPython `pyjitpl.py:326-336` exec-generated comparison opimpls. The `if b1 is b2: return <const>` fast path is wired: `binop_ref_to_int_record` answers an identical operand pair from `fastpath_same_boxes` without recording, as `binop_int_record` does for the int compares. |
 //! | `getfield_gc_i/rd>i`, `getfield_gc_r/rd>r` | PARITY (heapcache-aware) | r-bank obj + descr → heapcache lookup. Cache hit returns cached OpRef without recording; cache miss records `OpCode::GetfieldGc<I,R>` + `getfield_now_known` writeback. RPython `pyjitpl.py:855-882 + 929-950 _opimpl_getfield_gc_any_pureornot`. ConstPtr fast-path (`pyjitpl.py:856-860`) deferred — pyre walker doesn't track ConstPtr identity (optimizer's job post-trace). The pyre-specific `id>X` shape (int source — kind-flow kind-flow) stays unsupported. |
 //! | `setfield_gc_i/rid`, `setfield_gc_r/rrd` | PARITY (heapcache-aware, alias-clearing) | r-bank box + (i\|r)-bank valuebox + descr. If `getfield_cached(obj,descr) == Some(valuebox)` skip recording (RPython `if upd.currfieldbox is valuebox: return`); otherwise record `OpCode::SetfieldGc(obj, valuebox)` + `setfield_cached` write-through. Aliasing semantics: `CacheEntry.do_write_with_aliasing` (heapcache.py:90-94) routes through `_clear_cache_on_write(seen_alloc)` — always wipes `cache_anything`, additionally wipes `cache_seen_allocation` when the write target itself isn't seen-allocated. RPython `pyjitpl.py:973-988 _opimpl_setfield_gc_any`. The disabled is_unescaped branch (`pyjitpl.py:981-988`) is intentionally not ported — RPython itself has it commented out. `iid` / `ird` (int box) shapes stay unsupported (kind-flow territory). |
-//! | `getarrayitem_gc_r/rid>r` | PARITY (heapcache-aware) | r-bank array + i-bank index + descr → heapcache `getarrayitem` lookup. Cache hit returns cached OpRef without IR; cache miss records `OpCode::GetarrayitemGcR(array, index)` + `getarrayitem_now_known` writeback. RPython `pyjitpl.py:639-688 _do_getarrayitem_gc_any`. All three `_i` / `_r` / `_f` result shapes are wired to this same heapcache body (kind-keyed dst bank, dispatch arms below) and registered in `wellknown_bh_insns()` (`insns.rs:865-866`) for blackhole execution + codewriter emission. |
+//! | `getarrayitem_gc_r/rid>r` | PARITY (heapcache-aware) | r-bank array + i-bank index + descr → heapcache `getarrayitem` lookup. Cache hit returns cached OpRef without IR; cache miss records `OpCode::GetarrayitemGcR(array, index)` + `getarrayitem_now_known` writeback. RPython `pyjitpl.py:639-688 _do_getarrayitem_gc_any`. All three `_i` / `_r` / `_f` result shapes are wired to this same heapcache body (kind-keyed dst bank, dispatch arms below) and registered in `wellknown_bh_insns()` (`insns.rs`) for blackhole execution + codewriter emission. |
 //! | `setarrayitem_gc_r/rird`, `setarrayitem_gc_r/rcrd` | PARITY (heapcache-aware) | r-bank array + i-bank index + r-bank value + descr. Always records `OpCode::SetarrayitemGc(array, index, value)` + `heapcache.setarrayitem(...)` write. RPython `pyjitpl.py:736-744 _opimpl_setarrayitem_gc_any` — no skip-on-redundant short-circuit because `setarrayitem` does aliasing-aware invalidation. The `rcrd` `c`-argcode form (USE_C_FORM `assembler.py:99-107/312`) decodes the index as one inline signed byte → ConstInt; same recording body otherwise. `rrid` / `rrrd` / `rrfd` (Ref index) shapes stay unsupported (kind-flow). |
-//! | `residual_call_r_r/iRd>r` | TODO (`direct_assembler_call` + `capture_resumedata` not yet wired) | classifies the call by `EffectInfo`. Wired sub-cases: (1) release-gil via [`direct_call_release_gil`] — `CallReleaseGilI` + arglist `[savebox, funcbox] + argboxes[1:]` reshape per `pyjitpl.py:3675-3681`, plus the outer forces-branch `GUARD_NOT_FORCED` (`:2079`) + `GUARD_NO_EXCEPTION` (`:2082`); (2) loop-invariant heapcache via [`loopinvariant_lookup`] / [`loopinvariant_now_known`] per `pyjitpl.py:2088 + 2109`; (3) vable IR bookkeeping (`pyjitpl.py:2055-2080`) via [`maybe_walker_vable_and_vrefs_before_residual_call`] — emits FORCE_TOKEN + SETFIELD_GC only; the runtime heap halves of the token protocol (`vinfo.tracing_before_residual_call` / `vrefinfo.tracing_before_residual_call` and the after-call `vinfo.tracing_after_residual_call`, `pyjitpl.py`) are bracketed around the concrete callee execution by [`try_execute_residual_call_via_executor`], which arms TOKEN_TRACING_RESCALL before the call and probe-and-clears it after, surfacing [`DispatchError::VableEscapedDuringResidualCall`] on a detected force (`pyjitpl.py` ABORT_ESCAPE parity). The vref halves of the bracket are ported on `TraceCtx` but uncalled by the walker — see the module preamble. The remaining branches go through [`select_residual_call_opcode`]: `CallMayForce*` + `GuardNotForced` on the rest of the forces-virtual path (`pyjitpl.py:2017-2082`), `CallLoopinvariant*` on `EF_LOOPINVARIANT` (`pyjitpl.py:2087-2110`), `CallPure*` on elidable, otherwise `Call*`. `GuardNoException` follows whenever `effectinfo.check_can_raise(False)` is true (`pyjitpl.py:2082 handle_possible_exception`). `heapcache.invalidate_caches_varargs(call_opcode, ei, allboxes)` (`pyjitpl.py:2042 + 2659`) is wired around every recorded call op. `OS_NOT_IN_TRACE` is fail-loud-guarded up front via [`do_not_in_trace_call_result`] — `effect_info_for_call_flavor` stub never sets the index today (`flatten.rs:431`), making it dead until producers land. Same fail-loud treatment via [`do_jit_force_virtual_guard`] for `OS_JIT_FORCE_VIRTUAL` (stricter-than-PyPy — needs OpRef→concrete-pointer resolver). Still deferred (each blocked on infrastructure absent from pyre-jit-trace): `direct_libffi_call` / `direct_assembler_call` specialization (`pyjitpl.py:1908-1990` — assembler_call paths route through `inline_call_*/dR>X` instead), KEEPALIVE for vablebox (only fires when `direct_assembler_call` returns a vablebox), and `num_live`-aware `capture_resumedata(after_residual_call=True)` on the guards (`pyjitpl.py:2078-2082 → 2586`). |
+//! | `residual_call_r_r/iRd>r` | TODO (`direct_assembler_call` + `capture_resumedata` not yet wired) | classifies the call by `EffectInfo`. Wired sub-cases: (1) release-gil via [`direct_call_release_gil`] — `CallReleaseGilI` + arglist `[savebox, funcbox] + argboxes[1:]` reshape per `pyjitpl.py:3675-3681`, plus the outer forces-branch `GUARD_NOT_FORCED` (`:2079`) + `GUARD_NO_EXCEPTION` (`:2082`); (2) loop-invariant heapcache via [`loopinvariant_lookup`] / [`loopinvariant_now_known`] per `pyjitpl.py:2088 + 2109`; (3) vable IR bookkeeping (`pyjitpl.py:2055-2080`) via [`maybe_walker_vable_and_vrefs_before_residual_call`] — emits FORCE_TOKEN + SETFIELD_GC only; the runtime heap halves of the token protocol (`vinfo.tracing_before_residual_call` / `vrefinfo.tracing_before_residual_call` and the after-call `vinfo.tracing_after_residual_call`, `pyjitpl.py`) are bracketed around the concrete callee execution by [`try_execute_residual_call_via_executor`], which arms TOKEN_TRACING_RESCALL before the call and probe-and-clears it after, surfacing [`DispatchError::VableEscapedDuringResidualCall`] on a detected force (`pyjitpl.py` ABORT_ESCAPE parity). The vref halves of the bracket ARE called by the walker, under the same `is_may_force` gate, and their loops are NOT empty: [`walker_ec_enter`] takes a vref of every seeded callee frame through `TraceCtx::opimpl_virtual_ref` (`ExecutionContext.enter`'s vref), so `virtualref_boxes` carries real pairs. Measured over 431 synth + 93 parity fixtures: 5487 bracket entries, of which 686 (12.5%) saw at least one pair and 66 of 316 emitting fixtures reached a nonzero count, up to 7 pairs. The remaining branches go through [`select_residual_call_opcode`]: `CallMayForce*` + `GuardNotForced` on the rest of the forces-virtual path (`pyjitpl.py:2017-2082`), `CallLoopinvariant*` on `EF_LOOPINVARIANT` (`pyjitpl.py:2087-2110`), `CallPure*` on elidable, otherwise `Call*`. `GuardNoException` follows whenever `effectinfo.check_can_raise(False)` is true (`pyjitpl.py:2082 handle_possible_exception`). `heapcache.invalidate_caches_varargs(call_opcode, ei, allboxes)` (`pyjitpl.py:2042 + 2659`) is wired around every recorded call op. `OS_NOT_IN_TRACE` is fail-loud-guarded up front via [`do_not_in_trace_call_result`] — `effect_info_for_call_flavor` stub never sets the index today (pyre-jit's `flatten.rs`), making it dead until producers land. Same fail-loud treatment via [`do_jit_force_virtual_guard`] for `OS_JIT_FORCE_VIRTUAL` (stricter-than-PyPy — needs OpRef→concrete-pointer resolver). Still deferred (each blocked on infrastructure absent from pyre-jit-trace): `direct_libffi_call` / `direct_assembler_call` specialization (`pyjitpl.py:1908-1990` — assembler_call paths route through `inline_call_*/dR>X` instead), KEEPALIVE for vablebox (only fires when `direct_assembler_call` returns a vablebox), and `num_live`-aware `capture_resumedata(after_residual_call=True)` on the guards (`pyjitpl.py:2078-2082 → 2586`). |
 //! | `residual_call_r_i/iRd>i` | PARITY (kind sibling of `_r_r`) | same EffectInfo classification + guard emission as `_r_r` — `select_residual_call_opcode('i', ...)` returns the int-typed `Call*` family (`CallReleaseGilI` / `CallMayForceI` / `CallLoopinvariantI` / `CallPureI` / `CallI`); only the dst writeback bank (`registers_i`) differs. RPython parity: `pyjitpl.py:1346 opimpl_residual_call_r_i = _opimpl_residual_call1`; `do_residual_call`'s `descr.get_normalized_result_type()` dispatch (pyjitpl.py:2022-2044) selects the int-result CALL op. Argboxes pass through [`build_allboxes`] same as `_r_r` (R-list-only argboxes → identity permutation when arg_types is ref-only). |
 //! | `residual_call_ir_r/iIRd>r` | PARITY (shape sibling of `_r_r`) | adds an i-bank list between funcptr and the R-list. RPython parity: `pyjitpl.py:1349 opimpl_residual_call_ir_r = _opimpl_residual_call2`; `boxes2` argcode (`pyjitpl.py:3750-3760`) decodes the two count-prefixed lists into `argboxes = [i_args..., r_args...]`. Walker passes that flat list through [`build_allboxes`] (line-by-line port of `pyjitpl.py:1960-1993 _build_allboxes`) which permutes argboxes by `descr.get_arg_types()` so the recorded `Call*` arglist matches the callee's actual ABI even for mixed orderings like `[REF, INT, REF, INT]`. Same EffectInfo classification + guard emission as `_r_r` via [`select_residual_call_opcode`]. |
 //! | `raise/r`           | PARITY (`GUARD_CLASS`) | sets `ctx.last_exc_value` (`pyjitpl.py:1695`); top-level records `Finish(exc) descr=exit_frame_with_exception_descr_ref` (`pyjitpl.py:3238-3242 compile_exit_frame_with_exception`); sub-walk surfaces `SubRaise{exc}`. Caller-side handler scan (`finishframe_exception`) lives on `inline_call`'s SubRaise arm (above). RPython `pyjitpl.py:1690-1693` also emits `GUARD_CLASS(exc, cls_of_box(exc))` when `heapcache.is_class_known(exc) == false`; the retired trait-side path read `concrete_exc.ob_header.ob_type` from the concrete frame snapshot and emitted the orthodox `GuardClass(exc_box, cls_const)` per the heapcache `is_class_known` gate. |
@@ -107,8 +107,14 @@
 //!       (`inline_call.rs::walker_ec_enter`).  They still iterate zero
 //!       times for a callee the walker inlines without seeding a frame:
 //!       such a level has no frame object to take a `jit.virtual_ref`
-//!       of, where upstream's `perform_call` builds one for every
-//!       inlined call (`pyjitpl.py:2445-2476, 1862-1874`).
+//!       of.  Upstream always has one because it inlines the
+//!       interpreter's own frame construction as traced code, so the
+//!       app-level frame is an ordinary virtual the optimizer keeps —
+//!       and `ExecutionContext.enter`
+//!       (`executioncontext.py:88-89`) takes the vref of THAT.  Not of
+//!       the `MIFrame` `perform_call` → `newframe` pushes
+//!       (`pyjitpl.py:2445-2476, 1862-1874`), which is the tracer's own
+//!       register frame and never carries a vref.
 //!    b. **Codewriter-side**: `direct_assembler_call` + KEEPALIVE on
 //!       vablebox (`pyjitpl.py:3589-3609 + 2080-2081`). Walker's
 //!       residual_call dispatchers never receive `assembler_call=True`
@@ -122,13 +128,13 @@
 //!       #45) before it can return `Some(vref_opref)` /
 //!       `Some(standard_opref)` / `None`. Production reach today: 0 —
 //!       `OopSpecIndex::JitForceVirtual` is set only by
-//!       `jtransform.rs:1903 jit.force_virtual` lowering, which our
-//!       benchmarks don't reach. Metainterp orthodox port at
-//!       `majit-metainterp/src/pyjitpl.rs:11828` is tests-only.
+//!       `jtransform.rs`'s `_handle_jit_call` `jit.force_virtual` arm,
+//!       which our benchmarks don't reach. Metainterp orthodox port at
+//!       `majit-metainterp`'s `_do_jit_force_virtual` is tests-only.
 //!    d. **Not yet implemented**: `direct_libffi_call`
 //!       (`pyjitpl.py:3622-3667`) needs `CIF_DESCRIPTION_P` parser +
 //!       dynamic calldescr builder; live tracer also returns None
-//!       universally (`pyjitpl.rs:11487-11491`). Production reach
+//!       universally (`MetaInterp::direct_libffi_call`). Production reach
 //!       0 — pyre interpreter doesn't expose libffi calls.
 //!    e. Guard recording uses `ctx.trace_ctx.record_guard(..., 0)`
 //!       followed by `walker_capture_snapshot_for_last_guard`
@@ -2762,9 +2768,22 @@ impl DispatchError {
 /// (`census_dump`) is gated on [`fbw_debug_abort_enabled`], so with the
 /// `PYRE_FBW_DEBUG_ABORT` flag unset the only cost is one `BTreeMap`
 /// insert per declined walk (already a rare, slow event).
-thread_local! {
-    static FBW_DECLINE_CENSUS: std::cell::RefCell<std::collections::BTreeMap<&'static str, usize>> =
-        const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+///
+/// Process-wide, not per thread: `_thread` gives Python real OS threads, each
+/// of which traces on its own, so a thread-local map would have the dump report
+/// only the thread that happened to print it and silently drop every decline
+/// the others took.  A `Mutex` is free at this rate — the map is touched only
+/// on the cold decline path, never on the hot trace path.
+static FBW_DECLINE_CENSUS: std::sync::Mutex<std::collections::BTreeMap<&'static str, usize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Lock the census, recovering from poisoning: a `BTreeMap` of counters has no
+/// invariant a panicking writer can leave broken, and a diagnostic that goes
+/// silent after an unrelated panic is worse than one that keeps counting.
+fn census_map() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<&'static str, usize>> {
+    FBW_DECLINE_CENSUS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Bump the decline count for `name` (a [`DispatchError::variant_name`] or
@@ -2773,9 +2792,7 @@ thread_local! {
 /// so a corpus run prints `[fbw-census]` lines (the last block printed is
 /// the final tally) without needing a process-exit hook.
 pub(crate) fn census_record(name: &'static str) {
-    FBW_DECLINE_CENSUS.with(|c| {
-        *c.borrow_mut().entry(name).or_insert(0) += 1;
-    });
+    *census_map().entry(name).or_insert(0) += 1;
     census_dump();
 }
 
@@ -2900,7 +2917,7 @@ fn census_dump_foriter_inflight() {
 /// `loops_aborted` is unreachable there unless it can be read back as data.
 /// `pyre-wasm` exports it per index; the host runner joins the pairs.
 pub fn census_entries() -> Vec<(&'static str, usize)> {
-    FBW_DECLINE_CENSUS.with(|c| c.borrow().iter().map(|(n, &v)| (*n, v)).collect())
+    census_map().iter().map(|(n, &v)| (*n, v)).collect()
 }
 
 /// Print the accumulated decline census as `[fbw-census] <name>: <count>`
@@ -2910,16 +2927,14 @@ pub(crate) fn census_dump() {
     if !fbw_debug_abort_enabled() {
         return;
     }
-    FBW_DECLINE_CENSUS.with(|c| {
-        let map = c.borrow();
-        if map.is_empty() {
-            eprintln!("[fbw-census] (no declines recorded)");
-            return;
-        }
-        for (name, count) in map.iter() {
-            eprintln!("[fbw-census] {name}: {count}");
-        }
-    });
+    let map = census_map();
+    if map.is_empty() {
+        eprintln!("[fbw-census] (no declines recorded)");
+        return;
+    }
+    for (name, count) in map.iter() {
+        eprintln!("[fbw-census] {name}: {count}");
+    }
 }
 
 /// The same tally [`census_dump`] prints, as text, and without the
@@ -2934,12 +2949,10 @@ pub(crate) fn census_dump() {
 ///
 /// Reading, not draining: safe to call more than once.
 pub fn census_report() -> String {
-    FBW_DECLINE_CENSUS.with(|c| {
-        c.borrow()
-            .iter()
-            .map(|(name, count)| format!("[fbw-census] {name}: {count}\n"))
-            .collect()
-    })
+    census_map()
+        .iter()
+        .map(|(name, count)| format!("[fbw-census] {name}: {count}\n"))
+        .collect()
 }
 
 /// Carrier-boundary raise seed (`finishframe_exception` at the bridge carrier):
@@ -6387,7 +6400,7 @@ thread_local! {
     static FBW_ABORT_CALL_RESUME: std::cell::RefCell<Option<InlineAbortCarrier>> =
         const { std::cell::RefCell::new(None) };
 
-    /// B3: the set of OpRefs the walker built inline via
+    /// The set of OpRefs the walker built inline via
     /// [`try_walker_trace_exception_new`] (the virtualizable `NewWithVtable`
     /// exception). The immediately-following `RaiseVarargs` residual consults
     /// it to take the instance fast path — skipping the
@@ -6407,7 +6420,7 @@ thread_local! {
     static FBW_CONTEXT_CHAINED: std::cell::RefCell<std::collections::HashSet<OpRef>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
 
-    /// B3: LIFO stack of the previous-exception slot value
+    /// LIFO stack of the previous-exception slot value
     /// saved by each lowered `PUSH_EXC_INFO` (`get_current_exception` arm),
     /// paired with its live concrete.  `POP_EXCEPT`'s restore consumes the top
     /// entry, so the slot is set back to the TRUE saved prev (None for an outer
@@ -7655,7 +7668,7 @@ fn walker_concrete_ref_object<Sym: WalkSym>(
     }
 }
 
-/// B3 piece 3: resolve the walker's execution-context OpRef from the outer
+/// Resolve the walker's execution-context OpRef from the outer
 /// portal `sym.frame` (via [`fbw_mode.snapshot_sym`]), recovering it off
 /// the frame with `GetfieldGcR(frame, execution_context)` when
 /// `sym.execution_context` is unseeded.  Mirrors the inline-frame EC
@@ -9249,8 +9262,9 @@ fn classify_compare_box_use<Sym: WalkSym>(
     let Some(gin_op) = crate::jitcode_runtime::decode_op_at(code, gin_pc) else {
         return CompareBoxUse::Other;
     };
-    // A callee scan carries no liveness table of its own (see above), so it
-    // reports the shape alone and leaves condition 4 unproven.
+    // A callee scan carries no liveness table of its own (the inline-subwalk
+    // branch above binds `liveness` to `None`), so it reports the shape alone
+    // and leaves condition 4 unproven.
     let Some((jitcode_index, payload)) = liveness else {
         return CompareBoxUse::FeedsBranchOnly { arms_dead: false };
     };
@@ -11535,9 +11549,10 @@ fn handle<Sym: WalkSym>(
             // resumepc=orgpc)`; the first line of `generate_guard`
             // (`pyjitpl.py`) is `if isinstance(box, Const):
             // return`. Const exception boxes already pin the class so
-            // no guard is needed. Resume-data capture is omitted here
-            // for the same reason as `goto_if_not/iL` above — see that
-            // arm's comment for the trace-emitter endgame.
+            // no guard is needed. Where the guard IS emitted below, it
+            // captures its resume data at this opcode's pc through
+            // `walker_capture_snapshot_for_last_guard`, matching
+            // `generate_guard`'s `resumepc=orgpc`.
             if !exc.is_constant() {
                 if let ConcreteValue::Ref(exc_ptr) = concrete_exc {
                     if !exc_ptr.is_null() && !ctx.trace_ctx.heap_cache().is_class_known(exc) {
@@ -12177,7 +12192,7 @@ fn handle<Sym: WalkSym>(
                         ctx.trace_ctx
                             .record_guard(OpCode::GuardFutureCondition, &[], 0);
                         walker_capture_snapshot_for_last_guard(ctx, next_instr)?;
-                        // jitdriver.rs:2981-2988 states the rule the latch runs
+                        // `JitDriver::merge_point` states the rule the latch runs
                         // under: only latch what an attempt actually rejected.
                         // The give-up below returns without calling into
                         // `compile_trace` at all, so it costs no optimizer pass
@@ -12241,7 +12256,7 @@ fn handle<Sym: WalkSym>(
                         };
                         // pyjitpl.py:2982-2983 `classify_compile_outcome` is
                         // the shared reading of a close's outcome; the sibling
-                        // close in `jitdriver.rs:2947` already goes through it.
+                        // close in `JitDriver::merge_point` already goes through it.
                         // Reading `Compiled` here and treating every other
                         // outcome as one declined close collapses three states
                         // the classifier keeps apart, and latches the one that
@@ -12268,7 +12283,7 @@ fn handle<Sym: WalkSym>(
                                     op.next_pc,
                                 ));
                             }
-                            // pyjitpl.py:3000, jitdriver.rs:2967-2974: the
+                            // pyjitpl.py:3000, `JitDriver::merge_point`: the
                             // attempt armed `partial_trace`, so the next visit
                             // of this header takes the `has_partial` arm of the
                             // gate above and runs no optimizer pass either way.

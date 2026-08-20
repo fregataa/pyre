@@ -22,11 +22,16 @@ use super::*;
 /// value-returning callee CHAIN before folding to the `CALL_ASSEMBLER` tail.
 /// Default 7: a deep value-returning chain (`b→c→…→h`) stays in compiled code
 /// and each extra inlined level removes a residual call — measured ~2.0–2.3×
-/// on the `depthN_inline_chain` fixtures with no regression elsewhere.
+/// on `bench/synth/inline_chain_depth_typeflip.py` with no regression
+/// elsewhere.  The number predates that file: it was taken on the separate
+/// per-depth fixtures later consolidated into it, so re-measure before
+/// leaning on it.
 ///
-/// A callee that raises inline below an intermediate frame is capped separately,
-/// to the top inline level by `callee_body_contains_raise`: its unwind needs the
-/// cross-frame bridge (gh#343 / gh#467) the drain cannot yet build.
+/// A callee that raises inline is capped separately — at TWO multiframe levels,
+/// keyed off `callee_body_contains_raise` — because its unwind crosses the
+/// suspended intermediate frame through the cross-frame bridge (gh#343 /
+/// gh#467); a third level regresses.  See the measurement beside
+/// `effective_multiframe_depth` in `inline_call.rs`.
 ///
 /// A self-recursive callee is bounded instead by
 /// [`fbw_inline_recursion_count`] against `max_unroll_recursion`, mirroring
@@ -324,7 +329,7 @@ pub fn capture_fbw_finish_concrete_root_area() -> *const () {
     FBW_FINISH_CONCRETE.with(|value| value as *const _ as *const ())
 }
 
-/// Record that `op` is a walker-built inline exception (B3 construct fold).
+/// Record that `op` is a walker-built inline exception (construction fold).
 pub(crate) fn fbw_built_exc_insert(op: OpRef) {
     FBW_BUILT_EXC.with(|s| {
         s.borrow_mut().insert(op);
@@ -387,12 +392,12 @@ pub(crate) fn fbw_store_journal_reset() {
     // clears the per-entry body-effect signal so a prior walk's committed
     // mutation cannot block this walk's delivery.
     FBW_FORITER_INFLIGHT.with(|c| c.borrow_mut().clear());
-    // B3: drop any inline-built-exception OpRef keys a
+    // Drop any inline-built-exception OpRef keys a
     // prior aborted walk recorded, so they cannot match a same-numbered
     // OpRef minted by this walk's recorder.
     FBW_BUILT_EXC.with(|s| s.borrow_mut().clear());
     FBW_CONTEXT_CHAINED.with(|s| s.borrow_mut().clear());
-    // B3: drop any unbalanced PUSH_EXC_INFO prev saves a
+    // Drop any unbalanced PUSH_EXC_INFO prev saves a
     // prior aborted walk left (an exception that propagated out without its
     // POP_EXCEPT restore), so a stale saved-prev cannot be popped by an
     // unrelated POP_EXCEPT in this walk.
@@ -1713,8 +1718,8 @@ fn fbw_deny_hazardous_inline(callee_code_key: usize) {
 /// * **Loop-bearing** — a framestack callee whose `CodeObject` has a
 ///   `FOR_ITER`.  Its side-effecting `for` consume runs concretely in the
 ///   sub-walk, and a later kept-stack guard abort can REFUSE the Option-C item
-///   delivery (a `for..break` frame parked past the loop header,
-///   eval.rs:5445), so the re-run re-executes the consume and double-advances
+///   delivery (a `for..break` frame parked past the loop header, in
+///   `eval.rs`), so the re-run re-executes the consume and double-advances
 ///   the iterator (the two `foriter_exempt_*` witnesses).
 /// * **Self-recursive** — the callee calls itself.  A hot self-recursion
 ///   forms a `CALL_ASSEMBLER` bridge whose moving-nursery callee frame cannot
@@ -1727,8 +1732,8 @@ fn fbw_deny_hazardous_inline(callee_code_key: usize) {
 ///   hazard at inline depth 1.
 ///
 /// The `w_code` field is the `jitcode_for` code key, resolved to the raw
-/// `CodeObject` via the jitcode index (the `current`-frame pattern,
-/// mod.rs:4664).
+/// `CodeObject` via `state::ensure_jitcode_index` followed by
+/// `state::raw_code_for_jitcode_index`.
 ///
 /// Returns the code key of the offending callee, which is the entity the
 /// decline is a property of and therefore the one to deny — the same
@@ -1736,22 +1741,47 @@ fn fbw_deny_hazardous_inline(callee_code_key: usize) {
 /// `disable_noninlinable_function`.  Declining it at its own callsite makes
 /// the next attempt residualize that call, so the surviving nest is
 /// hazard-free and the enclosing loop can compile.
-fn fbw_inline_callee_hazardous<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> Option<usize> {
+///
+/// The second element names which of the three clauses fired.  The clauses
+/// are not equally tight: `repeat` and `self-recursive` name the frame that
+/// is actually recursing, while `for-iter` fires on any code object whose
+/// bytecode contains a `FOR_ITER` anywhere, whether or not an iterator is in
+/// flight at the decline point.  Reporting them apart is what lets a census
+/// say how much of the decline the loose clause is carrying: over 441 synth +
+/// 83 parity fixtures it fires 8 times on 6 fixtures for its 2 witnesses.
+///
+/// The looseness is load-bearing and the clause must stay FORWARD-looking.
+/// Requiring that a consume have ALREADY run in that frame — asking
+/// `FBW_FORITER_INFLIGHT`, whose `Jit` entries carry the `jitcode_index` each
+/// consume ran in, which needs no per-frame Python pc — cuts the census to 3
+/// fires and produces WRONG OUTPUT on `foriter_exempt_shared_generator` on all
+/// three backends, plus a jitstats regression on `inline_subwalk_user_iterator`
+/// (loops_aborted 1 -> 5, `fbw_rolled_back_with_effects` 0 -> 5, loops_compiled
+/// 3 -> 2) and on `list_append_write_barrier_gc` (loops_compiled 13 -> 12).
+/// Inlining the residual is what CARRIES the walk to the consume, so a decline
+/// conditioned on the consume having happened always arrives one step late: the
+/// witness still declined, at pc 533 instead of 261.  A real narrowing has to
+/// ask whether a `FOR_ITER` is REACHABLE from the frame's current position,
+/// which does need the per-frame pc `InlineFrame` does not carry.
+fn fbw_inline_callee_hazardous<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Option<(usize, &'static str)> {
     let session = ctx.session.borrow();
     let mut seen: Vec<usize> = Vec::with_capacity(session.framestack.len());
     for frame in session.framestack.iter() {
         if seen.contains(&frame.w_code) {
-            return Some(frame.w_code);
+            return Some((frame.w_code, "repeat"));
         }
         seen.push(frame.w_code);
         if let Some(idx) = crate::state::ensure_jitcode_index(frame.w_code as *const ()) {
             if let Some(raw_code) = crate::state::raw_code_for_jitcode_index(idx) {
                 let code = unsafe { raw_code.as_ref() };
                 if let Some(code) = code {
-                    if pyre_interpreter::code_has_for_iter(code)
-                        || pyre_interpreter::code_is_self_recursive(code)
-                    {
-                        return Some(frame.w_code);
+                    if pyre_interpreter::code_has_for_iter(code) {
+                        return Some((frame.w_code, "for-iter"));
+                    }
+                    if pyre_interpreter::code_is_self_recursive(code) {
+                        return Some((frame.w_code, "self-recursive"));
                     }
                 }
             }
@@ -1824,7 +1854,7 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
             eprintln!(
                 "[lb-arm] pc={pc} cause={cause:?} deferred={} hazard={}",
                 foriter_deferred_inline.is_some(),
-                hazardous_callee.is_some(),
+                hazardous_callee.map(|(_, why)| why).unwrap_or("false"),
             );
         }
         if let Some(callee_code_key) = foriter_deferred_inline {
@@ -1837,8 +1867,26 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
         // the enclosing location is retired, so the loop never compiles at
         // all.  Upstream answers the same situation by denying the callee and
         // letting the enclosing loop retrace (`pyjitpl.py:2818-2828`).
-        if let Some(callee_code_key) = hazardous_callee {
+        if let Some((callee_code_key, _)) = hazardous_callee {
             fbw_deny_hazardous_inline(callee_code_key);
+            // `fbw_deny_hazardous_inline` writes a thread-local set that only
+            // this walker reads, so the deny stayed invisible to the warm
+            // state: `dont_trace_here` counted zero on every fixture that
+            // reaches here.  The upstream answer cited above is
+            // `disable_noninlinable_function(greenkey_of_huge_function)`
+            // (`pyjitpl.py:2821`), which sets `JC_DONT_TRACE_HERE` on the
+            // callee's cell (`warmstate.py:331-337`).  The recursion-bound deny
+            // in `inline_call.rs` already calls it for the callee it names;
+            // this one names a callee the same way and had no reason not to.
+            if let Some((driver, _)) = crate::driver::try_driver_pair() {
+                driver
+                    .meta_interp_mut()
+                    .warm_state_mut()
+                    .disable_noninlinable_function(crate::driver::make_green_key(
+                        callee_code_key as *const (),
+                        0,
+                    ));
+            }
         }
         // The flush this latch feeds resumes the OUTERMOST caller at the CALL
         // that entered the inline region, re-executing that call from scratch,
