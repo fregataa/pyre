@@ -1,10 +1,11 @@
-# pyre-check: max-pypy-ratio=220
+# pyre-check: max-pypy-ratio=8
 # The trip count puts pypy's execution above the startup-subtraction floor, so
-# this ratio is a measurement. It reads higher than the clamped one it replaces
-# rather than lower: a baseline pinned to the floor over-states pypy's work,
-# so every ratio built on it was an under-estimate. The ceiling is twice the
-# slowest of the three backends observed (109.5x on cranelift) -- the previous
-# 110 sat on top of that reading and would fail on the run-to-run spread.
+# this ratio is a measurement. The loop runs at parity: ubuntu 1.7x / 1.7x /
+# 1.6x (dynasm / cranelift / wasm), macos 1.1x / 0.6x, windows 1.2x / 1.5x.
+# The ceiling is twice the slowest of those, which puts the derived floor
+# `min(1, ceiling / PERF_GATE_FLOOR_DIVISOR)` at 0.2x -- 2.5x under the fastest
+# reading, so both bounds keep room. A ceiling far above the measurement would
+# disable the gate at BOTH ends, the floor included.
 N = 38000000
 
 
