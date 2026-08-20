@@ -80,14 +80,6 @@ pub(crate) fn next_snapshot_pos<T>(store: &[Option<T>]) -> i32 {
 
 pub(crate) use crate::majit_log_enabled;
 
-// Temporary probe: the const heap short-box path has never executed, so
-// enabling it moves the compiled short preamble on every fixture.
-pub(crate) fn const_short_boxes_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("PYRE_CONST_SHORT_BOXES").is_some());
-    *ON
-}
-
 /// info.py:865-894 `getrawptrinfo` / `getptrinfo` return shape, with
 /// RPython `_forwarded` object identity preserved.
 ///
@@ -529,6 +521,24 @@ pub use crate::optimizeopt::info::StringLengthResolver;
 pub use crate::optimizeopt::info::{StringConstantAllocator, StringContentResolver};
 
 use crate::optimizeopt::info::PtrInfoExt;
+
+/// One line naming an operand for an assertion message: its producing opcode
+/// and, for a field access, the descr's field name. The operand's own `Debug`
+/// walks the whole abstract-value graph, which is unusable in a panic message.
+fn describe_operand_for_assert(b: &Operand) -> String {
+    let Some(op) = b.bound_op() else {
+        return format!("{:?}", b.to_opref());
+    };
+    let name = op
+        .getdescr()
+        .and_then(|d| d.as_field_descr().map(|fd| fd.field_name().to_string()))
+        .unwrap_or_default();
+    if name.is_empty() {
+        format!("{:?} {:?}", op.opcode, op.pos.get())
+    } else {
+        format!("{:?} {:?} `{name}`", op.opcode, op.pos.get())
+    }
+}
 
 /// Context provided to optimization passes.
 ///
@@ -4500,10 +4510,15 @@ impl OptContext {
         // silently retype the chain head. Always-on (not `debug_assert_eq!`)
         // for parity with the Const-invariant `assert!`s in `set_forwarded_*`;
         // asserted on the already-chain-walked `op` so it costs no extra walk.
+        // The message names both sides: which two operations disagree is the
+        // whole content of this failure, and the operand `Debug` walks the
+        // abstract-value graph, so it cannot be printed here.
         assert_eq!(
             op.type_(),
             newop.type_(),
-            "make_equal_to: cross-type forward (Box.type invariant)",
+            "make_equal_to: cross-type forward (Box.type invariant): {} <- {}",
+            describe_operand_for_assert(&op),
+            describe_operand_for_assert(newop),
         );
         // optimizer.py:392 if op is newop: return
         if &op == newop {
