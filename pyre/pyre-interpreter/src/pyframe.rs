@@ -120,22 +120,35 @@ pub mod frame_locals_proxy {
         }
 
         fn fast_local_index(&self, key: PyObjectRef) -> Result<Option<usize>, crate::PyError> {
-            // Every candidate name allocates its own string and `eq_w` can run
-            // a Python `__eq__`, so the caller's key is a pre-allocation copy
-            // from the first comparison onward.  Publish it and reload it for
-            // each compare; the candidate reuses one slot rather than growing
-            // the stack once per local.
+            // Every candidate name allocates its own string and both
+            // `__hash__` and `__eq__` can run a Python method, so the caller's
+            // key is a pre-allocation copy from the first of them onward.
+            // Publish it and reload it for each compare; the candidate reuses
+            // one slot rather than growing the stack once per local.
             let roots = pyre_object::gc_roots::push_roots();
             let key_slot = roots.base();
             roots.pin_root(key);
             let candidate_slot = key_slot + 1;
             roots.pin_root(pyre_object::PY_NULL);
+            // The scan hashes the key first whether it was reached to write or
+            // to read, so an unhashable key is a `TypeError` here rather than
+            // whatever the extras dict would go on to say about it.
+            let key_hash = crate::baseobjspace::hash_w_strict(roots.get(key_slot))?;
             // `code` addresses the compiler code object, which lives outside
             // the GC heap and so stays valid across those collections.
             let code = self.frame().code();
             let matches = |name: &str| -> Result<bool, crate::PyError> {
                 roots.set(candidate_slot, pyre_object::w_str_new(name));
-                crate::baseobjspace::eq_w(roots.get(candidate_slot), roots.get(key_slot))
+                // A name whose hash differs is never compared, so a key that
+                // claims equality with a name it does not hash like does not
+                // reach that name's slot.
+                Ok(
+                    crate::baseobjspace::hash_w_strict(roots.get(candidate_slot))? == key_hash
+                        && crate::baseobjspace::eq_w(
+                            roots.get(candidate_slot),
+                            roots.get(key_slot),
+                        )?,
+                )
             };
             for (index, name) in code.varnames.iter().enumerate() {
                 if hidden_local(code, index) {
@@ -196,6 +209,80 @@ pub mod frame_locals_proxy {
                 .map(|_| ())
         }
 
+        /// `framelocalsproxy_getkeyindex` with `read == true`, followed by
+        /// `framelocalsproxy_getval`: the value of the first locals-plus slot
+        /// whose name hashes and compares equal to `key` and which is bound.
+        ///
+        /// A name that matches only unbound slots reads as absent, which is
+        /// what sends `__getitem__` on to `f_extra_locals`.  The write
+        /// direction skips a PEP 709 hidden slot and this one does not, so it
+        /// cannot share [`Self::fast_local_index`]: a running comprehension's
+        /// iteration variable is readable through the proxy even though
+        /// assigning to that name goes to the extras dict instead.
+        fn locals_plus_value(
+            &self,
+            key: PyObjectRef,
+        ) -> Result<Option<PyObjectRef>, crate::PyError> {
+            // A candidate name allocates its own string and both `__hash__`
+            // and `__eq__` can run Python, so the key is rooted before the
+            // first of them and read back from that root afterwards.
+            let roots = pyre_object::gc_roots::push_roots();
+            let key_slot = roots.base();
+            roots.pin_root(key);
+            let candidate_slot = key_slot + 1;
+            roots.pin_root(pyre_object::PY_NULL);
+            // Hashing runs before the scan, so an unhashable key is a
+            // `TypeError` even for a frame with no locals to compare against.
+            let key_hash = crate::baseobjspace::hash_w_strict(roots.get(key_slot))?;
+            let exact_str_key = unsafe {
+                pyre_object::pyobject::is_exact_type(
+                    roots.get(key_slot),
+                    &pyre_object::pyobject::STR_TYPE,
+                )
+            };
+            // `code` addresses the compiler code object, which lives outside
+            // the GC heap and so stays valid across those collections.
+            let code = self.frame().code();
+            for (index, name, cell_slot) in locals_plus_names(code) {
+                let same = if exact_str_key {
+                    // The interned-name pointer comparison the scan opens
+                    // with, widened to every equal `str`: comparing WTF-8
+                    // bytes decides an exact `str` key outright, so it needs
+                    // neither the hash nor a candidate allocation.
+                    unsafe { pyre_object::w_str_get_wtf8(roots.get(key_slot)) }.as_bytes()
+                        == name.as_bytes()
+                } else {
+                    roots.set(candidate_slot, pyre_object::w_str_new(name));
+                    // A name whose hash differs is never compared: a key that
+                    // claims equality with a name it does not hash like reads
+                    // as absent rather than as that name's slot.
+                    crate::baseobjspace::hash_w_strict(roots.get(candidate_slot))? == key_hash
+                        && crate::baseobjspace::eq_w(
+                            roots.get(candidate_slot),
+                            roots.get(key_slot),
+                        )?
+                };
+                if !same {
+                    continue;
+                }
+                let frame = self.frame();
+                if index >= locals_w!(frame).len() {
+                    continue;
+                }
+                let slot = locals_w!(frame)[index];
+                let value = if cell_slot && !slot.is_null() && unsafe { pyre_object::is_cell(slot) }
+                {
+                    unsafe { pyre_object::w_cell_get(slot) }
+                } else {
+                    slot
+                };
+                if !value.is_null() {
+                    return Ok(Some(value));
+                }
+            }
+            Ok(None)
+        }
+
         fn key_is_fast_local(&self, key: PyObjectRef) -> Result<bool, crate::PyError> {
             Ok(self.fast_local_index(key)?.is_some())
         }
@@ -233,12 +320,35 @@ pub mod frame_locals_proxy {
         }
 
         fn __getitem__(&self, key: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-            // `mapping` allocates the snapshot dict, so reload the key after it.
+            // `framelocalsproxy_getitem` reads the one slot the key names.
+            // Materializing the whole mapping to answer a single lookup costs a
+            // dict plus an entry per bound local, and reports the miss as the
+            // dict's own `KeyError(key)` rather than the message below.
+            //
+            // `locals_plus_value` and the extras lookup both allocate, so
+            // reload the key from its root between them.
             let roots = pyre_object::gc_roots::push_roots();
             let key_slot = roots.base();
             roots.pin_root(key);
-            let mapping = self.mapping()?;
-            crate::baseobjspace::getitem(mapping, roots.get(key_slot))
+            if let Some(value) = self.locals_plus_value(roots.get(key_slot))? {
+                return Ok(value);
+            }
+            let extra = self.frame().get_extra_locals();
+            if !extra.is_null() {
+                let extra_slot = key_slot + 1;
+                roots.pin_root(extra);
+                if let Some(value) =
+                    crate::baseobjspace::finditem(roots.get(extra_slot), roots.get(key_slot))?
+                {
+                    return Ok(value);
+                }
+            }
+            let key_repr = unsafe { crate::display::py_repr_wtf8(roots.get(key_slot))? };
+            Err(crate::PyError::key_error(crate::display::wtf8_format!(
+                "local variable '",
+                key_repr,
+                "' is not defined"
+            )))
         }
 
         fn __setitem__(
@@ -250,22 +360,29 @@ pub mod frame_locals_proxy {
         }
 
         fn __delitem__(&mut self, key: PyObjectRef) -> Result<(), crate::PyError> {
-            // The snapshot, the lookup, the fast-local scan and the extras dict
-            // all allocate, so reload the key between them.
+            // `framelocalsproxy_setitem` with no value: the scan decides, and
+            // only a key it places nowhere goes on to the extras dict.  Probing
+            // the snapshot first instead built a whole mapping to reject one
+            // name, and reported an unhashable key in that dict's terms rather
+            // than as the hash's own `TypeError`.
+            //
+            // The extras lookup allocates, so reload the key from its root.
             let roots = pyre_object::gc_roots::push_roots();
             let key_slot = roots.base();
             roots.pin_root(key);
-            let mapping = self.mapping()?;
-            // Perform the lookup first so absent/unhashable keys retain the
-            // underlying mapping's KeyError/TypeError.
-            crate::baseobjspace::getitem(mapping, roots.get(key_slot))?;
             if self.key_is_fast_local(roots.get(key_slot))? {
                 return Err(crate::PyError::value_error(
                     "cannot remove local variables from FrameLocalsProxy",
                 ));
             }
-            let extra = self.frame().get_or_create_extra_locals();
-            crate::baseobjspace::delitem(extra, roots.get(key_slot))
+            // A delete does not create the extras dict that a store would.
+            let extra = self.frame().get_extra_locals();
+            if extra.is_null() {
+                return Err(crate::PyError::key_error_with_key(roots.get(key_slot)));
+            }
+            let extra_slot = key_slot + 1;
+            roots.pin_root(extra);
+            crate::baseobjspace::delitem(roots.get(extra_slot), roots.get(key_slot))
         }
 
         fn __len__(&self) -> Result<i64, crate::PyError> {
@@ -413,25 +530,39 @@ pub mod frame_locals_proxy {
             if args.len() < 2 || args.len() > 3 {
                 return Err(crate::PyError::type_error("pop expected 1 or 2 arguments"));
             }
-            // The snapshot, the lookup, the fast-local scan and the extras dict
-            // all allocate, so publish the incoming arguments and rebuild the
-            // slice for the delegated call.
+            // `framelocalsproxy_pop`: the scan decides, and only a key it
+            // places nowhere reaches the extras dict.  Probing the snapshot
+            // first discarded the lookup's error, so an unhashable key came
+            // back as a `KeyError` naming that key instead of the `TypeError`
+            // the hash raises.
+            //
+            // The extras lookup allocates, so publish the incoming arguments
+            // and rebuild the slice for the delegated call.
             let roots = pyre_object::gc_roots::push_roots();
             let args_base = roots.publish(&args[1..]);
             let nargs = args.len() - 1;
             roots.normalize(args_base, nargs);
-            let mapping = self.mapping()?;
-            if crate::baseobjspace::getitem(mapping, roots.get(args_base)).is_ok()
-                && self.key_is_fast_local(roots.get(args_base))?
-            {
+            if self.key_is_fast_local(roots.get(args_base))? {
                 return Err(crate::PyError::value_error(
                     "cannot remove local variables from FrameLocalsProxy",
                 ));
             }
-            let extra = self.frame().get_or_create_extra_locals();
+            let extra = self.frame().get_extra_locals();
+            if extra.is_null() {
+                // A frame with no extras dict answers the default if one was
+                // passed and reports the key itself otherwise; it does not
+                // gain a dict from a pop that finds nothing.
+                return if nargs == 2 {
+                    Ok(roots.get(args_base + 1))
+                } else {
+                    Err(crate::PyError::key_error_with_key(roots.get(args_base)))
+                };
+            }
+            let extra_slot = args_base + nargs;
+            roots.pin_root(extra);
             let call_args: Vec<PyObjectRef> =
                 (0..nargs).map(|i| roots.get(args_base + i)).collect();
-            let result = crate::baseobjspace::call_method(extra, "pop", &call_args);
+            let result = crate::baseobjspace::call_method(roots.get(extra_slot), "pop", &call_args);
             if result.is_null() {
                 Err(crate::call::take_call_error()
                     .unwrap_or_else(|| crate::PyError::runtime_error("pop failed")))
@@ -2203,6 +2334,41 @@ pub fn ncells(code: &CodeObject) -> usize {
     npure_cellvars(code) + code.freevars.len()
 }
 
+/// True when localsplus slot `idx` is a `varnames` entry that `MAKE_CELL`
+/// turned into a cell, so the slot holds the cell and a reader has to
+/// dereference it to reach the value.
+#[inline]
+fn cell_slot(code: &CodeObject, idx: usize) -> bool {
+    idx < code.localspluskinds.len()
+        && code.localspluskinds[idx] & crate::bytecode::CO_FAST_CELL != 0
+}
+
+/// The frame's locals-plus slots in `co_localsplusnames` order — every
+/// `varnames` entry, then the `cellvars` that are not already varnames, then
+/// the `freevars` — each paired with its slot index and whether the slot holds
+/// a cell.
+///
+/// `framelocalsproxy_getkeyindex` scans this order and
+/// `frame_locals_proxy_snapshot` fills a dict in it, so a name resolves to the
+/// same slot on both routes only as long as they walk it the same way.
+fn locals_plus_names(code: &CodeObject) -> impl Iterator<Item = (usize, &str, bool)> {
+    let locals = code
+        .varnames
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (index, name.as_str(), cell_slot(code, index)));
+    let pure_cellvars = code
+        .cellvars
+        .iter()
+        .filter(|name| !code.varnames.iter().any(|local| local == *name));
+    locals.chain(
+        pure_cellvars
+            .chain(code.freevars.iter())
+            .enumerate()
+            .map(|(offset, name)| (code.varnames.len() + offset, name.as_str(), true)),
+    )
+}
+
 /// True when localsplus slot `idx` carries `CO_FAST_HIDDEN`, i.e. an inlined
 /// comprehension's iteration variable (PEP 709).  The flag records that the
 /// surrounding binding is saved and restored by the comprehension bytecode;
@@ -2772,22 +2938,8 @@ impl PyFrame {
                 setitem_str_object(roots.get(snapshot_slot), name, roots.get(value_slot))
             };
 
-        for (index, name) in code.varnames.iter().enumerate() {
-            let cell_slot = index < code.localspluskinds.len()
-                && code.localspluskinds[index] & crate::bytecode::CO_FAST_CELL != 0;
-            insert_slot(index, name.as_ref(), cell_slot)?;
-        }
-        let mut index = code.varnames.len();
-        for name in code.cellvars.iter() {
-            if code.varnames.iter().any(|local| local == name) {
-                continue;
-            }
-            insert_slot(index, name.as_ref(), true)?;
-            index += 1;
-        }
-        for name in code.freevars.iter() {
-            insert_slot(index, name.as_ref(), true)?;
-            index += 1;
+        for (index, name, cell_slot) in locals_plus_names(code) {
+            insert_slot(index, name, cell_slot)?;
         }
         Ok(roots.get(snapshot_slot))
     }
