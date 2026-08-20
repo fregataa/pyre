@@ -1,0 +1,112 @@
+name: pyre CPython suite (weekly)
+
+# Non-gating exploratory run of the FULL CPython suite -- every module,
+# including the ones that fail today -- to catch a recorded verdict going
+# stale. Three lanes: dynasm JIT-on, dynasm JIT-off, cranelift JIT-on. A module
+# that passes JIT-off but not JIT-on is a JIT correctness divergence.
+# `--full` reports a regression against the baseline instead of failing on it,
+# but still exits nonzero, and withholds its report, when its buckets do not
+# account for every module it selected.
+
+on:
+  schedule:
+    - cron: "0 8 * * 0"
+  workflow_dispatch:
+
+concurrency:
+  group: pyre-cpython-weekly-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  full-suite:
+    name: full CPython suite (linux)
+    # The baseline records the gate's verdicts, so the lanes run on the gate's
+    # host with its own `--jobs`/`--timeout`: a report from another host, or a
+    # TIMEOUT under a tighter budget than the baseline was recorded with, is
+    # not a finding about the module.
+    runs-on: ubuntu-24.04
+    # Covers the extract, both builds and three full 434-module lanes.
+    timeout-minutes: 300
+    env:
+      PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
+      CHARON_VERSION: nightly-2026.05.29
+    steps:
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      with:
+        persist-credentials: false
+    - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+    - name: Set up CPython
+      id: cpython
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      with:
+        python-version: "3.14"
+    - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      with:
+        cache-bin: false
+    - name: Cache Charon binary
+      id: charon-cache
+      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: |
+          .pyre-build/charon
+          .pyre-build/charon-src
+        key: charon-bin-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}
+        restore-keys: |
+          charon-bin-${{ runner.os }}-${{ runner.arch }}-
+    - name: Install Charon
+      if: steps.charon-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: scripts/install-charon.py
+    - name: Compute LLBC fingerprint
+      id: llbc-fingerprint
+      shell: bash
+      run: |
+        value="$(scripts/extract-llbc.py --fingerprint majit-rlib pyre-object pyre-interpreter pyre-jit)"
+        echo "value=${value}" >> "$GITHUB_OUTPUT"
+    - name: Cache LLBC
+      id: llbc-cache
+      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: build/llbc
+        key: llbc-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.value }}
+        # A miss with no prefix to fall back on restores nothing and re-extracts
+        # all four crates. A loose restore is safe: `extract-llbc.py` re-judges
+        # each crate against the tree and re-extracts the ones that moved.
+        restore-keys: |
+          llbc-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-
+    - name: Extract LLBC
+      if: steps.llbc-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: scripts/extract-llbc.py majit-rlib pyre-object pyre-interpreter pyre-jit
+    - name: Build the dynasm backend
+      id: build-dynasm
+      run: cargo build --release -p pyrex --bin pyre-dynasm --no-default-features --features dynasm
+    - name: Build the cranelift backend
+      id: build-cranelift
+      # `!cancelled()` so a dynasm-only break does not also cost the run its
+      # cranelift report: the two share the sources but not the feature set.
+      # The price is that a failed setup step no longer stops this build.
+      if: ${{ !cancelled() }}
+      run: cargo build --release -p pyrex --bin pyre-cranelift --no-default-features --features cranelift
+    # Each lane names the build whose binary it runs, so no lane depends on
+    # where the other builds and lanes sit in the list.
+    - name: dynasm (JIT on)
+      if: ${{ !cancelled() && steps.build-dynasm.outcome == 'success' }}
+      run: ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --full --backend dynasm --jobs 3 --timeout 300 --report reports/dynasm-jit.json
+    # `!cancelled()` because a lane exits nonzero on more than a regression, and
+    # without it the JIT comparison is lost to whichever lane ran first.
+    - name: dynasm (JIT off)
+      if: ${{ !cancelled() && steps.build-dynasm.outcome == 'success' }}
+      run: ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --full --backend dynasm --no-jit --jobs 3 --timeout 300 --report reports/dynasm-nojit.json
+    - name: cranelift (JIT on)
+      if: ${{ !cancelled() && steps.build-cranelift.outcome == 'success' }}
+      run: ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --full --backend cranelift --jobs 3 --timeout 300 --report reports/cranelift-jit.json
+    - name: Upload reports
+      if: ${{ always() }}
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: cpython-suite-reports
+        path: reports/
