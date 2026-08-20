@@ -299,6 +299,7 @@ pub(crate) struct CompiledTrace {
     /// type with value, so `Const` carries both — the legacy
     /// `(constants: HashMap<u32, i64>, constant_types: HashMap<u32, Type>)`
     /// parallel pair has been collapsed.
+    #[allow(dead_code)]
     pub(crate) constants: majit_ir::ConstMap<majit_ir::Const>,
     /// Static exit metadata for each guard/finish in this trace.
     pub(crate) exit_layouts: indexmap::IndexMap<u32, StoredExitLayout>,
@@ -1247,6 +1248,7 @@ pub struct PartialTrace {
 ///   obj = lltype.cast_opaque_ptr(OBJECTPTR, box.getref_base())
 ///   return ConstInt(ptr2int(obj.typeptr))
 /// Reads the first word of the object (typeptr/vtable pointer).
+#[allow(dead_code)]
 fn default_cls_of_box(raw_ref: i64) -> i64 {
     unsafe { *(raw_ref as *const usize) as i64 }
 }
@@ -2163,9 +2165,19 @@ impl<M: Clone> MetaInterp<M> {
         fn visit_pool(
             pool: Option<&Arc<majit_ir::SharedConstPool>>,
             generation: u64,
+            is_minor: bool,
             visitor: &mut dyn FnMut(&mut GcRef),
         ) {
             let Some(pool) = pool else { return };
+            // `compile.py:ResumeGuardDescr._attrs_` makes `rd_consts` an
+            // ordinary GC-traced field upstream.  Its write barrier puts the
+            // newly assigned list in MiniMark's remembered set for one minor;
+            // survivors are promoted directly to oldgen, so clean pools do
+            // not participate in later minor root walks.  Major marking still
+            // visits every pool below.
+            if is_minor && !pool.take_minor_scan_pending() {
+                return;
+            }
             // Each pool records the generation of the walk that last visited
             // it, so a pool reached twice in one walk is visited once without
             // a visit set.  The counter is process-global because
@@ -2188,12 +2200,15 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         let generation = RD_CONSTS_WALK_GENERATION.fetch_add(1, Ordering::Relaxed);
+        let is_minor = majit_gc::shadow_stack::extra_root_walk_kind()
+            == majit_gc::shadow_stack::ExtraRootWalkKind::Minor;
         for entry in self.compiled_loops.values_mut() {
             for trace in entry.traces.values_mut() {
                 for layout in trace.exit_layouts.values_mut() {
                     visit_pool(
                         layout.storage.as_ref().map(|storage| &storage.rd_consts),
                         generation,
+                        is_minor,
                         &mut visitor,
                     );
                     let descr_pool = layout
@@ -2201,12 +2216,13 @@ impl<M: Clone> MetaInterp<M> {
                         .as_ref()
                         .and_then(|descr| descr.as_fail_descr())
                         .and_then(|fd| fd.rd_consts_arc());
-                    visit_pool(descr_pool.as_ref(), generation, &mut visitor);
+                    visit_pool(descr_pool.as_ref(), generation, is_minor, &mut visitor);
                 }
                 for layout in trace.terminal_exit_layouts.values_mut() {
                     visit_pool(
                         layout.storage.as_ref().map(|storage| &storage.rd_consts),
                         generation,
+                        is_minor,
                         &mut visitor,
                     );
                     let descr_pool = layout
@@ -2214,15 +2230,22 @@ impl<M: Clone> MetaInterp<M> {
                         .as_ref()
                         .and_then(|descr| descr.as_fail_descr())
                         .and_then(|fd| fd.rd_consts_arc());
-                    visit_pool(descr_pool.as_ref(), generation, &mut visitor);
+                    visit_pool(descr_pool.as_ref(), generation, is_minor, &mut visitor);
                 }
             }
             for tt in entry.front_target_tokens.iter_mut() {
-                if let Some(virtual_state) = tt.virtual_state.as_mut() {
-                    virtual_state.walk_const_ptr_refs_mut(&mut visitor);
-                }
-                if let Some(sp) = tt.short_preamble.as_mut() {
-                    sp.walk_const_ptr_refs_mut(&mut visitor);
+                // `history.TargetToken` is a GC object upstream.  MiniMark
+                // visits it in a minor only while its write barrier is dirty;
+                // after forwarding its graph, clean tokens stay out of later
+                // minor walks until another traced-field store.  A major must
+                // still see every token graph.
+                if !is_minor || tt.take_minor_scan_pending() {
+                    if let Some(virtual_state) = tt.virtual_state.as_mut() {
+                        virtual_state.walk_const_ptr_refs_mut(&mut visitor);
+                    }
+                    if let Some(sp) = tt.short_preamble.as_mut() {
+                        sp.walk_const_ptr_refs_mut(&mut visitor);
+                    }
                 }
             }
         }
@@ -12180,6 +12203,7 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// pyjitpl.py:3195 finally: self.history.cut(cut_at) — undo tentative JUMP/FINISH.
+    #[allow(dead_code)]
     fn cut_tentative_op(&mut self, cut_at: crate::recorder::TracePosition) {
         if let Some(ctx) = self.tracing.as_mut() {
             ctx.cut_trace(cut_at);
@@ -19972,6 +19996,7 @@ mod metainterp_static_data_tests {
         assert_eq!(JitArgKind::from_type(majit_ir::Type::Void), None);
     }
 
+    #[allow(dead_code)]
     extern "C" fn not_in_trace_clear_exc_helper() {
         // Test helper that clears the EXC_TLS thread-local in tests.
         // The do_not_in_trace_call test below sets last_exc_value
@@ -23507,11 +23532,13 @@ mod tests {
         })
     }
 
+    #[allow(dead_code)]
     fn may_force_void_values() -> &'static Mutex<Vec<i64>> {
         static VALUES: OnceLock<Mutex<Vec<i64>>> = OnceLock::new();
         VALUES.get_or_init(|| Mutex::new(Vec::new()))
     }
 
+    #[allow(dead_code)]
     fn may_force_test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -24044,6 +24071,7 @@ mod tests {
             .collect()
     }
 
+    #[allow(dead_code)]
     fn finish_trace_for_parity_preserves_captured_snapshots() {
         let mut meta = MetaInterp::<()>::new(10);
         meta.finish_setup_descrs_for_jitdrivers();

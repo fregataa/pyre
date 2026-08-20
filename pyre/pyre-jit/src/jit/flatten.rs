@@ -192,9 +192,9 @@ impl SSARepr {
     /// unique scratch index above. Each subsequent `fresh_var` for the
     /// same kind returns a strictly larger index. The returned index is
     /// safe to use directly in `Register::new(kind, idx)` /
-    /// `Operand::reg(kind, idx)` without further bookkeeping —
-    /// `regalloc::allocate_registers` will pick it up via the standard
-    /// SSARepr scan and color it.
+    /// `Operand::reg(kind, idx)` without further bookkeeping.  The index
+    /// is pre-regalloc: the register the emitted stream carries is the
+    /// color the canonical `flatten_graph` splice assigns.
     pub fn fresh_var(&mut self, kind: Kind, base: u16) -> VariableId {
         let slot = match kind {
             Kind::Int => 0,
@@ -2876,6 +2876,7 @@ fn flatten_constant_operand(constant: &super::flow::Constant) -> Operand {
 /// production-grade closure.  Tests that compare two SSARepr streams
 /// only compare opname + register kinds, so the `ConstRef(0)` value
 /// doesn't matter for those assertions.
+#[allow(dead_code)]
 pub(super) fn flatten_constant_operand_for_test(constant: &super::flow::Constant) -> Operand {
     match (&constant.value, constant.kind) {
         (ConstantValue::Opaque(_), Some(Kind::Ref)) => Operand::ConstRef(0),

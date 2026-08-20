@@ -3025,11 +3025,6 @@ pub struct PyreSym {
     /// Virtualizable object pointer (PyFrame).
     /// RPython MetaInterp stores the virtualizable separately from MIFrame.
     pub(crate) concrete_vable_ptr: *mut u8,
-    /// Root depth for `concrete_vable_ptr` while a residual call can collect.
-    /// RPython's local `virtualizable` remains a traced GCREF across
-    /// `vable_and_vrefs_before_residual_call` / `vable_after_residual_call`
-    /// (`rpython/jit/metainterp/pyjitpl.py:3317-3366`).
-    pub(crate) active_vable_root_depth: Option<usize>,
     /// Live (interpreter-owned) virtualizable `PyFrame` behind the tracing
     /// snapshot, or 0 when tracing runs without one (tests).
     /// `concrete_vable_ptr` points at the `snapshot_for_tracing` copy whose
@@ -3463,6 +3458,7 @@ pub struct MIFrame {
     pub(crate) close_merge_point_vsd: Option<usize>,
 }
 
+#[allow(dead_code)]
 pub(crate) fn instruction_consumes_comparison_truth(instruction: Instruction) -> bool {
     matches!(
         instruction,
@@ -3470,6 +3466,7 @@ pub(crate) fn instruction_consumes_comparison_truth(instruction: Instruction) ->
     )
 }
 
+#[allow(dead_code)]
 pub(crate) fn instruction_is_trivia_between_compare_and_branch(instruction: Instruction) -> bool {
     matches!(
         instruction,
@@ -3482,6 +3479,7 @@ pub(crate) fn instruction_is_trivia_between_compare_and_branch(instruction: Inst
     )
 }
 
+#[allow(dead_code)]
 pub(crate) fn instruction_needs_pre_opcode_snapshot(instruction: Instruction) -> bool {
     // Only keep the opcode-start snapshot for bytecodes that can emit a
     // guard after mutating the logical stack/register state. A larger
@@ -3532,6 +3530,7 @@ pub(crate) fn instruction_needs_pre_opcode_snapshot(instruction: Instruction) ->
 /// Python code need GUARD_NO_EXCEPTION. Arithmetic, comparisons, and
 /// local variable access are lowered to primitive IR ops (exc=False) in
 /// RPython and protected by type-specific guards instead.
+#[allow(dead_code)]
 pub(crate) fn instruction_may_raise(instruction: Instruction) -> bool {
     matches!(
         instruction,
@@ -3564,6 +3563,7 @@ pub struct PyreEnv;
 /// or `*mut FixedObjectArray` for `PyFrame.locals_cells_stack_w`), use
 /// [`pyobject_gcarray_descr`] instead — its `base_size` is the block's
 /// items offset, so the descriptor itself skips the length prefix.
+#[allow(dead_code)]
 pub(crate) fn pyobject_array_descr() -> DescrRef {
     // `nolength=True` shape (descr.py:359-360): items start at offset 0,
     // no length header — `GETARRAYITEM_GC_R(ptr, i)` lands on
@@ -3913,6 +3913,7 @@ pub(crate) fn wrapfloat(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
 // pyre-specific pre-optimization that duplicated (and mistyped) the
 // optimizer logic. It has been removed for structural parity with RPython.
 
+#[allow(dead_code)]
 pub(crate) fn try_trace_const_boxed_int(
     ctx: &mut TraceCtx,
     value: OpRef,
@@ -3945,6 +3946,7 @@ pub(crate) fn try_trace_const_boxed_int(
 /// (heapcache.py:172).  `opimpl_getfield_gc_i` already does that lookup,
 /// so this helper is now just a thin alias kept for source-stability
 /// with the call sites.
+#[allow(dead_code)]
 pub(crate) fn trace_arraylen_gc(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef) -> OpRef {
     opimpl_getfield_gc_i(ctx, obj, descr)
 }
@@ -4265,6 +4267,7 @@ fn concrete_gc_ptr(ctx: &TraceCtx, obj: OpRef) -> Option<i64> {
 /// Unbox int with proper GuardClass resume data via the frame impl's
 /// `generate_guard`. Generic over `WalkerFrameOps` so both `MIFrame` and
 /// `WalkContext` can invoke the same lowering.
+#[allow(dead_code)]
 pub(crate) fn trace_unbox_int_with_resume<F: crate::walker_frame_ops::WalkerFrameOps>(
     frame: &mut F,
     obj: OpRef,
@@ -4303,6 +4306,7 @@ pub(crate) fn int_or_bool_unbox_type_descr(
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn trace_unbox_int_with_resume_descr<F: crate::walker_frame_ops::WalkerFrameOps>(
     frame: &mut F,
     obj: OpRef,
@@ -4360,6 +4364,7 @@ pub(crate) fn trace_unbox_int_with_resume_descr<F: crate::walker_frame_ops::Walk
     crate::trace_unbox_int(frame.ctx_mut(), obj, type_addr, intval_descr)
 }
 
+#[allow(dead_code)]
 pub(crate) unsafe fn objspace_compare_ints(
     lhs_obj: PyObjectRef,
     rhs_obj: PyObjectRef,
@@ -4382,6 +4387,7 @@ pub(crate) unsafe fn objspace_compare_ints(
 /// baseobjspace as_float: coerce int|float → f64.
 /// Called only for int/float operands in the tracing fast path.
 /// Long operands are handled by residual fallback, not this function.
+#[allow(dead_code)]
 unsafe fn as_float_for_trace(obj: PyObjectRef) -> f64 {
     unsafe {
         if is_float(obj) {
@@ -4397,6 +4403,7 @@ unsafe fn as_float_for_trace(obj: PyObjectRef) -> f64 {
 /// Compare two numeric values as floats. Handles float_pair (int+float)
 /// via as_float coercion matching baseobjspace::float_lt/le/gt/ge/eq/ne.
 /// Long operands don't reach here — they trigger residual fallback.
+#[allow(dead_code)]
 pub(crate) unsafe fn objspace_compare_floats(
     lhs_obj: PyObjectRef,
     rhs_obj: PyObjectRef,
@@ -4515,6 +4522,7 @@ fn array_load_for_cache(
 }
 
 /// Read from frame's locals_cells_stack_w — namespace access path.
+#[allow(dead_code)]
 pub(crate) fn trace_raw_array_getitem_value(
     ctx: &mut TraceCtx,
     array: OpRef,
@@ -4688,6 +4696,7 @@ pub(crate) fn trace_mapdict_storage_setitem(
 
 /// Write to frame's locals_cells_stack_w array.
 /// Uses Gc (GC-typed) to match RPython's SETARRAYITEM_GC.
+#[allow(dead_code)]
 pub(crate) fn trace_raw_array_setitem_value(
     ctx: &mut TraceCtx,
     array: OpRef,
@@ -5302,6 +5311,7 @@ pub(crate) fn flush_walk_loop_end_state_to_frame(
 /// `body_pc - 1` so `next_instr()` re-enters the FOR_ITER body — delivering the
 /// already-advanced iteration exactly once (the FOR_ITER itself is NOT re-run).
 /// `push = None` is byte-identical to the plain flush.
+#[allow(dead_code)]
 pub(crate) fn flush_walk_end_state_to_frame_with_item(
     ctx: &TraceCtx,
     frame: usize,
@@ -6303,6 +6313,7 @@ pub(crate) fn fail_arg_opref_for_typed_value(ctx: &mut TraceCtx, value: Value) -
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn frame_callable_arg_types(nargs: usize) -> Vec<Type> {
     let mut types = Vec::with_capacity(2 + nargs);
     types.push(Type::Ref);
@@ -6313,6 +6324,7 @@ pub(crate) fn frame_callable_arg_types(nargs: usize) -> Vec<Type> {
     types
 }
 
+#[allow(dead_code)]
 pub(crate) fn one_arg_callee_frame_helper(
     arg_type: Type,
     is_self_recursive: bool,
@@ -6459,7 +6471,6 @@ impl PyreSym {
             is_function_entry_trace: false,
             concrete_execution_context: std::ptr::null(),
             concrete_vable_ptr: std::ptr::null_mut(),
-            active_vable_root_depth: None,
             live_vable_frame_addr: 0,
             last_exc_value: std::ptr::null_mut(),
             class_of_last_exc_is_const: false,
@@ -12382,6 +12393,7 @@ mod tests {
     /// through the single hash path (`baseobjspace.py:840-845`).  These tests
     /// don't go through `init_jit_hooks`, which installs the hooks at boot for
     /// the pyrex binary; the thread-local cell must be set on the test thread.
+    #[allow(dead_code)]
     fn install_test_hash_hook() {
         unsafe fn test_hash_w(obj: pyre_object::PyObjectRef) -> i64 {
             match pyre_interpreter::builtins::try_hash_value(obj) {

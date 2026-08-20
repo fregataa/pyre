@@ -199,12 +199,16 @@ pub struct CompiledExitLayout {
 impl CompiledExitLayout {
     /// Whether the collector traces exit slot `slot`.
     ///
-    /// The rule `llsupport/assembler.py compute_gcmap` applies: every
-    /// `REF`-typed failarg is marked, and nothing narrows it further.  A
-    /// force token is included, because `resoperation.py FORCE_TOKEN/0/r`
-    /// is REF upstream as well — it returns the jitframe, itself a GC
-    /// object that moves — and both emitted gcmaps
+    /// The rule `llsupport/assembler.py compute_gcmap` applies: it skips the
+    /// hole a virtual leaves (`if arg is None: continue`), marks every
+    /// remaining `REF`-typed failarg, and narrows nothing else.  A force
+    /// token is marked like any other, because `resoperation.py
+    /// FORCE_TOKEN/0/r` is REF upstream as well — it returns the jitframe,
+    /// itself a GC object that moves — and both emitted gcmaps
     /// (`guard_gcmap_from_faillocs`, `collect_guards`) mark it.
+    ///
+    /// The skip has nothing to do here: an exit layout reaches this point
+    /// with every fail arg bound, so the type test is the whole rule.
     ///
     /// Do not narrow it by force-token position: that would stop rooting a
     /// live jitframe pointer.
@@ -340,8 +344,10 @@ impl<'a> CompileData<'a> {
 /// `compile.py:62` `class PreambleCompileData(CompileData)`.
 pub struct PreambleCompileData<'a> {
     pub base: CompileData<'a>,
+    #[allow(dead_code)]
     pub runtime_boxes: &'a [OpRef],
     pub call_pure_results: &'a indexmap::IndexMap<Vec<Value>, Value>,
+    #[allow(dead_code)]
     pub enable_opts: &'a [String],
 }
 
@@ -364,8 +370,10 @@ impl<'a> PreambleCompileData<'a> {
 /// `compile.py:81` `class SimpleCompileData(CompileData)`.
 pub struct SimpleCompileData<'a> {
     pub base: CompileData<'a>,
+    #[allow(dead_code)]
     pub resumestorage: Option<&'a ResumeStorage>,
     pub call_pure_results: &'a indexmap::IndexMap<Vec<Value>, Value>,
+    #[allow(dead_code)]
     pub enable_opts: &'a [String],
 }
 
@@ -387,11 +395,14 @@ impl<'a> SimpleCompileData<'a> {
 
 /// `compile.py:98` `class BridgeCompileData(CompileData)`.
 pub struct BridgeCompileData<'a> {
+    #[allow(dead_code)]
     pub base: CompileData<'a>,
     pub runtime_boxes: &'a [OpRef],
+    #[allow(dead_code)]
     pub resumestorage: Option<&'a ResumeStorage>,
     pub call_pure_results: &'a indexmap::IndexMap<Vec<Value>, Value>,
     pub inline_short_preamble: bool,
+    #[allow(dead_code)]
     pub enable_opts: &'a [String],
 }
 
@@ -418,9 +429,13 @@ impl<'a> BridgeCompileData<'a> {
 /// `compile.py:122` `class UnrolledLoopData(CompileData)`.
 pub struct UnrolledLoopData<'a> {
     pub base: CompileData<'a>,
+    #[allow(dead_code)]
     pub celltoken: &'a Arc<JitCellToken>,
+    #[allow(dead_code)]
     pub state: &'a crate::optimizeopt::unroll::ExportedState,
+    #[allow(dead_code)]
     pub call_pure_results: &'a indexmap::IndexMap<Vec<Value>, Value>,
+    #[allow(dead_code)]
     pub enable_opts: &'a [String],
 }
 
@@ -1701,6 +1716,7 @@ pub(crate) fn build_terminal_exit_layouts<T: AsRef<majit_ir::Op>>(
     layouts
 }
 
+#[allow(dead_code)]
 pub(crate) fn terminal_exit_layout_for_trace(
     trace: &CompiledTrace,
     owning_key: u64,
@@ -1722,6 +1738,7 @@ pub(crate) fn terminal_exit_layout_for_trace(
     infer_terminal_exit_layout(&trace.inputargs, &trace.ops, owning_key, trace_id, op_index)
 }
 
+#[allow(dead_code)]
 pub(crate) fn decode_values_with_layout(
     raw_values: &[i64],
     layout: &CompiledExitLayout,
@@ -2786,7 +2803,8 @@ mod tests {
     /// The deadframe rooting in `handle_fail` reaches the layout, not the
     /// descr it came from, so the layout answers from its own types.  A
     /// force-token slot is traced like any other ref — `compute_gcmap`
-    /// marks every REF failarg.
+    /// marks every REF failarg it does not skip, and it skips only the hole a
+    /// virtual leaves.
     #[test]
     fn exit_layout_traces_every_ref_slot_including_force_tokens() {
         let layout = CompiledExitLayout {
@@ -3250,12 +3268,17 @@ fn alloc_fail_index() -> u32 {
 //                      failarg index (when TY_INT/REF/FLOAT), accessed via
 //                      `>> ST_SHIFT` with `STATUS_SHIFT_MASK`.
 pub(crate) const STATUS_BUSY_FLAG: u64 = 0x01;
+#[allow(dead_code)]
 pub(crate) const STATUS_TYPE_MASK: u64 = 0x06;
 pub(crate) const STATUS_SHIFT: u32 = 3;
 pub(crate) const STATUS_SHIFT_MASK: u64 = !((1u64 << STATUS_SHIFT) - 1);
+#[allow(dead_code)]
 pub(crate) const STATUS_TY_NONE: u64 = 0x00;
+#[allow(dead_code)]
 pub(crate) const STATUS_TY_INT: u64 = 0x02;
+#[allow(dead_code)]
 pub(crate) const STATUS_TY_REF: u64 = 0x04;
+#[allow(dead_code)]
 pub(crate) const STATUS_TY_FLOAT: u64 = 0x06;
 
 // MetaFailDescr removed: pyre-introduced placeholder for non-resume

@@ -2467,6 +2467,7 @@ impl ExportedState {
             }
         }
 
+        #[allow(dead_code)]
         fn visit_value(value: &mut Value, visitor: &mut dyn FnMut(&mut GcRef)) {
             if let Value::Ref(gcref) = value {
                 visitor(gcref);
@@ -3852,6 +3853,10 @@ impl OptUnroll {
                         && let Some(builder) = optimizer.short_preamble_producer.as_ref()
                     {
                         target_token.short_preamble = Some(builder.build_short_preamble_struct());
+                        // `history.TargetToken.short_preamble` is a traced GC
+                        // field upstream, so this replacement invokes the
+                        // normal MiniMark write barrier.
+                        target_token.mark_minor_scan_pending();
                     }
                 } else {
                     extra = Self::inline_short_preamble(
@@ -4847,6 +4852,7 @@ pub(crate) fn export_state(
 }
 
 /// unroll.py:479-504 import_state — module-level entry point.
+#[allow(dead_code)]
 pub(crate) fn import_state(
     targetargs: &[OpRef],
     exported_state: &ExportedState,
@@ -4856,6 +4862,7 @@ pub(crate) fn import_state(
     OptUnroll::new().import_state(targetargs, exported_state, optimizer, ctx)
 }
 
+#[allow(dead_code)]
 pub(crate) fn import_short_preamble_state(
     targetargs: &[OpRef],
     label_args: &[OpRef],
@@ -5875,6 +5882,7 @@ fn replace_terminal_jump(body_ops: &[majit_ir::OpRc], jump_op: Op) -> Vec<majit_
     result
 }
 
+#[allow(dead_code)]
 fn reshape_jump_args_for_preamble(jump_args: &mut Vec<OpRef>, preamble_args: &[OpRef]) {
     if jump_args.len() > preamble_args.len() {
         jump_args.truncate(preamble_args.len());

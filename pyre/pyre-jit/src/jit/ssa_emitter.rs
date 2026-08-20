@@ -79,10 +79,12 @@ impl SSAReprEmitter {
         self.builder.set_calldescr(calldescr);
     }
 
+    #[allow(dead_code)]
     fn add_const_i(&mut self, value: i64) -> u16 {
         self.builder.add_const_i(value)
     }
 
+    #[allow(dead_code)]
     fn add_const_r(&mut self, value: i64) -> u16 {
         self.builder.add_const_r(value)
     }
@@ -168,7 +170,7 @@ impl SSAReprEmitter {
     /// when the single-byte register/constant namespace cannot encode it.
     ///
     /// `num_regs` is the post-regalloc per-kind ceiling computed by
-    /// `super::regalloc::allocate_registers` from `max(color)+1`
+    /// `RegAllocator::find_num_colors` from `max(color)+1`
     /// (`codewriter.py:62-67`). Passing pre-regalloc builder values
     /// would over-allocate the `JitCode.num_regs_*` slots that
     /// `Assembler::emit_reg`'s 256-bound assertion (`assembler.py:73`)
@@ -192,6 +194,7 @@ impl SSAReprEmitter {
     /// canonical [`SSARepr`] (whose `insns_pos` side-table the probe
     /// inspects post-assemble).  Production callers continue to use
     /// `finish_with_positions_from`.
+    #[allow(dead_code)]
     pub fn into_builder(self) -> JitCodeBuilder {
         self.builder
     }
