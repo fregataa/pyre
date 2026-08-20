@@ -1012,7 +1012,19 @@ fn flush_callee_locals_region_to_frame<Sym: WalkSym>(
 /// operation directly, so it must preserve that preceding interpreter state
 /// transition on both the emitted frame operand and its recording-time
 /// concrete shadow.
-fn finish_current_frame_execution<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>) {
+fn finish_current_frame_execution<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    opcode_position: usize,
+) {
+    // `dispatch_bytecode` publishes `last_instr` before every opcode.  The
+    // walker bypasses that loop, so an escaped inline MIFrame needs the return
+    // coordinate explicitly; otherwise a frame returned by
+    // `sys._getframe(0)` remains at its constructor sentinel after the callee
+    // has finished.  The helper is a no-op for the top-level frame, whose
+    // finish path uses `fbw_publish_exit_last_instr` below.
+    if !ctx.is_top_level {
+        residual_call::record_and_publish_inline_callee_last_instr(ctx, opcode_position);
+    }
     let (frame, concrete_frame) = if ctx.is_top_level {
         let sym = ctx.fbw_mode.snapshot_sym;
         if sym.is_null() {
@@ -2597,9 +2609,9 @@ pub enum DispatchError {
     /// the walker itself covers loop-callee inlining.
     LoopBearingCalleeInlineUnsupported {
         pc: usize,
-        /// The decline stopped before the next residual executed with a
-        /// complete MIFrame image.  RPython converts that whole frame stack
-        /// and runs forward; rewinding an outer CALL would repeat effects.
+        /// Whether the aborting MIFrame has applied an effect since its caller
+        /// entered it.  A clean attempted frame can be discarded and re-entered
+        /// from the CALL; an applied frame must be preserved and run forward.
         blackhole_required: bool,
     },
     /// An in-flight FOR_ITER body executed a non-journalable
@@ -2830,20 +2842,18 @@ impl DispatchError {
             let loc = std::panic::Location::caller();
             eprintln!("[lb-site] {}:{} pc={pc}", loc.file(), loc.line());
         }
-        Self::LoopBearingCalleeInlineUnsupported {
-            pc,
-            blackhole_required: false,
-        }
+        Self::callee_inline_abort(pc, false)
     }
 
-    /// The nested residual-decline arm has proved that the current operation
-    /// has not run and that the MIFrame banks are complete.  Preserve each
-    /// inlined frame and continue through the blackhole, as
-    /// `convert_and_run_from_pyjitpl` does in RPython.
-    pub(crate) fn callee_inline_blackhole_required(pc: usize) -> Self {
+    /// Classify a nested residual decline by whether the aborting MIFrame has
+    /// already applied an effect.  A clean attempted frame can be discarded
+    /// and re-entered from its caller's CALL; an applied frame must be retained
+    /// and run forward with the rest of the live stack, as
+    /// `convert_and_run_from_pyjitpl` does (`blackhole.py:1799-1821`).
+    pub(crate) fn callee_inline_abort(pc: usize, blackhole_required: bool) -> Self {
         Self::LoopBearingCalleeInlineUnsupported {
             pc,
-            blackhole_required: true,
+            blackhole_required,
         }
     }
 }
@@ -2909,10 +2919,11 @@ pub fn census_record_frame_shape_decline(code_ptr: usize, kind: &'static str) {
     }
 }
 
-/// Record a frame-level FOR_ITER admission denial once per code object.
-/// `kind` names the predicate that denied the frame, so a pre-trace rejection
-/// remains attributable in the same census as frame-shape and traced-walk
-/// declines. Returns whether this was the first decline recorded for `code_ptr`.
+/// Record a loop-region FOR_ITER admission denial once per code object.
+/// `kind` names the predicate that denied the back-edge trace, so the
+/// pre-trace rejection remains attributable in the same census as frame-shape
+/// and traced-walk declines. Returns whether this was the first decline
+/// recorded for `code_ptr`.
 pub fn census_record_for_iter_gate_decline(code_ptr: usize, kind: &'static str) -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ENABLED.get_or_init(|| {
@@ -11323,8 +11334,12 @@ fn handle<Sym: WalkSym>(
             // lock-step with its concrete shadow.  Operand layout `>r`:
             // 1B dst.
             let (val, concrete) = {
-                let sess = ctx.session.borrow();
-                (sess.tmpreg_r, sess.tmpreg_r_concrete)
+                let mut sess = ctx.session.borrow_mut();
+                let val = sess.tmpreg_r;
+                let concrete = sess.tmpreg_r_concrete;
+                sess.tmpreg_r = OpRef::NONE;
+                sess.tmpreg_r_concrete = ConcreteValue::Null;
+                (val, concrete)
             };
             let dst = code[op.pc + 1] as usize;
             write_ref_reg(ctx, op.pc, dst, val, concrete)?;
@@ -11426,7 +11441,7 @@ fn handle<Sym: WalkSym>(
             //
             // Walker selects between the two via `ctx.is_top_level`.
             let result = read_ref_reg(code, op, 0, ctx)?;
-            finish_current_frame_execution(ctx);
+            finish_current_frame_execution(ctx, op.pc);
             // PyPy `box.value = result` parity at the frame boundary:
             // the callee's slot-keyed concrete shadow (`concrete_registers_r`)
             // carries the live PyObject pointer; mirror it onto the
@@ -11481,7 +11496,7 @@ fn handle<Sym: WalkSym>(
             // `inline_call_*_i` would land the int OpRef in its `>i` slot.
             // Operand layout `i`: 1B int register at op.pc+1.
             let result = read_int_reg(code, op, 0, ctx)?;
-            finish_current_frame_execution(ctx);
+            finish_current_frame_execution(ctx, op.pc);
             // PyPy `box.value = result` parity at the frame boundary —
             // see `ref_return/r` comment above for rationale.
             if !result.is_constant() {
@@ -11521,7 +11536,7 @@ fn handle<Sym: WalkSym>(
             // 1B signed const at op.pc+1.
             let value = code[op.pc + 1] as i8 as i64;
             let result = OpRef::ConstInt(value);
-            finish_current_frame_execution(ctx);
+            finish_current_frame_execution(ctx, op.pc);
             if ctx.is_top_level {
                 fbw_finish_concrete_set(ConcreteValue::Int(value));
                 fbw_terminate_with_finish(ctx, result, op.pc)?;
@@ -11545,7 +11560,7 @@ fn handle<Sym: WalkSym>(
             // which bank to write into.
             // Operand layout `f`: 1B float register at op.pc+1.
             let result = read_float_reg(code, op, 0, ctx)?;
-            finish_current_frame_execution(ctx);
+            finish_current_frame_execution(ctx, op.pc);
             if ctx.is_top_level {
                 // Slice b: portal-exit FINISH carries Type::Ref;
                 // `fbw_ensure_boxed_for_ca` re-boxes the float via
@@ -11580,7 +11595,7 @@ fn handle<Sym: WalkSym>(
             // register on the caller side (the codewriter emits no `>X`
             // marker for void calls).
             // No operand bytes (the `/` argcodes is empty).
-            finish_current_frame_execution(ctx);
+            finish_current_frame_execution(ctx, op.pc);
             if ctx.is_top_level {
                 // Slice b: route the void portal exit through
                 // `TraceAction::Finish` (empty args) so the compile

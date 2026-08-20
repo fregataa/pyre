@@ -7454,7 +7454,11 @@ fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
 /// (`bh_set_add_fn` / `bh_map_add_fn`), so they carry exactly the body-effect
 /// accounting of the residual they are, and a mid-body abort resumes through the
 /// same `try_commit_midbody_abort` path as the store family.
-fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
+/// A function-entry trace starts before bytecode dispatch and can therefore
+/// reach any `FOR_ITER` body in the code object. This is a trace-start policy,
+/// not frame admission: declining it leaves the interpreted frame running so
+/// each back-edge can make its own region-scoped decision.
+fn function_entry_trace_is_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
     use pyre_interpreter::Instruction as I;
     let instructions = &code.instructions;
     let mut arg_state = pyre_interpreter::OpArgState::default();
@@ -7546,9 +7550,9 @@ fn loop_region_ranges(
             // guessed at.
             //
             // With several disjoint handlers laid out after the body this
-            // swallows the bytecode between the earliest one and the jump, and
-            // the two readers of these ranges want opposite things from that.
-            // `loop_region_for_iter_bodies_all_jit_safe` only loses inlining —
+            // swallows the bytecode between the earliest one and the jump.
+            // `loop_region_for_iter_bodies_all_jit_safe`, the one reader, only
+            // loses inlining —
             // an unsafe `FOR_ITER` in the swallowed span declines a loop that
             // could not reach it — while narrowing to the handler nearest the
             // jump would let it admit a frame whose unsafe `FOR_ITER` really
@@ -7590,73 +7594,6 @@ fn loop_region_for_iter_bodies_all_jit_safe(
         }
     }
     true
-}
-
-/// Recognize the narrow range-specific exception to the whole-frame FOR_ITER
-/// gate: a natural loop that passes a freshly called `range(...)` directly to
-/// `list.append`. A disjoint unsafe loop elsewhere in the frame cannot execute
-/// in this backedge trace. This deliberately does not admit arbitrary earlier
-/// loops in an unsafe frame.
-fn loop_region_contains_escaping_range_append(
-    code: &pyre_interpreter::CodeObject,
-    loop_header_pc: usize,
-) -> bool {
-    use pyre_interpreter::Instruction as I;
-    #[derive(Clone, Copy)]
-    enum State {
-        Searching,
-        AwaitRange,
-        AwaitRangeCall,
-        AwaitAppendCall,
-    }
-
-    let ranges = loop_region_ranges(code, loop_header_pc);
-    if ranges.is_empty() {
-        return false;
-    }
-
-    let mut state = State::Searching;
-    let mut decode = pyre_interpreter::OpArgState::default();
-    for (pc, unit) in code.instructions.iter().copied().enumerate() {
-        let (instr, op_arg) = decode.get(unit);
-        if !ranges.iter().any(|range| range.contains(&pc)) {
-            // The region is a body span plus the out-of-line handler spans that
-            // rejoin it, so the scan crosses gaps.  A partial match may not span
-            // one: a body's trailing `LOAD_ATTR append` would otherwise stay
-            // `AwaitRange` until a handler's own `LOAD_GLOBAL range` and two
-            // calls completed the pattern, reporting an `append(range(...))` no
-            // execution path performs.
-            state = State::Searching;
-            continue;
-        }
-        match instr {
-            I::LoadAttr { namei }
-                if code.names[namei.get(op_arg).name_idx() as usize].as_str() == "append" =>
-            {
-                state = State::AwaitRange;
-            }
-            I::LoadGlobal { namei } => {
-                state = if matches!(state, State::AwaitRange)
-                    && code.names[(namei.get(op_arg) as usize) >> 1].as_str() == "range"
-                {
-                    State::AwaitRangeCall
-                } else {
-                    State::Searching
-                };
-            }
-            I::Call { .. } | I::CallKw { .. } => {
-                state = match state {
-                    State::AwaitRangeCall => State::AwaitAppendCall,
-                    State::AwaitAppendCall => return true,
-                    _ => State::Searching,
-                };
-            }
-            I::ExtendedArg | I::Cache => {}
-            _ if matches!(state, State::AwaitAppendCall) => state = State::Searching,
-            _ => {}
-        }
-    }
-    false
 }
 
 /// Whether `PYRE_FOR_ITER_GATE_DIAG` is set. The per-opcode decline and the
@@ -7859,7 +7796,7 @@ fn for_iter_body_is_jit_safe_at(code: &pyre_interpreter::CodeObject, pc: usize) 
 ///
 /// A single `FOR_ITER` keeps JITting because the count stays at one, and
 /// genuinely nested `FOR_ITER` frames are already declined by
-/// [`for_iter_bodies_all_jit_safe`].
+/// [`function_entry_trace_is_jit_safe`].
 fn for_iter_frame_is_finally_duplicated(code: &pyre_interpreter::CodeObject) -> bool {
     let entries: Vec<_> =
         pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable).collect();
@@ -8352,21 +8289,6 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
             return frame_root.frame().execute_frame(None, None);
         }
     }
-    if !cached_for_iter_bodies_all_jit_safe(code) && !frame_has_traceable_escaping_range_loop(code)
-    {
-        const DENIAL: &str = "FrameGate::ForIter/NoJitSafeLoopRegion";
-        let first_decline = pyre_jit_trace::jitcode_dispatch::census_record_for_iter_gate_decline(
-            code as *const _ as usize,
-            DENIAL,
-        );
-        if first_decline && for_iter_gate_diag_enabled() {
-            eprintln!(
-                "[for-iter-gate-decline] code={} source={} predicate={DENIAL}",
-                code.qualname, code.source_path
-            );
-        }
-        return frame_root.frame().execute_frame(None, None);
-    }
     frame_root.frame().fix_array_ptrs();
     // Set CURRENT_FRAME so zero-arg super() can find __class__ in the caller.
     let _frame_guard = pyre_interpreter::eval::install_current_frame(frame_root.frame());
@@ -8716,38 +8638,15 @@ fn cached_loop_region_for_iter_bodies_all_jit_safe(
     safe
 }
 
-fn cached_for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
+fn cached_function_entry_trace_is_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
     let key = code as *const _ as usize;
     let callcontrol = crate::jit::codewriter::CodeWriter::instance().callcontrol();
-    if let Some(&safe) = callcontrol.for_iter_bodies_jit_safe.get(&key) {
+    if let Some(&safe) = callcontrol.function_entry_trace_jit_safe.get(&key) {
         return safe;
     }
-    let safe = for_iter_bodies_all_jit_safe(code);
-    callcontrol.for_iter_bodies_jit_safe.insert(key, safe);
+    let safe = function_entry_trace_is_jit_safe(code);
+    callcontrol.function_entry_trace_jit_safe.insert(key, safe);
     safe
-}
-
-fn cached_loop_region_contains_escaping_range_append(
-    code: &pyre_interpreter::CodeObject,
-    loop_header_pc: usize,
-) -> bool {
-    let key = (code as *const _ as usize, loop_header_pc);
-    let callcontrol = crate::jit::codewriter::CodeWriter::instance().callcontrol();
-    if let Some(&contains) = callcontrol.escaping_range_loop_regions.get(&key) {
-        return contains;
-    }
-    let contains = loop_region_contains_escaping_range_append(code, loop_header_pc);
-    callcontrol
-        .escaping_range_loop_regions
-        .insert(key, contains);
-    contains
-}
-
-fn frame_has_traceable_escaping_range_loop(code: &pyre_interpreter::CodeObject) -> bool {
-    cached_loop_header_pcs(code).iter().copied().any(|header| {
-        cached_loop_region_for_iter_bodies_all_jit_safe(code, header)
-            && cached_loop_region_contains_escaping_range_append(code, header)
-    })
 }
 
 /// warmspot.py portal_runner parity: execute a frame through the JIT-enabled
@@ -9244,11 +9143,18 @@ fn maybe_compile_and_run(
     if cached_unsupported_jit_shape(code) != UnsupportedJitShape::None {
         return None;
     }
-    let region_safe = cached_loop_region_for_iter_bodies_all_jit_safe(code, loop_header_pc);
-    if !region_safe
-        || (!cached_for_iter_bodies_all_jit_safe(code)
-            && !frame_has_traceable_escaping_range_loop(code))
-    {
+    if !cached_loop_region_for_iter_bodies_all_jit_safe(code, loop_header_pc) {
+        const DENIAL: &str = "BackedgeGate::ForIter/UnsafeLoopRegion";
+        let first_decline = pyre_jit_trace::jitcode_dispatch::census_record_for_iter_gate_decline(
+            code as *const _ as usize,
+            DENIAL,
+        );
+        if first_decline && for_iter_gate_diag_enabled() {
+            eprintln!(
+                "[for-iter-gate-decline] code={} source={} loop_header_pc={loop_header_pc} predicate={DENIAL}",
+                code.qualname, code.source_path
+            );
+        }
         return None;
     }
     if let Some(expected_vsd) =
@@ -9822,25 +9728,36 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
 /// carry with zero in-loop tag ops.
 ///
 /// Only the locals region (`0..nlocals`) is scanned; cell/free vars and stack
-/// temps are left untouched. GC-safe: `w_int_new_unique` returns a managed heap
-/// box and the store lands in the frame's `locals_cells_stack_w` array, which
-/// is a GC root for the duration of the compiled run (`FrameLocalsRoot`) and is
-/// forwarded via the current-frame chain during any collection the allocation
-/// itself triggers.
+/// temps are left untouched.
+///
+/// `w_int_new_unique` allocates, so every iteration is a safepoint: the frame's
+/// `locals_cells_stack_w` is itself a GC object and a minor collection moves it,
+/// rewriting the field on the frame it forwards.  A borrow of the array taken
+/// before the call names the pre-move address, and the collection leaves that
+/// address free nursery space, so both the read and the store go through the
+/// frame each time.  The store is the barriered one: a fresh box is young and
+/// the array it lands in may be old, which is exactly the edge the remembered
+/// set exists to carry.
+///
+/// The frame moves for the same reason, so it is taken as its [`FrameRoot`]
+/// rather than as a reference: a `&mut PyFrame` resolved by the caller names the
+/// pre-move block from the first boxed slot onwards, and every later read and
+/// store would land there.
 #[inline]
-fn untag_tagged_frame_locals(frame: &mut PyFrame) {
+fn untag_tagged_frame_locals(frame_root: &mut FrameRoot) {
     if !pyre_object::tagged_int::CAN_BE_TAGGED {
         return;
     }
-    let nlocals = frame.nlocals();
-    let locals = locals_w_mut!(frame);
-    let n = nlocals.min(locals.len());
+    let n = {
+        let frame = frame_root.frame();
+        frame.nlocals().min(locals_w!(frame).len())
+    };
     for i in 0..n {
-        let slot = locals[i];
+        let slot = locals_w!(frame_root.frame())[i];
         if !slot.is_null() && pyre_object::tagged_int::is_tagged_int(slot) {
             let value = pyre_object::tagged_int::untag_int(slot);
             let boxed = pyre_object::intobject::w_int_new_unique(value);
-            locals[i] = boxed;
+            frame_root.frame().set_locals_w(i, boxed);
         }
     }
 }
@@ -9866,7 +9783,7 @@ fn execute_assembler(
     // Convert tagged-immediate frame locals to heap `W_IntObject` before the
     // compiled loop reads them, so the trace body operates on the flag-false
     // heap-int representation (no in-loop tag test). See `untag_tagged_frame_locals`.
-    untag_tagged_frame_locals(frame);
+    untag_tagged_frame_locals(&mut frame_root);
 
     if majit_metainterp::majit_log_enabled() {
         let locals: Vec<(usize, Option<i64>)> = (0..locals_w!(frame_root.frame()).len().min(5))
@@ -10551,11 +10468,6 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     if cached_unsupported_jit_shape(code) != UnsupportedJitShape::None {
         return None;
     }
-    // A function-entry walk can reach every loop in the frame, unlike a
-    // backedge walk, so retain the conservative whole-frame gate here.
-    if !cached_for_iter_bodies_all_jit_safe(code) {
-        return None;
-    }
     if dump_bytecode_enabled() {
         if code.obj_name.as_str() == "fannkuch" && frame_root.frame().next_instr() == 0 {
             use std::sync::OnceLock;
@@ -10661,7 +10573,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         // this path never runs `execute_assembler`, so convert here too. A
         // recursive callee (`fib(n-1)`) arrives with a tagged-immediate arg
         // local; without this the compiled `GuardClass(n)` derefs the tag.
-        untag_tagged_frame_locals(frame_root.frame());
+        untag_tagged_frame_locals(&mut frame_root);
         let mut jit_state = build_jit_state(frame_root.frame(), info);
         let outcome = {
             let _frame_locals_root = FrameLocalsRoot::new(frame_root.frame());
@@ -10823,6 +10735,14 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     }
 
     if driver.is_tracing() {
+        return None;
+    }
+
+    // A function-entry walk can reach every loop in the frame. Decline only
+    // this newly armed trace when one of those bodies is unsafe; the frame
+    // continues in `eval_loop_jit`, where its back-edges tick independently
+    // and consult their own natural loop regions.
+    if !cached_function_entry_trace_is_jit_safe(code) {
         return None;
     }
 
@@ -13634,7 +13554,7 @@ mod tests {
         let module = compile_exec("def f(n):\n    return [i for i in range(n)]\n")
             .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
-        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -13664,7 +13584,7 @@ mod tests {
         ] {
             let module = compile_exec(source).expect("test code should compile");
             let code = function_code_from_module(&module, "f");
-            assert!(for_iter_bodies_all_jit_safe(&code));
+            assert!(function_entry_trace_is_jit_safe(&code));
             assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
         }
     }
@@ -13682,7 +13602,7 @@ mod tests {
         ] {
             let module = compile_exec(source).expect("test code should compile");
             let code = function_code_from_module(&module, "f");
-            assert!(!for_iter_bodies_all_jit_safe(&code));
+            assert!(!function_entry_trace_is_jit_safe(&code));
             assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
         }
     }
@@ -13695,7 +13615,7 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
-        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -13709,7 +13629,7 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "h");
-        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert!(function_entry_trace_is_jit_safe(&code));
     }
 
     #[test]
@@ -13722,7 +13642,7 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "g");
-        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -13736,7 +13656,7 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "k");
-        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -13748,7 +13668,7 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "run");
-        assert!(!for_iter_bodies_all_jit_safe(&code));
+        assert!(!function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
 
         let mut outer_header = usize::MAX;
@@ -13775,47 +13695,9 @@ mod tests {
             &code,
             outer_header
         ));
-        assert!(loop_region_contains_escaping_range_append(
-            &code,
-            outer_header
-        ));
         assert!(!for_iter_body_is_jit_safe_at(
             &code,
             final_for_iter.expect("fixture must contain the final comprehension")
-        ));
-    }
-
-    #[test]
-    fn range_consumed_by_len_is_not_an_escaping_append() {
-        use pyre_interpreter::{Instruction as I, compile_exec};
-        let module = compile_exec(
-            "def run(n):\n    escaped = []\n    i = 0\n    while i < n:\n        escaped.append(len(range(i)))\n        i += 1\n    return escaped\n",
-        )
-        .expect("test code should compile");
-        let code = function_code_from_module(&module, "run");
-
-        let mut loop_header = usize::MAX;
-        let mut arg_state = pyre_interpreter::OpArgState::default();
-        for (pc, unit) in code.instructions.iter().copied().enumerate() {
-            let (instr, op_arg) = arg_state.get(unit);
-            let target = match instr {
-                I::JumpBackward { delta } => {
-                    Some(skip_caches(&code, pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
-                }
-                I::JumpBackwardNoInterrupt { delta } => {
-                    Some((pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
-                }
-                _ => None,
-            };
-            if let Some(target) = target {
-                loop_header = loop_header.min(target);
-            }
-        }
-
-        assert_ne!(loop_header, usize::MAX);
-        assert!(!loop_region_contains_escaping_range_append(
-            &code,
-            loop_header
         ));
     }
 
@@ -13879,7 +13761,7 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "s");
-        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -13908,7 +13790,7 @@ mod tests {
         .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
 
-        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -13950,7 +13832,7 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
-        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -13963,7 +13845,7 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
-        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -13977,7 +13859,7 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
-        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -13996,7 +13878,7 @@ mod tests {
                 .copied()
                 .any(|unit| { matches!(arg_state.get(unit).0, Instruction::StoreDeref { .. }) })
         );
-        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -14010,7 +13892,7 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
-        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -14024,7 +13906,7 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
-        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -14036,7 +13918,7 @@ mod tests {
             compile_exec("def w(src, o):\n    for i in src:\n        o.x = i\n    return o.x\n")
                 .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
-        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -14048,7 +13930,7 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
-        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -14064,7 +13946,7 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "r");
-        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert!(function_entry_trace_is_jit_safe(&code));
         assert!(!for_iter_frame_has_raising_named_handler(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
@@ -14083,7 +13965,7 @@ mod tests {
         let code = function_code_from_module(&module, "r");
         // The body opcodes themselves stay admissible; only the frame-level
         // handler shape declines.
-        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert!(function_entry_trace_is_jit_safe(&code));
         assert!(for_iter_frame_has_raising_named_handler(&code));
         assert_eq!(
             unsupported_jit_shape(&code),
@@ -14131,7 +14013,7 @@ mod tests {
         // the guard-failure bridge. The frame is admitted for tracing.
         // The body is kept free of `FOR_ITER` so the only classification axis
         // is the `WITH_EXCEPT_START` shape; a `for` loop whose body is not
-        // allow-listed declines independently via `for_iter_bodies_all_jit_safe`.
+        // allow-listed declines independently via `function_entry_trace_is_jit_safe`.
         use pyre_interpreter::compile_exec;
         let module = compile_exec(
             "def wf(cm):\n    total = 0\n    with cm:\n        total += 1\n    return total\n",

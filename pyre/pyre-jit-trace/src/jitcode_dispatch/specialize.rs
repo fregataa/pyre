@@ -7547,12 +7547,16 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
 ///
 /// `getframe` is `@jit.look_inside_iff(lambda space, depth:
 /// jit.isconstant(depth))` (`pypy/module/sys/vm.py:41`), so a constant depth is
-/// traced THROUGH: `ec.gettopframe_nohidden()` is a vref read that
-/// `pyjitpl.py:2153-2172 _do_jit_force_virtual` answers with
-/// `virtualizable_boxes[-1]` under a `ptr_eq` + `implement_guard_value`, the
-/// `depth == 0` test folds away, and `mark_as_escaped` is one `setfield_gc`.
-/// No call and no virtualizable force anywhere — pypy3 reports `forcings: 0`
-/// and `abort: vable escape: 0` on the fixtures where pyre loses the loop.
+/// traced THROUGH: at the portal, `ec.gettopframe_nohidden()` is a vref read
+/// that `pyjitpl.py:2153-2172 _do_jit_force_virtual` answers with
+/// `virtualizable_boxes[-1]` under a `ptr_eq` + `implement_guard_value`; in an
+/// inline MIFrame its live `JitVirtualRef` is known non-standard and follows
+/// the residual `jit_force_virtual` path, which `virtualize.py` removes after
+/// `vrefs_after_residual_call` publishes the forced pair.  The `depth == 0`
+/// test folds away, and `mark_as_escaped` is one `setfield_gc`.
+/// No call survives optimization and no virtualizable is forced — pypy3
+/// reports `forcings: 0` and `abort: vable escape: 0` on the fixtures where
+/// pyre loses the loop.
 ///
 /// Pyre residualizes the same walk as one opaque `bh_call_fn(_getframe,
 /// PY_NULL, depth)` `CallMayForce`, and [`pyre_interpreter::module::sys::vm::getframe`]'s
@@ -7726,6 +7730,29 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
         }
         frame
     };
+    // A hop whose `f_backref` is a live `JitVirtualRef` names another INLINED
+    // frame, and this walk publishes a forced pair only for the level it owns
+    // (`pyjitpl.py:3349-3367 vrefs_after_residual_call`).  The emitted
+    // `jit_force_virtual` then reaches a vref the optimizer materialises with a
+    // null `forced` field, so the hop lands on whatever that read produces
+    // rather than on the caller's frame.  Scan the record-time chain for one
+    // before anything is emitted: the seed below forces the walk's own vref for
+    // real and finishes its pair, so a later decline would leave the residual
+    // `getframe` a shorter chain than the interpreter's.  Non-virtual slots
+    // hold the frame pointer itself (`_jit_vref.py:40`), so following them here
+    // forces nothing.
+    {
+        let mut scan = frame;
+        for _ in 0..depth_value {
+            let raw = unsafe { (*scan).f_backref };
+            if raw.is_null()
+                || unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(raw as *const u8) }
+            {
+                return Ok(None);
+            }
+            scan = raw;
+        }
+    }
 
     // --- emit the specialized IR (walker-native) ---
     let pre_emit_pos = ctx.trace_ctx.get_trace_position();
@@ -7795,12 +7822,12 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     let mut cur_op = vable_op;
     let mut cur_ptr = frame;
     for _ in 0..depth_value {
+        let raw_ptr = unsafe { (*cur_ptr).f_backref };
         let raw_op = crate::state::opimpl_getfield_gc_r(
             ctx.trace_ctx,
             cur_op,
             crate::descr::pyframe_f_backref_descr(),
         );
-        let raw_ptr = unsafe { (*cur_ptr).f_backref };
         ctx.trace_ctx.set_opref_concrete(
             raw_op,
             majit_ir::Value::Ref(majit_ir::GcRef(raw_ptr as usize)),

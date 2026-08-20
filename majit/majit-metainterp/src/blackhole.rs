@@ -697,8 +697,16 @@ impl BlackholeInterpreter {
         self.tmpreg_i
     }
 
-    pub fn get_tmpreg_r(&self) -> i64 {
-        self.tmpreg_r
+    /// blackhole.py:368-373 `get_tmpreg_r`.
+    ///
+    /// Reference scratch values are GC-visible while a blackhole is running,
+    /// so consuming one must clear the slot immediately.  Leaving the last
+    /// value here keeps an otherwise-dead object alive until the whole frame
+    /// leaves blackhole mode.
+    pub fn get_tmpreg_r(&mut self) -> i64 {
+        let result = self.tmpreg_r;
+        self.tmpreg_r = 0;
+        result
     }
 
     pub fn get_tmpreg_f(&self) -> i64 {
@@ -842,7 +850,7 @@ impl BlackholeInterpreter {
     ///
     /// Rare case: the blackhole interps all returned normally
     /// (in general we get a ContinueRunningNormally exception).
-    fn done_with_this_frame(&self) -> JitException {
+    fn done_with_this_frame(&mut self) -> JitException {
         match self.return_type {
             BhReturnType::Void => JitException::DoneWithThisFrameVoid,
             BhReturnType::Int => JitException::DoneWithThisFrameInt(self.get_tmpreg_i()),
@@ -2598,12 +2606,16 @@ fn handle_jitexception(
     // blackhole.py:1764: while blackholeinterp.jitcode.jitdriver_sd is None
     while bh.jitcode.jitdriver_sd().is_none() {
         let next = bh.nextblackholeinterp.take();
-        // `pyopcode.py:184 handle_operation_error` — the no-handler propagation
-        // out of a frame stores `frame_finished_execution = True` there too, and
-        // this walk is exactly that: each level it discards on the way to the
-        // portal has been left by an exception it did not catch.  The `Ok` arm's
-        // twin store sits in `run_forever_with_portal`, which never sees these
-        // levels.
+        // `pyopcode.py:184 handle_operation_error` stores
+        // `frame_finished_execution = True` on the route that propagates out
+        // of a frame without a handler, and `executioncontext.py:91 leave`
+        // takes `got_exception` — both run on the unwind, not only on the
+        // return.  These levels are the ones the walk abandons on its way to
+        // the portal: their chain link is dropped here and never resumes, so
+        // this is where each one leaves.  The `Ok` arm's twin store sits in
+        // `run_forever_with_portal`, which never sees these levels.  Without
+        // the callback a traceback that retains such a frame refuses
+        // `frame.clear()`.
         if let Some(on_leave_level) = on_leave_level {
             on_leave_level(bh.virtualizable_ptr);
         }
@@ -2736,9 +2748,9 @@ pub fn run_forever_with_portal(
         // caller by one of those two routes, so its frame's execution is over.
         // Threaded from the interpreter side for the same reason as
         // `on_enter_level` — the transition is a property of the embedder's
-        // frame object, which majit-metainterp cannot name.  The bottommost
-        // level never arrives: it leaves through `handle_jitexception`'s
-        // propagating arm, which returns above.
+        // frame object, which majit-metainterp cannot name.  A level that
+        // unwinds instead of returning never arrives here; `handle_jitexception`
+        // calls the same callback for each level it abandons on its walk.
         if let Some(on_leave_level) = on_leave_level {
             on_leave_level(bh.virtualizable_ptr);
         }
@@ -3928,6 +3940,18 @@ mod tests {
             );
         }
 
+        /// `blackhole.py:get_tmpreg_r` consumes its GC-visible scratch slot.
+        /// Keeping the value there until frame release retains a dead result
+        /// throughout any remaining blackhole execution.
+        #[test]
+        fn get_tmpreg_r_clears_the_consumed_reference() {
+            let mut bh = BlackholeInterpreter::default();
+            bh.tmpreg_r = 0x7f00_0000_9abc;
+
+            assert_eq!(bh.get_tmpreg_r(), 0x7f00_0000_9abc);
+            assert_eq!(bh.tmpreg_r, 0);
+        }
+
         /// The caught exception is reachable from the root walker while the
         /// frame's handler runs.
         ///
@@ -4319,6 +4343,80 @@ mod tests {
                     crate::jitexc::JitException::DoneWithThisFrameInt(999)
                 ),
                 "the caller must return the portal runner's result, got {outcome:?}",
+            );
+        }
+
+        /// `blackhole.py:1759` is the single position a returning level leaves
+        /// from, so `on_leave_level` fires once there per level.  The store the
+        /// callback carries (`frame_finished_execution`) is idempotent and
+        /// hides a second fire, but the embedder hangs per-leave bookkeeping
+        /// off the same callback — pyre returns one recursion unit per level —
+        /// and a duplicate retires the caller's unit while the caller is still
+        /// running.
+        #[test]
+        fn the_leave_callback_fires_once_for_the_level_that_returns() {
+            const INNER_VABLE: i64 = 0x1111;
+            const CALLER_VABLE: i64 = 0x2222;
+
+            let mut sub = JitCodeBuilder::default();
+            sub.jit_merge_point(0, &[], &[], &[], &[], &[], &[]);
+            let sub_jitcode = sub.finish();
+
+            let mut inner_b = JitCodeBuilder::default();
+            let sub_idx = inner_b.add_sub_jitcode(sub_jitcode);
+            inner_b.inline_call_ir_v(sub_idx, &[], &[], None);
+            inner_b.load_const_i_value(1, 7);
+            inner_b.int_return(1);
+            let inner_jitcode = inner_b.finish();
+            inner_jitcode.set_jitdriver_sd(0);
+
+            let mut caller_b = JitCodeBuilder::default();
+            caller_b.load_const_i_value(0, 42);
+            let caller_resume = caller_b.current_pos();
+            caller_b.int_return(0);
+            let caller_jitcode = caller_b.finish();
+
+            let mut builder = super::build_inline_call_only_bh_builder();
+            let mut caller = builder.acquire_interp();
+            caller.setposition(std::sync::Arc::new(caller_jitcode), caller_resume);
+            caller.virtualizable_ptr = CALLER_VABLE;
+            let mut inner = builder.acquire_interp();
+            inner.setposition(std::sync::Arc::new(inner_jitcode), 0);
+            inner.virtualizable_ptr = INNER_VABLE;
+            inner.nextblackholeinterp = Some(Box::new(caller));
+
+            let left = std::cell::RefCell::new(Vec::new());
+            let on_leave_level = |ptr: i64| left.borrow_mut().push(ptr);
+            let portal_runner =
+                |_exc: &crate::jitexc::JitException| Ok((super::BhReturnType::Int, 999));
+            let outcome = super::run_forever_with_portal(
+                &mut builder,
+                inner,
+                0,
+                Some(&portal_runner),
+                None,
+                Some(&on_leave_level),
+                None,
+            );
+            assert!(
+                matches!(
+                    outcome,
+                    crate::jitexc::JitException::DoneWithThisFrameInt(999)
+                ),
+                "the caller must return the portal runner's result, got {outcome:?}",
+            );
+            // One entry per level, in the order each was left.  The inner
+            // level leaves through `run_forever_with_portal`'s post-return
+            // store; the caller carries no `jitdriver_sd`, so it is not the
+            // portal level `handle_jitexception` stops at but one of the
+            // levels its walk releases, and it leaves there.  Two entries for
+            // two levels is the contract — a repeat of either would be the
+            // double store that retires a still-running caller's recursion
+            // unit.
+            assert_eq!(
+                left.into_inner(),
+                vec![INNER_VABLE, CALLER_VABLE],
+                "one leave per level, none twice",
             );
         }
 
@@ -6126,7 +6224,7 @@ fn bhimpl_int_pop(bh: &mut BlackholeInterpreter) -> i64 {
 
 /// blackhole.py:674-676 `bhimpl_ref_pop(self): return self.get_tmpreg_r()`.
 fn bhimpl_ref_pop(bh: &mut BlackholeInterpreter) -> i64 {
-    bh.tmpreg_r
+    bh.get_tmpreg_r()
 }
 
 /// blackhole.py:677-679 `bhimpl_float_pop(self): return self.get_tmpreg_f()`.

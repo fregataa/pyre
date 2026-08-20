@@ -3116,12 +3116,23 @@ fn try_adopt_multi_frame_blackhole(
         (*(cf_addr as *mut pyre_interpreter::PyFrame)).execution_context
             as *mut pyre_interpreter::PyExecutionContext
     };
-    // Rooted for the whole drive: frames themselves never move, but once the
-    // tracer stores a `JitVirtualRef` in the chain the displaced value is a
-    // nursery object, and a collection inside the drive would leave the
-    // restore below writing back a pre-move pointer.
+    // Rooted for the whole drive: once the tracer stores a `JitVirtualRef` in
+    // the chain the displaced value is a nursery object, and a collection
+    // inside the drive would leave the restore below writing back a pre-move
+    // pointer.
     let saved_root =
         majit_gc::shadow_stack::push(majit_ir::GcRef(unsafe { (*ec).topframeref } as usize));
+    // The live frame is rooted for the same window and for a stronger reason:
+    // a compiled trace allocates an inlined callee's `PyFrame` with its own
+    // `NewWithVtable`, which the GC rewriter lowers to a nursery allocation,
+    // so the first minor collection the chain triggers moves it.  Every read
+    // of `root_addr` below the drive — the fold into the snapshot, the CRN
+    // handoff, the raise coordinate — would otherwise take the vacated block,
+    // whose `valuestackdepth` and locals are free nursery space.  This is the
+    // same recovery the single-frame path makes from its post-drive frame
+    // register, and the same hazard `resume_mainloop` roots each level's
+    // `virtualizable_ptr` slot against.
+    let live_root = majit_gc::shadow_stack::push(majit_ir::GcRef(root_addr));
     // `enter`: publish `ec.topframeref = <this level's frame>` before it runs.
     let set_topframeref = |frame_ptr: i64| unsafe {
         (*ec).topframeref = frame_ptr as *mut pyre_interpreter::PyFrame;
@@ -3129,7 +3140,35 @@ fn try_adopt_multi_frame_blackhole(
     // `pyopcode.py:239-241 RETURN_VALUE` / `pyopcode.py:184
     // handle_operation_error`: mark each level finished as it returns to its
     // caller, the store the walker performs at the `*_return` jitcode ops.
-    let finish_level = |frame_ptr: i64| crate::state::finish_blackhole_level_frame(frame_ptr);
+    //
+    // A frame costs exactly one recursion unit however it runs
+    // (`enter_recursive_frame`), and driving one here is the fourth way, the
+    // one that charges nothing on its own: every level below the root was
+    // minted by the walk rather than by an interpreter activation.  Charge
+    // them for the drive and give each unit back as its level returns, so a
+    // recursion that bottoms out inside the drive sees the budget it would
+    // have seen interpreted -- otherwise `sys.setrecursionlimit`'s cutoff
+    // moves by the chain's depth on exactly the round an abort is adopted.
+    // The root is already accounted and never reaches the leave callback, so
+    // omit it: the vector then contains exactly one guard for every callback
+    // pop, in outer-to-inner order.
+    let level_recursion = std::cell::RefCell::new(
+        per_frame
+            .iter()
+            .skip(1)
+            .map(|&(frame_ptr, _)| {
+                pyre_interpreter::call::enter_recursive_frame(
+                    frame_ptr as *const pyre_interpreter::PyFrame,
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
+    let finish_level = |frame_ptr: i64| {
+        crate::state::finish_blackhole_level_frame(frame_ptr);
+        // Levels return innermost-first, so this pops the guards in the order
+        // they were taken, reversed.
+        level_recursion.borrow_mut().pop();
+    };
     // EXPERIMENT: multi-frame runs full outer-frame bodies, so it needs a
     // full-coverage dispatch table, not the inline-call-only builder.
     let (mut mf_builder, _unwired) =
@@ -3162,6 +3201,8 @@ fn try_adopt_multi_frame_blackhole(
     // reading the root back so an in-place forward during the drive is kept.
     let saved_topframeref =
         majit_gc::shadow_stack::get(saved_root).0 as *mut pyre_interpreter::PyFrame;
+    // The authoritative post-drive identity of the frame the chain ran on.
+    let root_addr = majit_gc::shadow_stack::get(live_root).0;
     majit_gc::shadow_stack::pop_to(saved_root);
     unsafe {
         (*ec).topframeref = saved_topframeref;
@@ -4120,71 +4161,22 @@ fn run_perfn_walk<Sym: WalkSym>(
         // so this general leg cannot pre-empt them:
         // `VableEscapedDuringResidualCall` latches a narrower resume-marker
         // image and has an escape-pc fallback (arm below);
-        // `LoopBearingCalleeInlineUnsupported` and
-        // `AbortPermanentMarkerReached` route to the gh#467 CALL-forward
+        // `LoopBearingCalleeInlineUnsupported { blackhole_required: false }`
+        // and `AbortPermanentMarkerReached` route to the gh#467 CALL-forward
         // carrier, which resumes the OUTER frame at its CALL rather than
-        // inside the discarded callee attempt.  Only the first of those two is
-        // named below: `AbortPermanentMarkerReached` never reaches this leg
-        // because it is absent from `leaves_complete_image`'s allow-list, which
-        // gates the `matches!` entirely.  `ForceQuasiImmutable` resumes AT the
-        // forcing opcode via `flush_qmut_abort_state` (arm below), which re-runs
-        // the write the walk stopped in front of instead of finishing the frame
-        // past it.
-        //
-        // The `LoopBearingCalleeInlineUnsupported` arm only ever excludes the
-        // nested-residual variant marked `blackhole_required: true`: the plain
-        // decline is already outside `leaves_complete_image`'s allow-list and
-        // keeps the carrier either way.  That variant DOES own a complete
-        // per-frame image, and it had two separate blockers.  The first is
-        // closed: the blackhole did not publish `PyFrame.finish_value`'s
-        // `frame_finished_execution` store, which this codewriter lowers into
-        // the `*_return` operation instead of emitting — the walker re-emits it
-        // (`finish_current_frame_execution`) and the interpreter performs it on
-        // RETURN_VALUE, and the drive now performs it at every level it leaves
-        // (`state::finish_blackhole_level_frame`, wired as `on_leave_level`),
-        // so a frame it finished no longer reads back as executing.  That is
-        // what `parity_tests/jit_inline_traceback_frame_clear.py` needs on
-        // `sys._getframe().clear()`.
-        //
-        // The second blocker is PERMANENT, and it is why this arm stays.  A
-        // multi-frame image stacks the CALLEE above its CALLER, so every frame
-        // but the bottom one has a `nextblackholeinterp`.  `bhimpl_jit_merge_point`
-        // (`blackhole.py:1066-1093`) reads exactly that as the RECURSIVE PORTAL
-        // level: with a next interpreter present it takes
-        // `bhimpl_recursive_call_{i,r,f,v}`, parks the portal's result in
-        // `tmpreg_*`, sets `return_type`, and raises `LeaveFrame`.  That is
-        // correct upstream, where a portal jitdriver's merge point occurs only in
-        // the portal frame — but this decline is
-        // `LoopBearingCalleeInlineUnsupported`, which reports that the callee
-        // bears a loop, and a loop-bearing callee carries its own
-        // merge point at that loop's header.  The callee therefore hits its merge
-        // point BEFORE it ever reaches a `*_return`, and the caller below it
-        // receives that `tmpreg_*` as the callee's return value.
-        //
-        // Measured on `inline_subwalk_user_iterator`, whose `step` bears the
-        // `for x in it` loop: the image is `[run@1054, step@260]`, `step` runs a
-        // straight line from its resume to the `jit_merge_point` at its loop
-        // header and leaves there with `ret_type=Ref`, and `run` resumes holding
-        // the iterator — the ref live in the merge point's red list — where its
-        // call result belongs, ending in `unsupported operand type(s) for +:
-        // 'int' and 'object'`.  `list_append_write_barrier_gc` reproduces it
-        // independently on `[big_live_len_regrow@1191, churn@162]`, where `churn`
-        // leaves at the merge point of its own `for i in range(k)` loop — the very
-        // frame the failing traceback ends on — surfacing instead as `stack
-        // underflow during interpreter peek` off a traceback whose frames are
-        // interleaved, `str(i)` appearing to call `churn`.  Ten further
-        // fixtures answer `fbw_blackhole_adopted_multi_frame 0 -> 1`, so the
-        // handoff is reached broadly; the two failures are the shapes whose
-        // callee reaches its own merge point first, not a corner.
-        // `PYRE_WALKABORT_OFF=1` is the control: both fixtures pass with the
-        // leg disabled.
-        //
-        // So the handoff cannot represent "callee paused inside its own loop with
-        // its caller below it" at all, and the gh#467 CALL-forward carrier — which
-        // rewinds the OUTER frame to its CALL and re-runs the callee whole — is
-        // the only correct route for this decline.  Narrowing the arm to "refuse
-        // when a non-bottom frame can reach a merge point before returning" would
-        // exclude the same set, since bearing a loop is what this decline reports.
+        // inside the discarded callee attempt.  The nested-residual variant
+        // marked `blackhole_required: true` is the one this leg owns, and only
+        // once the walk has actually executed something: that is the whole
+        // claim the flag makes — residuals ran that a rewind-to-the-CALL would
+        // repeat — and it carries a complete per-frame image.  It stays here
+        // only because the drive now publishes each returning level's
+        // `frame_finished_execution` (`on_leave_level`); before that a frame
+        // outliving the call read back as still executing, which
+        // `parity_tests/jit_inline_traceback_frame_clear.py` catches on
+        // `sys._getframe().clear()` once the loop compiles.
+        // `ForceQuasiImmutable` resumes AT the forcing opcode via
+        // `flush_qmut_abort_state` (arm below), which re-runs the write the
+        // walk stopped in front of instead of finishing the frame past it.
         //
         // And only for an abort whose image is COMPLETE
         // (`DispatchError::leaves_complete_image`).  Pyre's walker has a whole
@@ -4206,7 +4198,10 @@ fn run_perfn_walk<Sym: WalkSym>(
                 error,
                 crate::jitcode_dispatch::DispatchError::TraceTooLong { .. }
                     | crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. }
-                    | crate::jitcode_dispatch::DispatchError::LoopBearingCalleeInlineUnsupported { .. }
+                    | crate::jitcode_dispatch::DispatchError::LoopBearingCalleeInlineUnsupported {
+                        blackhole_required: false,
+                        ..
+                    }
                     | crate::jitcode_dispatch::DispatchError::ForceQuasiImmutable { .. }
             ))
             && walk_abort_leg_enabled()
