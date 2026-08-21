@@ -66,7 +66,10 @@ fn field_spec_from_bh(
     majit_ir::descr::SimpleFieldDescrSpec {
         index: f.index,
         field_key: f.field_key().to_string(),
-        is_class_word: majit_ir::descr::class_word_inferred_from_name(&f.name),
+        // Carry the producer's declaration through unchanged, `None` included:
+        // a spec that declared nothing leaves the question to the name
+        // fallback rather than arriving as a declaration of the guess.
+        is_class_word: f.is_class_word,
         name: f.name.clone(),
         offset: f.offset,
         field_size: f.field_size,
@@ -241,9 +244,10 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                                 specs.push(majit_ir::descr::SimpleFieldDescrSpec {
                                     index: u32::MAX,
                                     field_key: name.clone(),
-                                    is_class_word: majit_ir::descr::class_word_inferred_from_name(
-                                        name,
-                                    ),
+                                    // The container name is all this arm
+                                    // has; nothing declared, so the descr
+                                    // infers from it.
+                                    is_class_word: None,
                                     name: name.clone(),
                                     offset: *offset,
                                     field_size: *field_size,
@@ -376,7 +380,10 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                         let spec = majit_ir::descr::SimpleFieldDescrSpec {
                             index: u32::MAX,
                             field_key: name.clone(),
-                            is_class_word: majit_ir::descr::class_word_inferred_from_name(name),
+                            // A parentless field with no layout carrier:
+                            // nothing declared, so the descr infers from the
+                            // name.
+                            is_class_word: None,
                             name: name.clone(),
                             offset: *offset,
                             field_size: *field_size,
@@ -547,7 +554,9 @@ pub fn residual_write_effect_info(
                 majit_ir::descr::SimpleFieldDescrSpec {
                     index: u32::MAX,
                     field_key: name.to_string(),
-                    is_class_word: majit_ir::descr::class_word_inferred_from_name(name),
+                    // The layout table names fields but declares no header
+                    // row, so the descr infers from the name.
+                    is_class_word: None,
                     name: name.to_string(),
                     offset,
                     // Same width rule as the `field_specs_from_layout` twin
@@ -6041,7 +6050,15 @@ where
                                 .close_green_key_hash()
                                 .zip(ctx.has_compiled_targets_fn.as_ref())
                                 .is_some_and(|(key, f)| f(key));
-                            let close_key = ctx.close_green_key_hash().unwrap_or(ctx.green_key);
+                            // Take the structured key and derive the hash from
+                            // it, rather than taking the hash and leaving the
+                            // key behind: the merge point this registers is
+                            // later read by consumers that install cell flags,
+                            // and a hash alone reaches a cell only by bucket.
+                            let (close_key, close_key_typed) = match ctx.close_green_key() {
+                                Some(k) => (k.get_uhash(), Some(k)),
+                                None => (ctx.green_key, ctx.green_key_values().cloned()),
+                            };
                             if !already_compiled_here
                                 && !ctx.has_merge_point_at(close_key, ctx.header_pc)
                             {
@@ -6064,7 +6081,12 @@ where
                                         ctx.num_ops(),
                                     );
                                 }
-                                ctx.add_merge_point(close_key, original_boxes, ctx.header_pc);
+                                ctx.add_merge_point_with_key(
+                                    close_key,
+                                    close_key_typed,
+                                    original_boxes,
+                                    ctx.header_pc,
+                                );
                                 return TraceAction::Continue;
                             }
                         }
@@ -6185,9 +6207,15 @@ where
                             mp_green_refs.clone(),
                             mp_green_floats.clone(),
                         );
-                        let Some(inner_key) = ctx.merge_point_green_key_hash(pc, &mp_greens) else {
+                        // The structured key first, hash second: this merge
+                        // point is registered below and later read by the
+                        // segmenting consumers, which install cell flags and
+                        // so need a key a chain walk can match, not a bucket.
+                        let Some(inner_key_typed) = ctx.merge_point_green_key(pc, &mp_greens)
+                        else {
                             return TraceAction::Continue;
                         };
+                        let inner_key = inner_key_typed.get_uhash();
                         let already_compiled_here = ctx
                             .has_compiled_targets_fn
                             .as_ref()
@@ -6349,7 +6377,12 @@ where
                                     ctx.num_ops(),
                                 );
                             }
-                            ctx.add_merge_point(inner_key, original_boxes, header_pc);
+                            ctx.add_merge_point_with_key(
+                                inner_key,
+                                Some(inner_key_typed),
+                                original_boxes,
+                                header_pc,
+                            );
                         }
                     }
                 }
@@ -10440,6 +10473,7 @@ mod tests {
             is_immutable: false,
             is_quasi_immutable: false,
             index_in_parent: 0,
+            is_class_word: None,
         };
         crate::blackhole::BhDescr::Field {
             offset: 0,

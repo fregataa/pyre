@@ -844,7 +844,7 @@ fn build_object_descr_group_with_extra_gc_edges(
                 // function was found on) whose qualified name
                 // `"Method.w_class"` matches the header spelling exactly, and
                 // it sits ahead of the real header in the field list.
-                is_class_word: offset == pyre_object::pyobject::W_CLASS_OFFSET,
+                is_class_word: Some(offset == pyre_object::pyobject::W_CLASS_OFFSET),
                 index_in_parent,
             },
         )
@@ -2556,7 +2556,7 @@ pub fn make_array_descr_with_full_id(
     )
 }
 
-// ── Range iterator field descriptors ─────────────────────────────────
+// Range iterator field descriptors.
 
 use pyre_object::floatobject::{
     FLOAT_FLOATVAL_OFFSET, FLOAT_W_DICT_OFFSET, FLOAT_W_SLOTS_OFFSET, W_FloatObject,
@@ -3825,7 +3825,7 @@ pub fn str_len_descr() -> DescrRef {
     field_descr_from_group(&W_UNICODE_DESCR_GROUP, 2)
 }
 
-// ── Object header & allocation descriptors ──────────────────────────
+// Object header and allocation descriptors.
 
 /// `PyCode.code_ptr` — the host `CodeObject` every code-field getter resolves
 /// through (`code_get_field` -> `require_code`).  Read only to prove it is
@@ -3864,7 +3864,7 @@ static PYCODE_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLoc
         // is the class word and `class_word_field` answers `None` for this
         // layout. Testing `offset == W_CLASS_OFFSET` the way the object-group
         // factory does would read as if the header could appear here.
-        is_class_word: false,
+        is_class_word: Some(false),
         index_in_parent: 0,
     };
     let mut specs = vec![
@@ -4727,7 +4727,7 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
         // word. Its offsets are `EC_*` and share no origin with
         // `W_CLASS_OFFSET`, so matching on offset here would be a coincidence,
         // not an invariant.
-        is_class_word: false,
+        is_class_word: Some(false),
         // Stamped below, once the specs are in offset order.
         index_in_parent: 0,
     };
@@ -5026,9 +5026,9 @@ mod tests {
     /// Every layout's class word is the inherited `PyObject` header slot, and
     /// both accessors must name that one field.
     ///
-    /// `SimpleFieldDescr`'s legacy producer infers `is_w_class` from the field
+    /// `SimpleFieldDescr` falls back to inferring `is_w_class` from the field
     /// name (`class_word_inferred_from_name`: `== "w_class"` or
-    /// `ends_with(".w_class")`), and
+    /// `ends_with(".w_class")`) when nothing declared, and
     /// `build_object_descr_group_with_extra_gc_edges` qualifies every name
     /// with the group's simple name.  So a group that declares a payload field
     /// literally called `w_class` publishes *two* descrs reporting
@@ -5038,6 +5038,13 @@ mod tests {
     /// Both halves are asserted because the two accessors read different lists:
     /// `class_word_field` answers a byte offset off `gc_fielddescrs`, and
     /// `class_word_index_in_parent` a slot position off `all_fielddescrs`.
+    /// Each is asserted *per group*, `None` included, since a group that stops
+    /// answering is invisible to any check phrased over the groups that still
+    /// do.  The two lists differ in what an answer is owed for:
+    /// `gc_fielddescrs` carries the shared header edge for every group, so
+    /// `class_word_field` must always answer; `all_fielddescrs` holds the
+    /// header row only for the groups that list it, so
+    /// `class_word_index_in_parent` must answer exactly for those.
     #[test]
     fn every_groups_class_word_is_the_inherited_pyobject_header_slot() {
         let groups: &[(&str, DescrRef)] = &[
@@ -5065,29 +5072,58 @@ mod tests {
         // Violations are accumulated rather than asserted in place: a test that
         // stops at the first bad group reports which one comes *first*, not
         // which ones are wrong, and the population is the finding here.
+        // Every group is checked for an answer, not just for a wrong answer,
+        // because counting the groups that *did* answer cannot see a group
+        // that stopped: one answering group satisfies a population count while
+        // every other group is dark.  What "must answer" means differs per
+        // accessor and is spelled out at each one below.
         let mut violations: Vec<String> = Vec::new();
-        let mut positional_answers = 0usize;
         for (label, descr) in groups {
             let size = descr
                 .as_size_descr()
                 .unwrap_or_else(|| panic!("{label} must be a SizeDescr"));
 
             // (a) the byte-offset answer names the header slot
-            if let Some(fd) = size.class_word_field()
-                && fd.offset() != W_CLASS_OFFSET
-            {
-                violations.push(format!(
+            match size.class_word_field() {
+                None => violations.push(format!(
+                    "{label}: class_word_field() = None — a PyObject layout \
+                     whose header row declares nothing"
+                )),
+                Some(fd) if fd.offset() != W_CLASS_OFFSET => violations.push(format!(
                     "{label}: class_word_field() -> `{}` at offset {} (want the \
                      inherited PyObject header at {W_CLASS_OFFSET})",
                     fd.field_name(),
                     fd.offset(),
-                ));
+                )),
+                Some(_) => {}
             }
 
-            // (b) the positional answer indexes that same field
-            if let Some(idx) = size.class_word_index_in_parent() {
-                positional_answers += 1;
-                match size.all_fielddescrs().get(idx) {
+            // (b) the positional answer indexes that same field, and answers
+            // at all exactly when this group's own positional list holds the
+            // header row.  Ten of the groups below reach the header only as a
+            // gc-only edge, which `with_extra_gc_fielddescr` keeps out of
+            // `all_fielddescrs()` precisely so positional indexing is
+            // unaffected — for those `None` is the required answer, and a
+            // `Some` would mean some *payload* field claimed the class word.
+            let header_is_positional = size
+                .all_fielddescrs()
+                .iter()
+                .any(|fd| fd.offset() == W_CLASS_OFFSET);
+            match (size.class_word_index_in_parent(), header_is_positional) {
+                (None, true) => violations.push(format!(
+                    "{label}: class_word_index_in_parent() = None while \
+                     all_fielddescrs() does carry the header at \
+                     {W_CLASS_OFFSET} — the slot lost its declaration and \
+                     OptVirtualize's fold stops firing for this layout"
+                )),
+                (Some(idx), false) => violations.push(format!(
+                    "{label}: class_word_index_in_parent() = {idx} while \
+                     all_fielddescrs() carries no field at {W_CLASS_OFFSET} — \
+                     a payload field is claiming a header row this list does \
+                     not hold"
+                )),
+                (None, false) => {}
+                (Some(idx), true) => match size.all_fielddescrs().get(idx) {
                     None => violations.push(format!(
                         "{label}: class_word_index_in_parent() = {idx} is out of \
                          range for all_fielddescrs() (len {})",
@@ -5101,18 +5137,10 @@ mod tests {
                         fd.offset(),
                     )),
                     Some(_) => {}
-                }
+                },
             }
         }
 
-        // The accessor must not be able to degenerate to a constant `None`:
-        // that would silently disable OptVirtualize's class-word fold instead
-        // of correcting it, and every check above would still hold.
-        assert!(
-            positional_answers > 0,
-            "no group answered class_word_index_in_parent() — a fold that never \
-             fires is indistinguishable from a fold that is right"
-        );
         // This held two `Method` exceptions until the host gained a declaration
         // channel.  `Method` carries a payload field literally called `w_class`
         // — the class the bound function was found on, which
@@ -5123,8 +5151,12 @@ mod tests {
         // `find()` stopped on it in both lists.
         //
         // Now `build_object_descr_group_with_extra_gc_edges` declares
-        // `is_class_word: offset == W_CLASS_OFFSET`, a layout invariant a name
-        // rule cannot express, and the exceptions retired.
+        // `is_class_word: Some(offset == W_CLASS_OFFSET)`, a layout invariant a
+        // name rule cannot express, and the exceptions retired.  The
+        // declaration also outranks the guess on a `get_field_descr` cache hit
+        // and rides `BhFieldSpec` through serialization, so neither a
+        // name-only producer arriving first nor a blackhole round trip can put
+        // the payload field back.
         assert!(
             violations.is_empty(),
             "{} of {} groups resolve a class word that is not the inherited \
@@ -5324,6 +5356,96 @@ mod tests {
         assert!(!call.is_result_signed());
     }
 
+    /// A class-word declaration must survive serialization into a blackhole
+    /// spec and back.
+    ///
+    /// `BhFieldSpec` is the only channel between a layout producer and the
+    /// descriptors rebuilt from `descrs.bin`, so a flag it does not carry is a
+    /// flag the far side has to guess — and the guess
+    /// (`class_word_inferred_from_name`) reads a name, which a *payload* field
+    /// can spell exactly like its layout's header row. The synthetic layout
+    /// below is that shape: the payload at offset 24 is the one the name rule
+    /// picks, and the header at offset 8 is the one the layout declares.
+    #[test]
+    fn a_class_word_declaration_survives_the_blackhole_round_trip() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_translate::jitcode::{BhFieldSpec, BhSizeSpec};
+
+        let spec = |field_key: &str,
+                    name: &str,
+                    offset: usize,
+                    index_in_parent: usize,
+                    is_class_word: bool| {
+            majit_ir::descr::SimpleFieldDescrSpec {
+                index: index_in_parent as u32,
+                field_key: field_key.to_string(),
+                name: name.to_string(),
+                offset,
+                field_size: 8,
+                field_type: Type::Ref,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                flag: ArrayFlag::Pointer,
+                virtualizable: false,
+                index_in_parent,
+                is_class_word: Some(is_class_word),
+            }
+        };
+        let group = majit_ir::descr::make_simple_descr_group(
+            u32::MAX,
+            32,
+            0,
+            0,
+            &[
+                spec("w_class", "Synth.w_class", 24, 0, false),
+                spec("header", "Synth.header", 8, 1, true),
+            ],
+        );
+        assert_eq!(
+            group.size_descr.class_word_field().map(|fd| fd.offset()),
+            Some(8),
+            "the declaration outranks the name on the producing side"
+        );
+
+        let wire: Vec<BhFieldSpec> = group
+            .size_descr
+            .all_fielddescrs()
+            .iter()
+            .map(|fd| BhFieldSpec::from_field_descr(fd.as_ref()))
+            .collect();
+        assert_eq!(
+            (wire[0].is_class_word, wire[1].is_class_word),
+            (Some(false), Some(true)),
+            "the wire must carry the declaration, not the name's answer"
+        );
+
+        let bytes = bincode::serialize(&wire).expect("BhFieldSpec is a wire record");
+        let wire: Vec<BhFieldSpec> = bincode::deserialize(&bytes).expect("round trip");
+
+        // A `type_id` used by no other test: `simple_descr_group_from_bh_size`
+        // publishes into the process-global `gc_cache`, and an existing slot
+        // would answer from the producing side and prove nothing.
+        let rebuilt = simple_descr_group_from_bh_size(&BhSizeSpec {
+            size: 32,
+            type_id: 0xc1a5_0000_57ea_d001,
+            vtable: 0,
+            is_gc_managed: true,
+            headerless: false,
+            all_fielddescrs: wire,
+        });
+        assert_eq!(
+            rebuilt.size_descr.class_word_field().map(|fd| fd.offset()),
+            Some(8),
+            "a rebuilt descr that re-guessed from the name would answer the \
+             payload field at offset 24"
+        );
+        assert_eq!(
+            rebuilt.size_descr.class_word_index_in_parent(),
+            Some(1),
+            "the positional answer must index the declared header row"
+        );
+    }
+
     #[test]
     fn make_descr_from_bh_field_preserves_parent_name_index() {
         use majit_ir::descr::ArrayFlag;
@@ -5348,6 +5470,7 @@ mod tests {
                     is_immutable: false,
                     is_quasi_immutable: false,
                     index_in_parent: 0,
+                    is_class_word: None,
                 },
                 BhFieldSpec {
                     index: 1,
@@ -5361,6 +5484,7 @@ mod tests {
                     is_immutable: true,
                     is_quasi_immutable: false,
                     index_in_parent: 1,
+                    is_class_word: None,
                 },
             ],
         };
@@ -5413,6 +5537,7 @@ mod tests {
             is_immutable: false,
             is_quasi_immutable: false,
             index_in_parent: 0,
+            is_class_word: None,
         };
         let parent = BhSizeSpec {
             size: std::mem::size_of::<usize>(),
@@ -5704,6 +5829,7 @@ mod tests {
                 is_immutable: false,
                 is_quasi_immutable: false,
                 index_in_parent: 0,
+                is_class_word: None,
             },
             BhFieldSpec {
                 index: 1,
@@ -5717,6 +5843,7 @@ mod tests {
                 is_immutable: false,
                 is_quasi_immutable: false,
                 index_in_parent: 1,
+                is_class_word: None,
             },
         ];
         let owner = BhSizeSpec {
@@ -5833,11 +5960,10 @@ fn simple_field_spec_from_bh(
         is_quasi_immutable: spec.is_quasi_immutable,
         flag: spec.field_flag,
         virtualizable: false,
-        // `BhFieldSpec` carries no class-word flag, so a declaration does not
-        // survive the blackhole round trip and the name is all that is left.
-        // Inherits the fallback's limitation: a `Method.w_class` payload
-        // rebuilt from a blackhole spec still reads as a class word.
-        is_class_word: majit_ir::descr::class_word_inferred_from_name(&spec.name),
+        // The producer's declaration, carried straight through — `None`
+        // included, so a spec that declared nothing leaves the question to the
+        // name fallback instead of arriving as a declaration of a guess.
+        is_class_word: spec.is_class_word,
         index_in_parent: spec.index_in_parent,
     }
 }
@@ -6096,7 +6222,7 @@ fn field_descr_from_bh_field(
             // needs the `_cache_size` slot, so only take this route when it
             // is populated.
             if gc._cache_size.contains_key(&key) {
-                let fd = gc.get_field_descr(
+                let fd = gc.get_field_descr_declaring(
                     key,
                     &field_key,
                     Some(field.name.as_str()),
@@ -6109,6 +6235,11 @@ fn field_descr_from_bh_field(
                     field.index,
                     false,
                     claimed_index,
+                    // This is the route that lets a serialized spec populate
+                    // the `(STRUCT, fieldname)` slot a layout producer will
+                    // later find cached, so it carries the declaration rather
+                    // than leaving the name fallback to seed it.
+                    field.is_class_word,
                 );
                 return fd as DescrRef;
             }
@@ -6127,7 +6258,7 @@ fn field_descr_from_bh_field(
         }
     }
 
-    let descr = majit_ir::descr::SimpleFieldDescr::new_with_name(
+    let mut descr = majit_ir::descr::SimpleFieldDescr::new_with_name(
         field.index,
         field.offset,
         field.field_size,
@@ -6138,6 +6269,11 @@ fn field_descr_from_bh_field(
         field.field_key().to_string(),
     )
     .with_quasi_immutable(field.is_quasi_immutable);
+    // `new_with_name` seeded the answer from the display name; a spec that
+    // declared one replaces that guess. A spec that declared nothing leaves it.
+    if let Some(is_class_word) = field.is_class_word {
+        descr = descr.with_class_word(is_class_word);
+    }
     let arc: DescrRef = Arc::new(descr);
     // descr.py:225-235 `get_field_descr` cache-miss path — register the
     // freshly-minted field descr so `compute_bitstrings` enumerates it.
@@ -6716,6 +6852,9 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                 is_immutable: *is_immutable,
                 is_quasi_immutable: *is_quasi_immutable,
                 index_in_parent: index_in_parent.unwrap_or(0),
+                // A standalone `BhDescr::Field` carries no layout, so nothing
+                // here declares and the name is what the rebuild reads.
+                is_class_word: None,
             };
             // The claim itself goes beside the spec, unflattened.
             field_descr_from_bh_field(&field, parent.as_ref(), *index_in_parent)
