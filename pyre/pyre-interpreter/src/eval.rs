@@ -2513,16 +2513,31 @@ impl NamespaceOpcodeHandler for PyFrame {
             // the globals dict borrow-based via `getitem_str` + the cell cache).
             let w_globals = self.get_w_globals();
             if !std::ptr::eq(w_locals, w_globals) {
-                let key = unsafe { pyre_object::w_str_new(name) };
-                match crate::baseobjspace::getitem(w_locals, key) {
-                    Ok(value) => return Ok(value),
-                    Err(err) if matches!(err.kind, PyErrorKind::KeyError) => {
-                        // pyopcode.py:LOAD_NAME `if not w_value: w_value =
-                        // ec.space.finditem_str(self.w_globals, name)` —
-                        // a missing locals entry falls through to globals.
-                    }
-                    Err(err) => return Err(err),
+                // pyopcode.py:967-968 `w_value = space.finditem_str(
+                // self.getorcreatedebug().w_locals, varname)`. The probe is
+                // `finditem_str`, not `getitem`: an exact dict answers from its
+                // strategy with the borrowed key, so neither the wrapped key nor
+                // a KeyError is built. A class body reads every one of its names
+                // through here, and the names it does not bind itself — a module
+                // global, a builtin — miss on every pass, which is the miss that
+                // shortcut exists for. `finditem_str` keeps a dict subclass on
+                // the generic path, where a `__getitem__` or `__missing__`
+                // override still runs.
+                // `pyopcode.py:965 w_varname = self.getname_w(nameindex)`:
+                // the generic arm names its key through `co_names_w`, so a
+                // namespace that cannot use the borrowed-key shortcut — a
+                // `dict` subclass, a non-dict mapping — wraps no key of its own
+                // per execution either.
+                if let Some(value) = crate::baseobjspace::finditem_str_named(
+                    w_locals,
+                    name,
+                    self.pycode as PyObjectRef,
+                    nameindex,
+                )? {
+                    return Ok(value);
                 }
+                // pyopcode.py:972 — a missing locals entry falls through to
+                // `LOAD_GLOBAL_cached`.
             }
             return self.load_global_value(name, nameindex);
         }
@@ -2533,6 +2548,10 @@ impl NamespaceOpcodeHandler for PyFrame {
     /// pyopcode.py:855-859 STORE_NAME —
     /// `space.setitem_str(self.getorcreatedebug().w_locals, varname, w_value)`.
     ///
+    /// `nameindex` addresses the `co_names_w` slot naming the key on the
+    /// non-dict-mapping arm below; callers holding no index pass
+    /// [`crate::pyopcode::NO_NAMEINDEX`].
+    ///
     /// Writes straight to `w_locals` (the class namespace, or — at module
     /// scope — the globals dict). It must NOT route through `getdictscope`:
     /// that runs `fast2locals`, which would erase a module frame's
@@ -2541,24 +2560,17 @@ impl NamespaceOpcodeHandler for PyFrame {
     fn store_name_value(
         &mut self,
         name: &str,
-        _nameindex: usize,
+        nameindex: usize,
         value: Self::Value,
     ) -> Result<(), PyError> {
         let w_locals = self.get_or_create_w_locals();
-        // pyopcode.py:855-859 `space.setitem_str(w_locals, varname, w_value)`:
-        // a plain dict stores by str key through its strategy without
-        // materializing a throwaway `w_str` (an overwrite reuses the stored
-        // key; only a new name allocates one). This is the raw mapping store,
-        // not `__setitem__`, exactly as the object-keyed `setitem` resolves a
-        // dict below. A non-dict mapping (`exec(src, g, mapping)`) keeps the
-        // object-keyed path.
-        if unsafe { pyre_object::is_dict(w_locals) } {
-            unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str(w_locals, name, value);
-            }
+        let hash = crate::baseobjspace::named_key_hash(name, self.pycode as PyObjectRef, nameindex);
+        if store_name_into_dict(w_locals, name, hash, value) {
             return Ok(());
         }
-        let key = unsafe { pyre_object::w_str_new(name) };
+        let key = unsafe {
+            crate::pycode::w_code_getname_w_or_new(self.pycode as PyObjectRef, nameindex, name)
+        };
         crate::baseobjspace::setitem(w_locals, key, value)?;
         Ok(())
     }
@@ -2566,28 +2578,22 @@ impl NamespaceOpcodeHandler for PyFrame {
     /// pypy/interpreter/pyopcode.py:567 STORE_GLOBAL — bypasses w_locals
     /// and writes directly into w_globals so `exec("global x; x = 1", g, l)`
     /// lands `x` in `g` even when `l != g`.
+    ///
+    /// `nameindex` names the key through `co_names_w` on the dict-subclass arm;
+    /// callers holding no index pass [`crate::pyopcode::NO_NAMEINDEX`].
     fn store_global_value(
         &mut self,
         name: &str,
-        _nameindex: usize,
+        nameindex: usize,
         value: Self::Value,
     ) -> Result<(), PyError> {
         let w_globals = self.get_w_globals();
-        if !w_globals.is_null() {
-            // A real W_DictObject / W_ModuleDictObject can use the borrowed
-            // string strategy path.  Dict subclasses are ordinary instance
-            // objects in pyre, however, and must retain their mapping object
-            // identity just as PyPy's `space.setitem_str(w_globals, ...)`
-            // does.  Casting such an instance to W_DictObject corrupts the
-            // layout and also skips an overridden `__setitem__`.
-            if unsafe { pyre_object::is_dict(w_globals) } {
-                unsafe {
-                    pyre_object::dictmultiobject::w_dict_setitem_str(w_globals, name, value);
-                }
-            } else {
-                let key = unsafe { pyre_object::w_str_new(name) };
-                crate::baseobjspace::setitem(w_globals, key, value)?;
-            }
+        let hash = crate::baseobjspace::named_key_hash(name, self.pycode as PyObjectRef, nameindex);
+        if !w_globals.is_null() && !store_name_into_dict(w_globals, name, hash, value) {
+            let key = unsafe {
+                crate::pycode::w_code_getname_w_or_new(self.pycode as PyObjectRef, nameindex, name)
+            };
+            crate::baseobjspace::setitem(w_globals, key, value)?;
         }
         Ok(())
     }
@@ -2608,7 +2614,12 @@ impl NamespaceOpcodeHandler for PyFrame {
         // instead of being swallowed as a miss.
         let w_globals = self.get_w_globals();
         if !w_globals.is_null()
-            && let Some(value) = crate::baseobjspace::finditem_str(w_globals, name)?
+            && let Some(value) = crate::baseobjspace::finditem_str_named(
+                w_globals,
+                name,
+                self.pycode as PyObjectRef,
+                nameindex,
+            )?
         {
             return Ok(value);
         }
@@ -2748,6 +2759,97 @@ pub unsafe fn load_global_via_cache_extern(
         Ok(v) => v,
         Err(_) => None,
     }
+}
+
+/// `pyopcode.py:855-859 space.setitem_str(w_ns, varname, w_value)` on a real
+/// `W_DictObject` / `W_ModuleDictObject`: stores by borrowed `&str` through the
+/// strategy without materializing a throwaway `w_str` (an overwrite reuses the
+/// stored key; only a new name allocates one).  This is the raw mapping store,
+/// not `__setitem__`, exactly as the object-keyed `setitem` resolves a dict.
+///
+/// Answers `false` when `w_ns` is not a dict, leaving the caller on the
+/// object-keyed path: a dict subclass is an ordinary instance in pyre and must
+/// keep its mapping identity and any `__setitem__` override, and a non-dict
+/// mapping (`exec(src, g, mapping)`) has no strategy to store into.
+///
+/// `hash` is `name`'s digest when the caller holds it — the memo
+/// `rstr.py:402-412 ll_strhash` keeps in the shared `co_names_w` string
+/// (`crate::baseobjspace::named_key_hash`), so a stored name is hashed once per
+/// string rather than once per opcode.  Zero leaves the strategy to hash the
+/// borrowed bytes.
+fn store_name_into_dict(w_ns: PyObjectRef, name: &str, hash: i64, value: PyObjectRef) -> bool {
+    if !unsafe { pyre_object::is_dict(w_ns) } {
+        return false;
+    }
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_hashed(w_ns, name, hash, value);
+    }
+    true
+}
+
+/// STORE_NAME for a caller holding the wrapped name rather than a `co_names_w`
+/// index — the JIT's `bh_store_name_fn`, whose `w_name` operand is the trace's
+/// own `box_str_constant`.
+///
+/// Naming the key from that constant is what keeps the mapping arm from minting
+/// an immortal `w_str` per execution, the job `co_names_w` (`pycode.py:127-129`)
+/// does for the interpreter; the residual carries no index to reach a slot with.
+///
+/// # Safety
+/// `w_name` must point to a valid `str` object.
+pub unsafe fn store_name_value_w(
+    frame: &mut PyFrame,
+    w_name: PyObjectRef,
+    value: PyObjectRef,
+) -> Result<(), PyError> {
+    let name = unsafe { pyre_object::unicodeobject::w_str_get_value(w_name) };
+    // The trace's own `box_str_constant` names the key, so it is the same
+    // string object on every execution — `rstr.py:402-412 ll_strhash`'s memo
+    // makes it hashed once rather than once per store.
+    let hash = unsafe { pyre_object::unicodeobject::w_str_hash_memoized(w_name) };
+    let w_locals = frame.get_or_create_w_locals();
+    if store_name_into_dict(w_locals, name, hash, value) {
+        return Ok(());
+    }
+    crate::baseobjspace::setitem(w_locals, w_name, value)?;
+    Ok(())
+}
+
+/// DELETE_NAME counterpart of [`store_name_value_w`], for the JIT's
+/// `bh_delete_name_fn`.  The trace already holds the key object, so it deletes
+/// through that rather than naming the key again.
+///
+/// # Safety
+/// `w_name` must point to a valid `str` object.
+pub unsafe fn delete_name_w(frame: &mut PyFrame, w_name: PyObjectRef) -> Result<(), PyError> {
+    let w_locals = frame.get_or_create_w_locals();
+    crate::baseobjspace::delitem(w_locals, w_name).map_err(|err| {
+        if matches!(err.kind, PyErrorKind::KeyError) {
+            let name = unsafe { pyre_object::unicodeobject::w_str_get_value(w_name) };
+            PyError::name_error_with_name(format!("name '{name}' is not defined"), name)
+        } else {
+            err
+        }
+    })
+}
+
+/// STORE_GLOBAL counterpart of [`store_name_value_w`], for the JIT's
+/// `bh_store_global_fn`.  `pyopcode.py:567` writes straight into `w_globals`.
+///
+/// # Safety
+/// `w_name` must point to a valid `str` object.
+pub unsafe fn store_global_value_w(
+    frame: &mut PyFrame,
+    w_name: PyObjectRef,
+    value: PyObjectRef,
+) -> Result<(), PyError> {
+    let name = unsafe { pyre_object::unicodeobject::w_str_get_value(w_name) };
+    let hash = unsafe { pyre_object::unicodeobject::w_str_hash_memoized(w_name) };
+    let w_globals = frame.get_w_globals();
+    if !w_globals.is_null() && !store_name_into_dict(w_globals, name, hash, value) {
+        crate::baseobjspace::setitem(w_globals, w_name, value)?;
+    }
+    Ok(())
 }
 
 /// `celldict.py:279-329 _LOAD_GLOBAL_cached`.  When `pycode` is
@@ -3635,7 +3737,7 @@ impl OpcodeStepExecutor for PyFrame {
         // The pinned RustPython compiler emits STORE_DEREF for that assignment;
         // normalize its semantics at the opcode boundary.
         if crate::pyframe::class_scope_class_deref_is_name(self.code(), idx) {
-            return self.store_name_value("__class__", 0, value);
+            return self.store_name_value("__class__", crate::pyopcode::NO_NAMEINDEX, value);
         }
         let slot = locals_w!(self)[idx];
         if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
@@ -3680,7 +3782,7 @@ impl OpcodeStepExecutor for PyFrame {
 
     fn delete_deref(&mut self, idx: usize) -> Result<(), PyError> {
         if crate::pyframe::class_scope_class_deref_is_name(self.code(), idx) {
-            return self.delete_name("__class__");
+            return self.delete_name("__class__", crate::pyopcode::NO_NAMEINDEX);
         }
         // `pyopcode.py:580 DELETE_DEREF`: fetch the cell, raise if empty, then
         // `cell.set(None)` — clear the cell *contents* (PY_NULL is the empty
@@ -4211,7 +4313,9 @@ impl OpcodeStepExecutor for PyFrame {
     // CPython 3.13: LOAD_FROM_DICT_OR_GLOBALS — try TOS dict first, then globals
     fn load_from_dict_or_globals(&mut self, name: &str, nameindex: usize) -> Result<(), PyError> {
         let mapping = self.pop();
-        let key = pyre_object::w_str_new(name);
+        let key = unsafe {
+            crate::pycode::w_code_getname_w_or_new(self.pycode as PyObjectRef, nameindex, name)
+        };
         let anchor = FrameAnchor::new(self);
         match crate::baseobjspace::getitem(mapping, key) {
             Ok(value) => {
@@ -4231,7 +4335,10 @@ impl OpcodeStepExecutor for PyFrame {
     // back to the cell / free variable at `idx`.
     fn load_from_dict_or_deref(&mut self, idx: usize, name: &str) -> Result<(), PyError> {
         let mapping = self.pop();
-        let key = pyre_object::w_str_new(name);
+        // A localsplus name has no `co_names_w` slot to realize into, so nothing
+        // bounds how often this runs; interning is what keeps an immortal
+        // string per execution from being an immortal string per execution.
+        let key = pyre_object::unicodeobject::intern_str_value(name);
         let anchor = FrameAnchor::new(self);
         match crate::baseobjspace::getitem(mapping, key) {
             Ok(value) => {
@@ -4456,12 +4563,14 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── delete_name ──
     // pypy/interpreter/pyopcode.py:821 DELETE_NAME — delete from w_locals; KeyError → NameError.
-    fn delete_name(&mut self, name: &str) -> Result<(), PyError> {
+    fn delete_name(&mut self, name: &str, nameindex: usize) -> Result<(), PyError> {
         // `space.delitem(w_locals, w_name)`; at module scope `w_locals` is the
         // globals dict, so a module DELETE_NAME routes through the canonical
         // W_DictObject too.  KeyError → NameError.
         let w_locals = self.get_or_create_w_locals();
-        let key = unsafe { pyre_object::w_str_new(name) };
+        let key = unsafe {
+            crate::pycode::w_code_getname_w_or_new(self.pycode as PyObjectRef, nameindex, name)
+        };
         crate::baseobjspace::delitem(w_locals, key).map_err(|err| {
             if matches!(err.kind, PyErrorKind::KeyError) {
                 PyError::name_error_with_name(format!("name '{name}' is not defined"), name)

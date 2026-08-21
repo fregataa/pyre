@@ -4335,11 +4335,66 @@ unsafe fn setitem_instance(obj: PyObjectRef, index: PyObjectRef, value: PyObject
 /// Take the `_checked` variant so that surfaces as an error rather than a
 /// miss; only that path wraps the key, to name it in a 3.14 hash-error.
 pub fn finditem_str(obj: PyObjectRef, key: &str) -> Result<Option<PyObjectRef>, PyError> {
+    finditem_str_named(obj, key, pyre_object::PY_NULL, 0)
+}
+
+/// [`finditem_str`] for a caller that can name the key without allocating — a
+/// `(code object, name index)` pair addressing a `co_names_w` slot
+/// (`pycode.py:127-129`), as `pyopcode.py:965` reaches its varname.
+///
+/// The pair is resolved only on the arm that consumes a wrapped key, so a
+/// shortcut dict answers from the borrowed `&str` without touching the slot.
+/// That laziness is the point: reading it is a `dont_look_inside` call the JIT
+/// residualises, and the shortcut is the arm that already allocated nothing.
+///
+/// A `PY_NULL` `pycode` addresses no slot, which is also what a wrapper with no
+/// name table resolves to, so [`finditem_str`] and a nameless code object land
+/// on the same mint.
+pub fn finditem_str_named(
+    obj: PyObjectRef,
+    key: &str,
+    pycode: PyObjectRef,
+    nameindex: usize,
+) -> Result<Option<PyObjectRef>, PyError> {
     if is_shortcut_dict(obj) {
-        return unsafe { pyre_object::dictmultiobject::w_dict_getitem_str_checked(obj, key) }
-            .map_err(|_| take_pending_dict_key_error(w_str_new(key)));
+        let hash = named_key_hash(key, pycode, nameindex);
+        return unsafe {
+            pyre_object::dictmultiobject::w_dict_getitem_str_checked_hashed(obj, key, hash)
+        }
+        .map_err(|_| take_pending_dict_key_error(wrapped_key(key, pycode, nameindex)));
     }
-    finditem(obj, w_str_new(key))
+    finditem(obj, wrapped_key(key, pycode, nameindex))
+}
+
+/// The wrapped lookup key: the code object's shared name when the caller named
+/// one, otherwise a freshly minted `w_str`.
+fn wrapped_key(key: &str, pycode: PyObjectRef, nameindex: usize) -> PyObjectRef {
+    unsafe { crate::pycode::w_code_getname_w_or_new(pycode, nameindex, key) }
+}
+
+/// `rstr.py:402-412 ll_strhash` for a key the caller named through a
+/// `co_names_w` slot (`pycode.py:127-129`): the digest is memoized in that
+/// shared name string, so each name is hashed once per string rather than once
+/// per opcode that reads it.  Zero when the caller named no slot — the probe
+/// then hashes the borrowed bytes itself, as it always has.
+///
+/// Unlike [`wrapped_key`] this never mints: a slot that has not been realized
+/// yet is realized (one interned string per name value), and a caller holding
+/// no code object gets zero.
+pub(crate) fn named_key_hash(key: &str, pycode: PyObjectRef, nameindex: usize) -> i64 {
+    let w_name = unsafe { crate::pycode::w_code_getname_w(pycode, nameindex) };
+    if w_name.is_null() {
+        return 0;
+    }
+    // The digest answers for `key`'s bytes, so the slot must be the name the
+    // caller borrowed `key` from — the same pairing [`wrapped_key`] already
+    // stores under.  A mismatch would probe a bucket the key is not in.
+    debug_assert_eq!(
+        unsafe { pyre_object::unicodeobject::w_str_get_value(w_name) },
+        key,
+        "co_names_w slot names a different key than the opcode borrowed"
+    );
+    unsafe { pyre_object::unicodeobject::w_str_hash_memoized(w_name) }
 }
 
 /// PyPy-compatible identity check returning a raw boolean value.
@@ -5127,7 +5182,7 @@ pub fn setdict(obj: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
 /// `getdict` result.  Upstream dict-subclass instances are dict-layout
 /// `W_DictMultiObject`, so `finditem_str`/`setitem_str` strategy
 /// dispatch works on them directly; pyre dict-subclass instances are
-/// `__dict_data__`-composed W_ObjectObject (typedef.rs
+/// slot-composed W_ObjectObject (typedef.rs
 /// dict_descr_new), so the `w_dict_*` layout accessors must target the
 /// backing dict.  Plain dicts, module dicts and mapdict views pass
 /// through unchanged.  The `__dict__` getter keeps returning the
