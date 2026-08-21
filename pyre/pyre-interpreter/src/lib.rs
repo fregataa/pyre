@@ -161,6 +161,8 @@ pub mod stack_check;
 pub mod syntax_warnings;
 pub mod type_methods;
 pub mod typedef;
+#[cfg(windows)]
+pub mod unicodehelper_win32;
 pub mod warn;
 
 // ── Execution and import modules ──
@@ -1212,6 +1214,11 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
             189,
             typed::<crate::module::_winapi::overlapped::W_Overlapped>(),
         ),
+        // PEP 528's raw console stream follows the two overlapped owners at
+        // the append-only Windows tail.  It is subclassable and therefore
+        // participates in the same rclass hierarchy as every typed IO base.
+        #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+        subclass_range_alias(190, typed::<crate::module::_io::W_WindowsConsoleIO>()),
     ]
 }
 
@@ -1230,10 +1237,10 @@ pub fn active_subclass_range_hierarchy() -> &'static [(u32, Option<u32>)] {
         const MMAP_HIERARCHY_SLOTS: usize = 1;
         #[cfg(not(any(unix, windows)))]
         const MMAP_HIERARCHY_SLOTS: usize = 0;
-        // `_overlapped.Overlapped` and `_winapi.Overlapped`, both of which a
-        // sandbox build leaves out.
+        // `_overlapped.Overlapped`, `_winapi.Overlapped`, and the host-backed
+        // `_WindowsConsoleIO`, all of which a sandbox build leaves out.
         #[cfg(windows)]
-        const OVERLAPPED_HIERARCHY_SLOTS: usize = 2;
+        const OVERLAPPED_HIERARCHY_SLOTS: usize = 3;
         #[cfg(not(windows))]
         const OVERLAPPED_HIERARCHY_SLOTS: usize = 0;
         &hierarchy[..hierarchy.len()

@@ -72,6 +72,26 @@ fn locale_error(message: &str) -> crate::PyError {
     err
 }
 
+#[cfg(windows)]
+fn windows_default_locale_component(lctype: u32) -> Option<String> {
+    use windows_sys::Win32::Globalization::{GetLocaleInfoW, GetUserDefaultLCID};
+
+    let mut buffer = [0u16; 16];
+    let len = unsafe {
+        GetLocaleInfoW(
+            GetUserDefaultLCID(),
+            lctype,
+            buffer.as_mut_ptr(),
+            buffer.len() as i32,
+        )
+    };
+    if len <= 1 {
+        None
+    } else {
+        Some(String::from_utf16_lossy(&buffer[..len as usize - 1]))
+    }
+}
+
 /// Numeric/monetary locale parameters decoded into owned buffers, the
 /// `lconv` fields `localeconv` exposes (`interp_locale.py`).
 struct LocaleConvData {
@@ -253,6 +273,40 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         exception_base,
     );
     crate::module_ns_store(ns, "Error", w_error);
+
+    // `_localemodule.c:_locale._getdefaultlocale` — this compatibility hook
+    // is Windows-only.  The locale name is built from the user's ISO
+    // language and territory and reports the active ANSI code page separately.
+    // PyPy publishes the same two-item shape from `getdefaultlocale`.
+    #[cfg(all(windows, not(feature = "sandbox")))]
+    crate::module_ns_store(
+        ns,
+        "_getdefaultlocale",
+        crate::make_builtin_function_with_arity(
+            "_getdefaultlocale",
+            |_| {
+                use windows_sys::Win32::Globalization::{
+                    LOCALE_SISO3166CTRYNAME, LOCALE_SISO639LANGNAME,
+                };
+                let language = windows_default_locale_component(LOCALE_SISO639LANGNAME);
+                let territory = windows_default_locale_component(LOCALE_SISO3166CTRYNAME);
+                let locale = match (language, territory) {
+                    (Some(language), Some(territory)) => {
+                        pyre_object::w_str_new(&format!("{language}_{territory}"))
+                    }
+                    _ => pyre_object::w_none(),
+                };
+                // The active ANSI code page, spelled `cp<n>` whatever it is:
+                // code page 65001 answers `cp65001`, not `utf-8`.  Mapping it
+                // to a codec name is `locale.getdefaultlocale`'s job, not this
+                // hook's.
+                let codepage = unsafe { windows_sys::Win32::Globalization::GetACP() };
+                let encoding = pyre_object::w_str_new(&format!("cp{codepage}"));
+                Ok(pyre_object::w_tuple_new(vec![locale, encoding]))
+            },
+            0,
+        ),
+    );
 
     // localeconv() — numeric/monetary parameters of the current locale.
     // Reads the host locale DB; under sandbox the stub override below replaces
@@ -571,5 +625,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 crate::make_builtin_function(name, locale_unavailable),
             );
         }
+        // `_getdefaultlocale` reads the user's locale and the active ANSI code
+        // page, so it is host state on the same terms.
+        #[cfg(windows)]
+        crate::module_ns_store(
+            ns,
+            "_getdefaultlocale",
+            crate::make_builtin_function_with_arity(
+                "_getdefaultlocale",
+                locale_unavailable,
+                0,
+            ),
+        );
     }
 }
