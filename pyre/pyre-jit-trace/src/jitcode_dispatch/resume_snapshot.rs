@@ -49,8 +49,18 @@ fn forward_snapshot_py_pc(jitcode_index: u32, pc: u32) -> Result<u32, DispatchEr
     if pc == majit_ir::resumedata::NO_JITCODE_PC as u32 {
         return Ok(u32::MAX);
     }
-    crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)
-        .and_then(|payload| payload.resume_position_for_jitcode_pc(pc as usize))
+    let payload = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)
+        .ok_or(DispatchError::GuardResumeCoordinateUnavailable { pc: pc as usize })?;
+    // A level with no Python code object has no Python pc, and so no entry in
+    // a table keyed by one.  `descr_call`'s tail (`crate::ctor_continuation`)
+    // is the one such level; `u32::MAX` is the same "no coordinate" answer the
+    // sentinel arm above gives, and what every reader of this field already
+    // treats as absent.
+    if payload.code_ptr.is_null() {
+        return Ok(u32::MAX);
+    }
+    payload
+        .resume_position_for_jitcode_pc(pc as usize)
         .map(|(_, py_pc)| py_pc)
         .ok_or(DispatchError::GuardResumeCoordinateUnavailable { pc: pc as usize })
 }
@@ -235,13 +245,13 @@ fn walker_capture_inline_nonstandard_vable_guard_inner<Sym: WalkSym>(
             session
                 .framestack
                 .iter()
-                .filter(|frame| frame.parent.is_some())
+                .filter(|frame| !frame.parents.is_empty())
                 .count(),
             session.framestack.len(),
             session
                 .framestack
                 .iter()
-                .filter_map(|frame| frame.parent.clone())
+                .flat_map(|frame| frame.parents.iter().cloned())
                 .collect::<Vec<_>>(),
         )
     };
@@ -315,7 +325,7 @@ pub(crate) fn walker_inline_guard_resumes_in_callee<Sym: WalkSym>(
     let n_parents = session
         .framestack
         .iter()
-        .filter(|frame| frame.parent.is_some())
+        .filter(|frame| !frame.parents.is_empty())
         .count();
     n_parents > 0 && n_parents == session.framestack.len()
 }
@@ -439,7 +449,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             session
                 .framestack
                 .iter()
-                .filter_map(|frame| frame.parent.clone())
+                .flat_map(|frame| frame.parents.iter().cloned())
                 .collect::<Vec<_>>()
         };
         // Fire the multi-frame snapshot only when the paused-caller chain
@@ -3044,6 +3054,10 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
         let pf_py_pc = forward_snapshot_py_pc(pf.jitcode_index, pf_pc_word)?;
         frames.push((pf.jitcode_index, pf_pc_word, pf_py_pc, pf.boxes.as_slice()));
     }
+    // `descr_call`'s tail needs no case of its own here: the constructor
+    // inline records it among `__init__`'s level's `parents`, so the loop
+    // above already emitted it — at its own depth, however deep the chain
+    // below it goes.  See `crate::ctor_continuation`.
     let callee_py_pc =
         forward_snapshot_py_pc(callee_jitcode_index as u32, callee_jitcode_pc as u32)?;
     frames.push((

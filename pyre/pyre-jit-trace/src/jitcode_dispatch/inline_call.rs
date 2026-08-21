@@ -2829,7 +2829,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // sub-context it builds, so every descent into a canonical helper body
     // carries it — not just the ones entered from another sub-walk.
     let _helper_frame =
-        nested_helper_entry.map(|frame| InlineFrameGuard::enter(ctx.session, 0, Some(frame)));
+        nested_helper_entry.map(|frame| InlineFrameGuard::enter(ctx.session, 0, vec![frame]));
     let walk_result = run_sub_jitcode_walk(
         ctx,
         op.pc,
@@ -3441,9 +3441,25 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // Preserve exactness per argument.  Method-form calls put a usually
     // nonnumeric `self` in slot 0; folding all arguments into one boolean
     // incorrectly made that erase the proof for an independent numeric `x`.
-    let exact_numeric_args: Vec<ExactNumericArg> = callee_arg_concretes
+    //
+    // The one argument a guard failure inside this callee rebuilds.  The rewind
+    // resumes at the caller's CALL, so it re-runs `type.__call__` from
+    // `__new__` — and only a constructor has its argument's ALLOCATION inside
+    // that region.  `try_walker_inline_type_call` passes the instance it just
+    // emitted as `callee_args[0]` and repeats it in `constructor_result`, so
+    // matching the two names that instance and nothing else; `is_unescaped`
+    // (`heapcache.py:493-494`) is the other half — nothing outside the walk has
+    // taken a reference between the allocation and this boundary.
+    let rewind_built_arg = constructor_result.and_then(|(instance, _)| {
+        (instance != OpRef::NONE
+            && callee_args.first() == Some(&instance)
+            && ctx.trace_ctx.heap_cache().is_unescaped(instance))
+        .then_some(0usize)
+    });
+    let arg_facts: Vec<CalleeArgFact> = callee_arg_concretes
         .iter()
-        .map(|concrete| {
+        .enumerate()
+        .map(|(index, concrete)| {
             let (plain_int, exact_float) = match concrete {
                 ConcreteValue::Int(_) => (true, false),
                 ConcreteValue::Float(_) => (false, true),
@@ -3457,9 +3473,10 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     (false, false)
                 }
             };
-            ExactNumericArg {
+            CalleeArgFact {
                 numeric: plain_int || exact_float,
                 plain_int,
+                rewind_reallocates: rewind_built_arg == Some(index),
             }
         })
         .collect();
@@ -3572,7 +3589,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     if fbw_foriter_inflight_active() && !instance_next_seeded_route {
         let safety = fbw_callee_body_replay_safety(
             body.code,
-            &exact_numeric_args,
+            &arg_facts,
             body.num_regs_i,
             body.constants_i,
             body.num_regs_r,
@@ -3675,10 +3692,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         };
         if fbw_inline_diag_enabled() {
             eprintln!(
-                "[inline-foriter-gate] pc={} legacy_admit={legacy_admit} exact_numeric_args={} \
+                "[inline-foriter-gate] pc={} legacy_admit={legacy_admit} numeric_args={} \
+                 rewind_built_arg={rewind_built_arg:?} \
                  safety={safety:?} deferred_admit={foriter_deferred_admit}",
                 op.pc,
-                exact_numeric_args.iter().filter(|arg| arg.numeric).count(),
+                arg_facts.iter().filter(|arg| arg.numeric).count(),
             );
         }
         // An unbound `Dirty` body is not admitted by seeding its frame.  Its
@@ -3751,16 +3769,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         .unwrap_or(u16::MAX);
     let strict_inlinable =
         callee_fast_path_inlinable(body.code, callee_descr_refs, ctx, callee_portal_frame_reg);
-    // `typeobject.py descr_call` discards `__init__`'s result and returns the
-    // instance.  Hold constructors to the strict straight-line path here;
-    // together with the `constructor_result.is_none()` term on `strict_seed`,
-    // this keeps `__init__` out of every resume chain.  No callee frame is
-    // seeded, so a guard in `__init__` resumes at the caller's CALL coordinate
-    // and re-runs the instantiation, making the result discard unnecessary to
-    // represent.
-    if constructor_result.is_some() && !strict_inlinable {
-        return resolved_inline_decline(op.pc, line!());
-    }
     // A zero-param callee has no positional argument to seed, so the register
     // convention above holds vacuously and the strict path serves it like any
     // other straight-line leaf.  The residual it would otherwise fall back to
@@ -3812,7 +3820,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         if contains_raise && !strict_inlinable && body_facts.has_exception_table {
             Some(fbw_callee_body_replay_safety(
                 body.code,
-                &exact_numeric_args,
+                &arg_facts,
                 body.num_regs_i,
                 body.constants_i,
                 body.num_regs_r,
@@ -3880,14 +3888,13 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // callee needing fresh cellvar allocation is not seeded — the seed block
     // below breaks out to the ordinary single-frame inline for it — so exclude
     // it here too, or the preflight would decline a CALL that path still
-    // serves.  Constructor inlining also stays out of the seed: `typeobject.py
-    // descr_call` owns the discard of `__init__`'s result, and the flattened
-    // frame shape cannot reconstruct that discard from a two-frame in-callee
-    // guard pause.
+    // serves.  A constructor is seeded like any other callee: the discard of
+    // `__init__`'s result is `descr_call`'s, and pyre records that as its own
+    // resume level (`crate::ctor_continuation`) rather than by refusing to
+    // seed and re-executing the CALL.
     let strict_seed = strict_inlinable
         && inline_depth < fbw_max_multiframe_depth()
-        && callee_code.cellvars.is_empty()
-        && constructor_result.is_none();
+        && callee_code.cellvars.is_empty();
     // Preflight the caller frame BEFORE the seed below records a virtual
     // PyFrame.  A CALL covered by a try/catch marker must remain residual so
     // its post-call catch resume routes an exception; returning after frame
@@ -4703,8 +4710,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             "Collapse::DepthCap"
         } else if !callee_code.cellvars.is_empty() {
             "Collapse::CellVars"
-        } else if constructor_result.is_some() {
-            "Collapse::Constructor"
         } else {
             "Collapse::Other"
         });
@@ -4932,7 +4937,22 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         };
         // Track this callee for the lifetime of the sub-walk so nested
         // self-calls see the correct recursion depth.
-        let _inline_frame = InlineFrameGuard::enter(ctx.session, callee_code_key, parent_frame);
+        //
+        // A constructor pauses TWO levels here, outermost-first: the caller at
+        // its CALL, then `descr_call`'s tail, which upstream is an ordinary
+        // `MIFrame` between them.  Recording it on this level is what puts it
+        // at its own depth for every guard below, including one inside a
+        // callee `__init__` itself inlines.
+        let mut parents: Vec<InlineParentFrame> = parent_frame.into_iter().collect();
+        if let Some((instance, _)) = constructor_result
+            && callee_frame_materialized_has_resume
+        {
+            let Some(tail) = super::ctor_continuation_parent_frame(instance) else {
+                return Err(DispatchError::callee_inline_unsupported(op.pc));
+            };
+            parents.push(tail);
+        }
+        let _inline_frame = InlineFrameGuard::enter(ctx.session, callee_code_key, parents);
         // Name the frame this sub-walk executes concretely, so each residual
         // it runs can `enter`/`leave` it on the interpreter frame chain.
         let _inline_concrete_frame = InlineConcreteFrameGuard::enter(concrete_callee_frame);
@@ -7724,6 +7744,12 @@ pub(crate) fn run_sub_jitcode_walk<Sym: WalkSym>(
                 // transparent-helper exclusions at the abort-coordinate claim
                 // and the post-step trace-limit check exist to prevent.
                 transparent_helper_subwalk: true,
+                // For the same reason: a helper descent inside an inlined
+                // `__init__` is not itself the `__init__` level, so it must
+                // not inherit the instance that would make its guards record
+                // `descr_call`'s tail.  `walker_capture_multi_frame_inline_
+                // snapshot` routes this mode away before it reads the field,
+                // so this is the statement of intent rather than the fix.
                 ..ctx.fbw_mode
             },
             session: ctx.session,

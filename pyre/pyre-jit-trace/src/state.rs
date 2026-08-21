@@ -871,6 +871,37 @@ pub fn ensure_build_time_jitcode_at(index: usize) -> Option<std::sync::Arc<crate
     Some(payload)
 }
 
+/// Append a jitcode that has no Python `CodeObject` and hand back its index.
+///
+/// `warmspot.py:282` installs `CodeWriter.make_jitcodes()` wholesale, so every
+/// graph upstream traces — including the interpreter's own, such as
+/// `typeobject.py descr_call` — already has a slot and an absolute index. Pyre
+/// builds its table from Python `CodeObject`s plus whatever the build-time BFS
+/// from the portal reaches, and that BFS stops short of the type-call spine
+/// (`call_function_impl_raw` is reached, `call_function_impl_result` is not),
+/// so a graph pyre needs as a resume level has to be added here instead.
+///
+/// The slot appends past [`reserve_build_time_index_space`], the same place a
+/// runtime `PyCode` entry lands, so no baked build-time index is displaced.
+/// The payload carries a null `code_ptr`: `raw_code_for_jitcode_index` already
+/// reports that as "no raw code" for the jd1 drain portal, and the consumers
+/// that key a level by its Python code object read it through that accessor.
+pub fn install_codeless_jitcode(payload: std::sync::Arc<crate::PyJitCode>) -> i32 {
+    debug_assert!(
+        payload.code_ptr.is_null(),
+        "install_codeless_jitcode is for a jitcode with no Python CodeObject",
+    );
+    ensure_finish_setup();
+    METAINTERP_SD.with(|r| {
+        let mut sd = r.borrow_mut();
+        sd.reserve_build_time_index_space();
+        let index = sd.jitcodes.len() as i32;
+        MetaInterpStaticData::stamp_payload_index(index, &payload);
+        sd.jitcodes.push(Box::new(JitCode { index, payload }));
+        index
+    })
+}
+
 /// `framework.py root_walker.walk_roots` parity for the persistent
 /// `MetaInterpStaticData.jitcodes` list (warmspot.py:282
 /// `self.metainterp_sd.jitcodes = jitcodes`).  Each entry's PyCode
@@ -7998,6 +8029,43 @@ fn reconstruct_inline_recipe(
     if frame.pc < 0 {
         decline!("NoSnapshotPc");
     }
+    // `descr_call`'s tail reconstructs no frame.  Its jitcode has no code
+    // object, so every check below would decline it, and the whole chain with
+    // it; but its JIT-visible body is only the discard of `__init__`'s result
+    // and `ref_return` of the instance, which the drain can carry out by
+    // substituting the box on the way out.  Decode that one box here.
+    if crate::ctor_continuation::is_installed_level(frame.jitcode_index) {
+        let [instance_value] = frame.values.as_slice() else {
+            decline!("CtorTailArity");
+        };
+        let (instance, _) = bridge_decode_box(
+            ctx,
+            instance_value,
+            Type::Ref,
+            rd_virtuals,
+            resume_data,
+            fail_values,
+            fail_types,
+            backend,
+            cache,
+        );
+        if instance.is_none() {
+            decline!("CtorTailBox");
+        }
+        return Some(ReconstructRecipe {
+            code_ptr: std::ptr::null(),
+            jitcode_index: frame.jitcode_index,
+            jitcode_pc: frame.pc,
+            nlocals: 0,
+            valuestackdepth: 0,
+            registers_i: Vec::new(),
+            registers_r: Vec::new(),
+            registers_f: Vec::new(),
+            concrete_r: Vec::new(),
+            nargs: 0,
+            return_substitute: Some(instance),
+        });
+    }
     let py_pc =
         crate::py_coord::resume_py_pc_for_jitcode_word(frame.jitcode_index, frame.pc) as usize;
     let Some(w_code) = code_for_jitcode_index(frame.jitcode_index) else {
@@ -8358,6 +8426,7 @@ fn reconstruct_inline_recipe(
                 registers_f,
                 concrete_r,
                 nargs: frame_nlocals,
+                return_substitute: None,
             });
         }
         let RebuiltValue::Virtual(frame_vidx) = ref_values[frame_pos] else {
@@ -8497,6 +8566,7 @@ fn reconstruct_inline_recipe(
             registers_f,
             concrete_r,
             nargs: frame_nlocals,
+            return_substitute: None,
         });
     }
 
@@ -8647,6 +8717,7 @@ fn reconstruct_inline_recipe(
         registers_f,
         concrete_r,
         nargs: frame_nlocals,
+        return_substitute: None,
     })
 }
 
