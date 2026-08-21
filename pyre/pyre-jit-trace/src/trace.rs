@@ -4995,12 +4995,35 @@ fn run_perfn_walk<Sym: WalkSym>(
             leg,
         );
         if std::env::var_os("PYRE_FBW_CENSUS").is_some() {
+            // Every compilation cliff ends the walk under one error name, so
+            // `end` alone cannot say which bytecode the location was lost to.
+            // Name the opcode for the permanent decline, the one outcome that
+            // takes the location out of tracing for good
+            // (`TraceAction::AbortPermanent` -> DONT_TRACE_HERE).
+            let cliff = match &walk_result {
+                Err(crate::jitcode_dispatch::DispatchError::AbortPermanentMarkerReached { pc }) => {
+                    let code = (!pjc.code_ptr.is_null()).then(|| unsafe { &*pjc.code_ptr });
+                    let (py_pc, name) =
+                        crate::py_coord::py_op_name_for_jitcode_pc(&pjc.metadata, code, *pc);
+                    // Cut the operand rendering off the variant the same way
+                    // `end` is cut above, so a corpus run tallies the line with
+                    // `sort | uniq -c` instead of splitting one opcode across
+                    // every distinct argument shape.
+                    let mut name = name.unwrap_or_else(|| "?".to_string());
+                    if let Some(at) = name.find(|c: char| matches!(c, '(' | '{' | ' ')) {
+                        name.truncate(at);
+                    }
+                    Some(format!(" py_pc={py_pc} py_op={name}"))
+                }
+                _ => None,
+            };
             eprintln!(
                 "[fbw-census] end={end} committed={committed} leg={leg} bridge={} \
                  unj_val={unj_val} unj_sym={unj_sym} exec_v={exec_v} exec_mf={exec_mf} \
                  exec_pl={exec_pl} effects={effects} jstore={jstore} jappend={jappend} \
-                 jcell={jcell} unrecoverable={unrecoverable}",
+                 jcell={jcell} unrecoverable={unrecoverable}{}",
                 ctx.is_bridge_trace,
+                cliff.as_deref().unwrap_or(""),
             );
         }
     }
@@ -5070,9 +5093,20 @@ fn probe_walk_perfn_jitcode<Sym: WalkSym>(
 /// ops after that merge point and before the loop's final back-edge, so neither
 /// a prologue-only marker (e.g. `COPY_FREE_VARS` ahead of a clean hot loop) nor
 /// a post-loop marker over-declines the loop.  A loop covered by an exception
-/// handler keeps the full-tail scan so a post-loop `abort_permanent` still
-/// declines it, because compiled-loop delivery of an uncaught raise to the
-/// handler is not yet supported.
+/// handler additionally keeps every marker from that handler's entry onward,
+/// because compiled-loop delivery of an uncaught raise to the handler is not
+/// yet supported.
+///
+/// That bound has no upper limit, and the missing limit is deliberate rather
+/// than an oversight.  Narrowing it to the PCs reachable from the loop's own
+/// handler is unsound: a walk that leaves the loop concretely executes the
+/// post-loop tail, and a raise there is delivered by
+/// `vstack_enter_exception_handler` into the TAIL's handler, which the loop's
+/// own reachability set does not contain.  The walk then records that handler
+/// inline and keeps going, so a marker in it is reached after non-journaled
+/// effects have already run — the case the paragraph above describes.  A sound
+/// narrowing would have to seed every handler the walk can reach, which for
+/// these shapes is the whole tail again.
 ///
 /// The scan exempts one marker class: `LOAD_FAST_CHECK`'s null arm.  The
 /// decline above is a refusal over an *unported* opcode, whose arm bails
@@ -5118,7 +5152,7 @@ fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<us
         return None;
     };
 
-    let mut back_edge_end: Option<usize> = None;
+    let mut back_edges: Vec<(usize, usize)> = Vec::new();
     let mut abort_permanent_pcs: Vec<usize> = Vec::new();
     for op in crate::jitcode_runtime::decoded_ops(code).filter(|op| op.pc > merge_point) {
         if op.opname == "abort_permanent" {
@@ -5127,33 +5161,79 @@ fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<us
         if op.opname.starts_with("goto") && op.argcodes.ends_with('L') {
             let target = u16::from_le_bytes([code[op.next_pc - 2], code[op.next_pc - 1]]) as usize;
             if target <= merge_point {
-                back_edge_end = Some(back_edge_end.map_or(op.pc, |end| end.max(op.pc)));
+                back_edges.push((target, op.pc));
             }
         }
     }
 
+    // A backward goto closes the loop headed at `merge_point` only when it
+    // jumps to that header.  One that jumps further back closes an ENCLOSING
+    // loop, and letting it set the end here stretches this loop's body across
+    // the enclosing one: for a loop nested inside a yield-bearing loop that
+    // sweeps the `YIELD_VALUE` marker in and declines a body that never goes
+    // near it.  Take the nearest header first, then its last back edge, so a
+    // `continue` earlier in the body cannot truncate the region either.  With
+    // no candidate at all the region stays open to the end of the code, the
+    // conservative direction.
+    let back_edge_end = back_edges
+        .iter()
+        .map(|&(target, _)| target)
+        .max()
+        .and_then(|nearest| {
+            back_edges
+                .iter()
+                .filter(|&&(target, _)| target == nearest)
+                .map(|&(_, pc)| pc)
+                .max()
+        });
+
     // `start_pc` is a code-unit index; the exception table lookup takes byte offsets (×2).
-    let loop_in_try = unsafe {
+    let loop_handler = unsafe {
         pyre_interpreter::pycode::w_code_lookup_exceptiontable(
             w_code as pyre_object::PyObjectRef,
             (start_pc as u32) * 2,
         )
-    }
-    .is_some();
+    };
 
-    // `PYRE_FBW_LOOPBODY_SCAN_LOOP_ONLY` drops the `loop_in_try` widening
-    // entirely, the counterpart of `PYRE_FBW_LOOPBODY_SCAN_FULL`, so the whole
-    // carve-out stays measurable without a rebuild.
-    let scan_end = if !std::env::var_os("PYRE_FBW_LOOPBODY_SCAN_LOOP_ONLY").is_some()
-        && (loop_in_try || std::env::var_os("PYRE_FBW_LOOPBODY_SCAN_FULL").is_some())
-    {
-        code.len()
+    // The loop body always scans.  What a covering exception-table entry adds
+    // is its HANDLER, not the whole tail: an uncaught raise inside a compiled
+    // loop has to be delivered into that handler and the backend cannot do it,
+    // so a marker there still declines the loop — but straight-line code after
+    // the loop is not reachable from the loop at all, and scanning it declines
+    // loops over markers they can never run.
+    //
+    // A generator is where the difference shows.  Its body is a single entry
+    // whose target is the PEP 479 epilogue, so a whole-tail scan sweeps up the
+    // `YIELD_VALUE` markers sitting between the back edge and that target and
+    // declines every generator's loop — including a loop that never goes near
+    // a yield.
+    //
+    // `PYRE_FBW_LOOPBODY_SCAN_LOOP_ONLY` drops the handler region too and
+    // `PYRE_FBW_LOOPBODY_SCAN_FULL` restores the whole-tail scan, so both ends
+    // of the carve-out stay measurable without a rebuild.
+    let loop_end = back_edge_end.unwrap_or(code.len());
+    let handler_py_pc = if std::env::var_os("PYRE_FBW_LOOPBODY_SCAN_LOOP_ONLY").is_some() {
+        None
+    } else if std::env::var_os("PYRE_FBW_LOOPBODY_SCAN_FULL").is_some() {
+        Some(0)
     } else {
-        back_edge_end.unwrap_or(code.len())
+        // `lookup_exceptiontable` reports byte offsets; a marker's owner is
+        // reported as an instruction index.
+        loop_handler.map(|(target, _, _)| target as usize / 2)
     };
     abort_permanent_pcs
         .into_iter()
-        .filter(|pc| *pc < scan_end)
+        .filter(|pc| {
+            if *pc < loop_end {
+                return true;
+            }
+            let Some(handler_py_pc) = handler_py_pc else {
+                return false;
+            };
+            // A marker whose owner cannot be named keeps declining, the
+            // conservative direction `abort_permanent_owner` documents.
+            abort_permanent_owner(w_code, &pjc, *pc).is_none_or(|(py_pc, _)| py_pc >= handler_py_pc)
+        })
         .find(|pc| !marker_is_load_fast_check_null_arm(w_code, &pjc, *pc))
 }
 

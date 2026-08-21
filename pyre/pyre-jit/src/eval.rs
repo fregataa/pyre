@@ -6406,14 +6406,17 @@ fn stack_almost_full() -> bool {
 /// Evaluate a Python frame with JIT compilation.
 ///
 /// This is the main entry point for pyre-jit.
-pub fn eval_with_jit(frame: &mut PyFrame) -> PyResult {
+pub fn eval_with_jit(
+    frame: &mut PyFrame,
+    resume: Option<&mut pyre_interpreter::call::FrameResumeArgs>,
+) -> PyResult {
     // pypy/interpreter/pyframe.py:360 marks execute_frame as a stack-check
     // entry.  The portal runner is pyre's JIT-aware execution entry for the
     // same frame and must perform the interpreter-side check before compiled
     // code exists; compiled callees additionally carry the backend prologue.
     pyre_interpreter::stack_check::drain_jit_pending_exception()?;
     pyre_interpreter::stack_check::stack_check()?;
-    eval_with_jit_inner(frame)
+    eval_with_jit_inner(frame, resume)
 }
 
 /// Hook target for `pyre_interpreter::call::set_jit_param`. Routes
@@ -6821,6 +6824,8 @@ fn drive_unpack_iterable_trace(
                 | crate::call_jit::BlackholeResult::DoneWithThisFrameInt(_)
                 | crate::call_jit::BlackholeResult::DoneWithThisFrameRef(_)
                 | crate::call_jit::BlackholeResult::DoneWithThisFrameFloat(_) => break,
+                // Clean bail: the frame already carries the stamped resume pc.
+                crate::call_jit::BlackholeResult::BailToInterpreter => break,
                 // Blackhole could not resume; leave the rest to `ln`.
                 crate::call_jit::BlackholeResult::Failed => break,
             }
@@ -8119,7 +8124,10 @@ fn unsupported_jit_shape_uncached(
     (UnsupportedJitShape::None, "")
 }
 
-fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
+fn eval_with_jit_inner(
+    frame: &mut PyFrame,
+    resume: Option<&mut pyre_interpreter::call::FrameResumeArgs>,
+) -> PyResult {
     // The JIT-side frame-activation seam: a frame that runs entirely as
     // compiled code returns from `try_function_entry_jit` without reaching an
     // eval loop, so the recursion budget is spent here, where every JIT route
@@ -8133,13 +8141,13 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     // PYRE_JIT=0 disables JIT entirely, falling back to plain interpreter.
     static PYRE_JIT_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *PYRE_JIT_DISABLED.get_or_init(|| std::env::var("PYRE_JIT").as_deref() == Ok("0")) {
-        return frame.execute_frame(None, None);
+        return frame.execute_frame_plain(resume);
     }
     // A traced frame runs interpreted: `call_trace` / `return_trace` /
     // `bytecode_trace` are driven from the plain eval path, so a frame the JIT
     // takes over reports no events at all.
     if pyre_interpreter::pyframe::frame_tracing_active(frame) {
-        return frame.execute_frame(None, None);
+        return frame.execute_frame_plain(resume);
     }
     let mut frame_root = FrameRoot::new(frame);
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
@@ -8178,7 +8186,7 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
                 code as *const _ as usize,
                 unsupported_jit_shape(code).1,
             );
-            return frame_root.frame().execute_frame(None, None);
+            return frame_root.frame().execute_frame_plain(resume);
         }
     }
     frame_root.frame().fix_array_ptrs();
@@ -8191,7 +8199,22 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     {
         let (drv, _) = driver_pair();
         if drv.is_bridge_tracing() {
-            return frame_root.frame().execute_frame(None, None);
+            return frame_root.frame().execute_frame_plain(resume);
+        }
+    }
+
+    // A resumed frame reaches the portal already positioned mid-body, so its
+    // payload has to be consumed before the merge point is consulted: the
+    // green key is `(pycode, next_instr)`, and the sent value belongs on the
+    // operand stack at the pc that key names.  This is the last point at
+    // which the frame can still decline, so nothing below may need the
+    // payload again.  A suspended `yield from` delegate that yields finishes
+    // the resumption on its own and this frame never runs.
+    if let Some(resume) = resume {
+        if let Some(delegated) =
+            pyre_interpreter::eval::prepare_frame_resume_for_dispatch(frame_root.frame(), resume)?
+        {
+            return Ok(delegated);
         }
     }
 
@@ -9094,6 +9117,42 @@ fn maybe_compile_and_run(
     // counter tick below instead of entering `execute_assembler` with no meta
     // to interpret its exit (which aborts). The tmp cell then re-ticks until
     // the real loop compiles.
+    // Why a compiled loop for this green key is or is not enterable, per
+    // back-edge.  `has_runnable_compiled_loop` is the conjunction of an entry
+    // procedure token and a frontend `compiled_loops` entry, and the two fail
+    // for different reasons: a pruned cell reads `cell_present=false
+    // state=NotHot` while its meta survives, an invalidated token reads
+    // `seen_token=true has_token=false`.  Separating them is what distinguishes
+    // a cell the warmstate dropped from a token something revoked.
+    static GEN_ENTRY_DIAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *GEN_ENTRY_DIAG.get_or_init(|| std::env::var_os("PYRE_GEN_ENTRY_DIAG").is_some()) {
+        let runnable = driver.has_runnable_compiled_loop(green_key);
+        let meta = driver.get_compiled_meta(green_key).is_some();
+        let last = driver.last_compiled_key();
+        let ws = driver.meta_interp_mut().warm_state_mut();
+        let state = ws.get_cell_state(green_key);
+        let (present, seen_token, has_token) = match ws.get_cell(green_key) {
+            Some(cell) => (
+                true,
+                cell.has_seen_a_procedure_token(),
+                cell.get_procedure_token().is_some(),
+            ),
+            None => (false, false, false),
+        };
+        eprintln!(
+            "[gen-entry] code={} pc={} key={} runnable={} meta={} last_compiled={:?} cell_present={} state={:?} seen_token={} has_token={}",
+            code.obj_name.as_str(),
+            loop_header_pc,
+            green_key,
+            runnable,
+            meta,
+            last,
+            present,
+            state,
+            seen_token,
+            has_token,
+        );
+    }
     if driver.has_runnable_compiled_loop(green_key) {
         return execute_assembler(frame, green_key, loop_header_pc, driver, info, env);
     }
@@ -9468,6 +9527,7 @@ fn blackhole_result_tag(r: &crate::call_jit::BlackholeResult) -> &'static str {
         R::DoneWithThisFrameRef(_) => "DoneWithThisFrameRef",
         R::DoneWithThisFrameFloat(_) => "DoneWithThisFrameFloat",
         R::ExitFrameWithExceptionRef(_) => "ExitFrameWithExceptionRef",
+        R::BailToInterpreter => "BailToInterpreter",
         R::Failed => "Failed",
     }
 }
@@ -9676,6 +9736,41 @@ fn untag_tagged_frame_locals(frame_root: &mut FrameRoot) {
     }
 }
 
+/// Publish `PyFrame.frame_finished_execution = True` after a single-frame
+/// blackhole resume that ran this frame to its return.
+///
+/// `jitexc.py:16-40 DoneWithThisFrame*` is the blackhole reporting that the
+/// frame is done.  `pyopcode.py:239-241 RETURN_VALUE` performs the store
+/// there, and upstream carries it in the jitcode, so pyjitpl, the blackhole
+/// and compiled code all replay it.  Pyre lowers the return into the
+/// `*_return` operation instead, so every executor publishes the transition by
+/// hand: the interpreter in `finish_value`, the walker in
+/// `finish_current_frame_execution`, the multi-frame drive per level in
+/// `finish_blackhole_level_frame`, and the single-frame resume here.
+///
+/// `generator.py:94` reads exactly this bit to tell a RETURN from a YIELD, so
+/// a frame that skips it makes a generator or coroutine hand its return value
+/// back as one more yielded value.
+///
+/// `ExitFrameWithExceptionRef` is deliberately not covered: pyre offers that
+/// exception to the frame's own exception table first, so the frame may resume
+/// at a handler rather than be finished.
+fn publish_blackhole_frame_finished(
+    result: &crate::call_jit::BlackholeResult,
+    frame: &mut PyFrame,
+) {
+    use crate::call_jit::BlackholeResult;
+    if matches!(
+        result,
+        BlackholeResult::DoneWithThisFrameVoid
+            | BlackholeResult::DoneWithThisFrameInt(_)
+            | BlackholeResult::DoneWithThisFrameRef(_)
+            | BlackholeResult::DoneWithThisFrameFloat(_)
+    ) {
+        frame.set_frame_finished_execution(true);
+    }
+}
+
 /// RPython warmstate.py:387-423 execute_assembler.
 ///
 /// Run compiled machine code for a given green_key. Handles the
@@ -9877,6 +9972,18 @@ fn execute_assembler(
                     )));
                 }
             };
+            // `pyopcode.py:239-241` stores `frame_finished_execution = True`
+            // in the RETURN_VALUE handler itself, so upstream records an
+            // ordinary field store into the trace and compiled code replays
+            // it for free.  Pyre lowers the return into the `*_return`
+            // operation, so every executor has to publish the store by hand:
+            // the interpreter does it in `finish_value`, the walker in
+            // `finish_current_frame_execution`, the blackhole through its
+            // frame-finished hook, and compiled code here.  `generator.py:94`
+            // reads exactly this bit to tell a RETURN from a YIELD, so a
+            // frame that skips it makes a generator or coroutine hand its
+            // return value back as one more yielded value.
+            frame_root.frame().set_frame_finished_execution(true);
             Some(LoopResult::Done(Ok(result)))
         }
         // warmstate.py:416-422 general: handle_fail
@@ -9917,6 +10024,7 @@ fn execute_assembler(
                         forced_guard_cache_owner(descr_arc, frame_root.frame()),
                         false,
                     );
+                    publish_blackhole_frame_finished(&bh_result, frame_root.frame());
                     match &bh_result {
                         crate::call_jit::BlackholeResult::ContinueRunningNormally {
                             green_int,
@@ -9939,6 +10047,7 @@ fn execute_assembler(
                             // propagate the Python exception, don't swallow it.
                             Some(LoopResult::Done(Err(exc.clone())))
                         }
+                        crate::call_jit::BlackholeResult::BailToInterpreter => None,
                         crate::call_jit::BlackholeResult::Failed => {
                             // RPython: blackhole resume never fails — rd_numb
                             // is always complete (`blackhole.py:1679` raises
@@ -10303,6 +10412,7 @@ fn bound_reached(
                         forced_guard_cache_owner(descr_arc, frame_root.frame()),
                         false,
                     );
+                    publish_blackhole_frame_finished(&bh_result, frame_root.frame());
                     match &bh_result {
                         crate::call_jit::BlackholeResult::ContinueRunningNormally {
                             green_int,
@@ -10311,6 +10421,7 @@ fn bound_reached(
                             apply_blackhole_crn_handoff(frame_root.frame(), green_int);
                             return Some(LoopResult::ContinueRunningNormally);
                         }
+                        crate::call_jit::BlackholeResult::BailToInterpreter => {}
                         crate::call_jit::BlackholeResult::Failed => {}
                         _ => {
                             if let Some(r) = bh_result.to_pyresult() {
@@ -10573,6 +10684,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                         forced_guard_cache_owner(descr_arc, frame_root.frame()),
                         false,
                     );
+                    publish_blackhole_frame_finished(&bh_result, frame_root.frame());
                     match &bh_result {
                         crate::call_jit::BlackholeResult::ContinueRunningNormally {
                             green_int,
@@ -10581,6 +10693,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                             apply_blackhole_crn_handoff(frame_root.frame(), green_int);
                             // Fall through to eval_loop_jit
                         }
+                        crate::call_jit::BlackholeResult::BailToInterpreter => {}
                         crate::call_jit::BlackholeResult::Failed => {
                             // RPython blackhole resume cannot fail
                             // (`blackhole.py:1679` raises
@@ -10810,6 +10923,18 @@ fn handle_jit_outcome(
             // must not escape into a blackhole caller and turn this successful
             // return into a raise.
             crate::call_jit::clear_residual_call_exception();
+            // `pyopcode.py:239-241` stores `frame_finished_execution = True`
+            // in the RETURN_VALUE handler itself, so upstream records an
+            // ordinary field store into the trace and compiled code replays
+            // it for free.  Pyre lowers the return into the `*_return`
+            // operation, so every executor has to publish the store by hand:
+            // the interpreter does it in `finish_value`, the walker in
+            // `finish_current_frame_execution`, the blackhole through its
+            // frame-finished hook, and compiled code here.  `generator.py:94`
+            // reads exactly this bit to tell a RETURN from a YIELD, so a
+            // frame that skips it makes a generator or coroutine hand its
+            // return value back as one more yielded value.
+            frame.set_frame_finished_execution(true);
             JitAction::Return(Ok(value))
         }
         DetailedDriverRunOutcome::Jump {

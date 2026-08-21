@@ -7806,23 +7806,25 @@ impl CodeWriter {
                     // the next block.
                     current_block.clone()
                 } else {
-                    // `current_block` already closed and no joinpoint
-                    // candidate exists — RPython has no equivalent
-                    // because its per-block walker (`flowcontext.py:
-                    // 407-475`) cannot re-enter PC iteration with a
-                    // dead current block: every walker pop installs a
-                    // fresh live SpamBlock from `pendingblocks`.  Pyre's
-                    // PC-sequential walker drove the prior synthesise-
-                    // fresh-block adaptation here, but with the W-1 fix
-                    // every sequential PC keeps `current_block` alive
-                    // and every branch arrival registers a joinpoint
-                    // candidate, so this arm should be unreachable.
-                    // Fail-loud per RPython invariant.
-                    panic!(
-                        "emit_mark_label_pc!(py_pc={}): no live current_block \
-                         and no joinpoint candidate — invariant violation",
-                        py_pc,
-                    );
+                    // `current_block` is dead and this PC carries no
+                    // joinpoint candidate.  The only writer of `dead` is
+                    // `mergeblock`'s supersede (`flowcontext.py:455-463`),
+                    // which kills the block a later merge could not union
+                    // with and queues its replacement on `pendingblocks`.
+                    // Upstream is never here: its walker is per-block, and
+                    // `closeblock` raises `StopFlowing` so a superseded
+                    // block is never walked further.  Pyre's PC-sequential
+                    // walker can still be standing inside that block when
+                    // the supersede happens, and the PCs after it belong to
+                    // the replacement, not to the corpse.
+                    //
+                    // Stop flowing, which is what upstream does: leave the
+                    // block, and let the outer walker pop the replacement
+                    // `mergeblock` already pushed.  Emitting into a dead
+                    // block instead would put operations somewhere the
+                    // post-walk drain skips.
+                    block_switch_pending = true;
+                    current_block.clone()
                 };
                 // Yield-on-switch: when `new_block` differs from
                 // `current_block`, set the `block_switch_pending`
@@ -12630,15 +12632,36 @@ impl CodeWriter {
                             // UnaryPositive→`pos`, ListToTuple→`list_to_tuple`
                             // are the two CALL_INTRINSIC_1 variants with a
                             // residual; both are single-Ref→Ref.  The remaining
-                            // variants (import-star, stopiteration-error, the PEP
-                            // 695 type-param helpers) are def-time or error-path
+                            // variants (import-star, async-gen-wrap, the PEP 695
+                            // type-param helpers) are def-time or error-path
                             // only, so no residual has been written for them.
+                            //
+                            // `StopIterationError` is a no-op: `pyopcode.rs`
+                            // leaves the value on the stack unchanged, because
+                            // the PEP 479 conversion happens in the generator
+                            // machinery (`leak_generator_iteration`) rather
+                            // than at this opcode.  An opcode the interpreter
+                            // executes as a no-op has nothing to residualize
+                            // and nothing to bail for, so leave TOS alone and
+                            // let the trace carry on — the same treatment
+                            // `ExitInitCheck` gets.
+                            //
+                            // It is load-bearing for generators specifically:
+                            // the PEP 479 epilogue carries this opcode in 648
+                            // of the 649 generator/coroutine code objects in
+                            // `lib-python/3`, and a generator body always sits
+                            // inside an exception-table range, which widens the
+                            // loop-body prescan to the whole code object.  A
+                            // marker here therefore declined essentially every
+                            // generator frame, loop and epilogue alike.
                             let opname = match func.get(op_arg) {
                                 IntrinsicFunction1::UnaryPositive => Some("pos"),
                                 IntrinsicFunction1::ListToTuple => Some("list_to_tuple"),
                                 _ => None,
                             };
-                            if let Some(opname) = opname {
+                            if matches!(func.get(op_arg), IntrinsicFunction1::StopIterationError) {
+                                // TOS stays as it is — no pop, no fresh push.
+                            } else if let Some(opname) = opname {
                                 let _val_reg = emit_popvalue_ref!(current_depth, py_pc);
                                 let val_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                                 let result_value = emit_graph_op_with_result(
@@ -13570,14 +13593,31 @@ impl CodeWriter {
                         // `liveness.rs`'s `Instruction::YieldValue` arm,
                         // assemble.py:1543.
                         //
-                        // Fundamentally unsound to port: YIELD_VALUE suspends the
-                        // frame (StepResult::Yield), resuming later in a different
-                        // stack context — a residual call cannot express that.
-                        // flowspace's `record_pure_op("yield")` is an analysis
-                        // artifact (flow purity, not runtime effect-freedom), not
-                        // a signal that a residual is possible.  A JIT traces one
-                        // continuous execution, so abort_permanent is the only
-                        // parity-correct choice.
+                        // YIELD_VALUE suspends the frame (StepResult::Yield) and
+                        // resumes it later in a different stack context, which no
+                        // residual this compiler can emit expresses; flowspace's
+                        // `record_pure_op("yield")` is an analysis artifact (flow
+                        // purity, not runtime effect-freedom), not a signal that a
+                        // residual is possible.
+                        //
+                        // The marker was long unreachable for a reason that sat
+                        // one level up — a resumption ran
+                        // `PyFrame::execute_generator_frame`, which called the
+                        // plain evaluator directly instead of the registered
+                        // eval override, so no frame of a generator was ever
+                        // offered to the tracer and no loop in a generator body
+                        // could compile, yield or not.  That entry now goes
+                        // through the override, so a loop that stays clear of
+                        // the yield compiles and this arm is what stops a trace
+                        // at the suspension itself.
+                        //
+                        // Upstream additionally gives the resumption a merge
+                        // point of its own (`generator.py:604`
+                        // `generatorentry_driver`, taken at `:63` when
+                        // `should_not_inline` (`:614`) counts two or more
+                        // yields; below that the body is inlined into the
+                        // caller's trace).  Pyre has no such driver yet, so a
+                        // resumption enters the portal as an ordinary frame.
                         Instruction::YieldValue { .. } => {
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
