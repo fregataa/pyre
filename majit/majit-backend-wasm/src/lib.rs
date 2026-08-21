@@ -84,8 +84,11 @@ use std::sync::{Arc, Mutex};
 /// declined because the source guard and bridge input arities disagree; 47 =
 /// LABEL publication suppressed because the bridge entry has nonzero parameters.
 /// 48 = an inline trial's LABEL-resume storage exceeds the frozen frame; 49 =
-/// the region carries a CALL_ASSEMBLER the owner build emits no arm for.
-pub static BRIDGE_DIAG: [AtomicU64; 50] = [const { AtomicU64::new(0) }; 50];
+/// the region carries a CALL_ASSEMBLER the owner build emits no arm for; 50 =
+/// the owner is already invalidated, so a merged region would inherit its set
+/// flag instead of starting valid; 51 = the region's closing JUMP names a LABEL
+/// published by another module, which no in-module `br` can reach.
+pub static BRIDGE_DIAG: [AtomicU64; 52] = [const { AtomicU64::new(0) }; 52];
 
 #[repr(u8)]
 #[derive(Clone, Copy)]
@@ -123,6 +126,13 @@ static INLINE_GEOMETRY_COUNT: AtomicU64 = AtomicU64::new(0);
 /// by string; the errors themselves come from the install itself, which is the
 /// only build there is.
 static INLINE_TRIAL_ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Why each loop-closing bridge was refused a merge into its owner, capped so
+/// a long run cannot grow the log without bound. `bridge_diag`'s counters say
+/// how many declines each reason took; these records carry the keys that say
+/// which ones matter — `(slot, key)` joins a record against the trace-entry
+/// census, whose `entries` count is how often that crossing actually ran.
+static INLINE_DECLINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+const INLINE_DECLINE_LOG_CAP: usize = 64;
 
 pub(crate) fn record_inline_geometry(kind: FrameShortageKind, needed: usize, available: usize) {
     const FIELD_MASK: u64 = (1 << 24) - 1;
@@ -153,6 +163,17 @@ pub fn inline_geometry_count() -> u64 {
 
 pub fn inline_trial_errors() -> String {
     INLINE_TRIAL_ERRORS.lock().unwrap().join(" | ")
+}
+
+pub(crate) fn record_inline_decline(record: String) {
+    let mut log = INLINE_DECLINES.lock().unwrap();
+    if log.len() < INLINE_DECLINE_LOG_CAP {
+        log.push(record);
+    }
+}
+
+pub fn inline_declines() -> String {
+    INLINE_DECLINES.lock().unwrap().join(" | ")
 }
 
 fn record_inline_trial_error(error: &BackendError) {
@@ -196,7 +217,9 @@ fn classify_inline_install_error(error: &BackendError) {
 }
 
 static REEMIT_ENABLED: AtomicBool = AtomicBool::new(false);
-static INLINE_BRIDGE_ENABLED: AtomicBool = AtomicBool::new(false);
+static INLINE_BRIDGE_ENABLED: AtomicBool = AtomicBool::new(true);
+/// Off until the miscompile below is root-caused. See `inline_nonheader_enable`.
+static INLINE_NONHEADER_ENABLED: AtomicBool = AtomicBool::new(false);
 static BRIDGE_PARAMS_ENABLED: AtomicBool = AtomicBool::new(true);
 static TRACE_ENTRY_CENSUS_FORCED: AtomicBool = AtomicBool::new(false);
 
@@ -304,13 +327,36 @@ fn reemit_enabled() -> bool {
     REEMIT_ENABLED.load(Ordering::Relaxed)
 }
 
-/// Arm loop-closing bridge inlining from the host before guest execution starts.
-pub fn inline_bridge_enable() {
-    INLINE_BRIDGE_ENABLED.store(true, Ordering::Relaxed);
+/// Disable loop-closing bridge inlining from the host before guest execution
+/// starts. A bridge that closes back onto its owner's loop is merged into the
+/// owner's module by default, so the guard reaching it becomes a branch inside
+/// one module instead of a call out to another; this carries the host's
+/// explicit opt-out into the backend.
+pub fn inline_bridge_disable() {
+    INLINE_BRIDGE_ENABLED.store(false, Ordering::Relaxed);
 }
 
 fn inline_bridge_enabled() -> bool {
     INLINE_BRIDGE_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Admit a region whose closing JUMP names a resumable LABEL that is not the
+/// loop header. `codegen` emits these by wrapping the entry dispatch in a
+/// `loop` the region branches back into, re-entering past that label's resume
+/// loader with the values already in locals — on fannkuch that is 16.3M of the
+/// 20.6M surviving cross-module crossings.
+///
+/// ⛔ Off by default: the emitted shape is structurally valid and correct on the
+/// unit-test traces (`region_closing_at_a_non_header_label_*`), but on real IR
+/// it miscompiles — 47 `check.py` fixtures die identically with a corrupted Ref
+/// (`TypeError: '' object is not an iterator`). Not yet root-caused, so the
+/// accept condition below keeps declining unless a host opts in to debug it.
+pub fn inline_nonheader_enable() {
+    INLINE_NONHEADER_ENABLED.store(true, Ordering::Relaxed);
+}
+
+fn inline_nonheader_enabled() -> bool {
+    INLINE_NONHEADER_ENABLED.load(Ordering::Relaxed)
 }
 
 /// Disable guard-to-bridge value parameters from the host before guest
@@ -3353,12 +3399,46 @@ impl majit_backend::Backend for WasmBackend {
         }
 
         if inline_bridge_enabled() {
-            if !is_direct {
+            // `model.py:145-152`: a bridge compiled after `invalidate_loop`
+            // starts valid, and only a later invalidation activates its
+            // GUARD_NOT_INVALIDATED (`runner_test.py test_guard_not_invalidated`
+            // steps 3-4). A merged region reads the owner's root flag, which is
+            // already set here, so it would be dead on arrival. Decline, and let
+            // the out-of-line path mint the fresh flag that keeps the contract.
+            // `(slot, key)` names the crossing this decline leaves in place,
+            // which is what the trace-entry census counts.
+            let decline = |reason: &str| {
+                record_inline_decline(format!(
+                    "bridge={} src={source_trace_id} fi={source_fail_index} \
+                     slot={external_jump_slot} key={external_jump_key} reason={reason}",
+                    self.trace_counter,
+                ));
+            };
+            if original_token.is_invalidated() {
+                diag_bump(50);
+                decline("owner_invalidated");
+            } else if !is_direct {
                 diag_bump(33);
+                decline("not_direct");
             } else if !bridge_is_loop_closing {
                 diag_bump(34);
-            } else if !resumes_at_loop_header {
+                decline("not_loop_closing");
+            } else if external_jump_slot != source_func_handle {
+                // The emitter turns a region's closing JUMP into a `br`, and a
+                // `br` cannot leave the module, so the JUMP must name a LABEL of
+                // the loop the region merges into. A JUMP naming another
+                // module's published label resolves to no LABEL in the merged
+                // stream, and the in-module arm would then branch to the
+                // owner's loop instead of the loop the bridge meant.
+                diag_bump(51);
+                decline("foreign_label");
+            } else if !resumes_at_loop_header && !inline_nonheader_enabled() {
+                // Resuming at the header lets the region `br` straight to the
+                // `loop`. Resuming at an earlier LABEL needs the
+                // `loop`-wrapped dispatch, which is opt-in until its
+                // miscompile is root-caused (`inline_nonheader_enable`).
                 diag_bump(38);
+                decline("not_header");
             } else if let Some(mut candidate) = original_token
                 .compiled
                 .get()
@@ -3371,8 +3451,10 @@ impl majit_backend::Backend for WasmBackend {
                     .any(|r| r.source_fail_index == source_fail_index)
                 {
                     diag_bump(36);
+                    decline("already_owned");
                 } else if !codegen::merged_stream_has_loop_label(&candidate) {
                     diag_bump(39);
+                    decline("no_loop_label");
                 } else {
                     self.collect_constants_from_ops(ops);
                     candidate.inlined_bridges.push(codegen::InlinedBridge {
@@ -3425,6 +3507,24 @@ impl majit_backend::Backend for WasmBackend {
                             }
                             diag_bump(31);
                             diag_bump(32);
+                            // The region runs from the owner's module, so its
+                            // `GUARD_NOT_INVALIDATED` reads the owner's root
+                            // flag. Name that as this compile's generation, or
+                            // the quasi-immutable dependencies registered
+                            // afterwards attach to a flag the merged code never
+                            // loads and a mutated field leaves the fold in
+                            // place.
+                            original_token.record_bridge_invalidation_flag(
+                                original_token.invalidation_flag(),
+                            );
+                            // The region has no code of its own: it was
+                            // installed by rebuilding the owner, so there is no
+                            // address to report. `model.py:67 compile_bridge`
+                            // permits `None` here, and the consumers treat the
+                            // result as debug data — `interp_resop.py:253-255`
+                            // defaults `asmaddr`/`asmlen` to 0 when it is
+                            // absent — so a zero-address artifact says exactly
+                            // "installed, but not as a block of its own".
                             return Ok(AsmInfo {
                                 code_addr: 0,
                                 code_size: 0,
@@ -3452,6 +3552,7 @@ impl majit_backend::Backend for WasmBackend {
                 }
             } else {
                 diag_bump(35);
+                decline("not_reemittable");
             }
         }
 

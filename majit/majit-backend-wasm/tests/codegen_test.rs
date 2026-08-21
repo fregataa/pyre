@@ -365,9 +365,17 @@ fn wasm_outlier_bridges_stay_compiled_at_runtime() {
     }
 
     let module = wasm_module.to_str().expect("workspace paths must be UTF-8");
-    for (bench, expected_counter) in [
-        ("exception_oserror_fields.py", "BRIDGE_OK"),
-        ("generator_tree_recursion.py", "accepted_ca"),
+    // A region that is no longer declined reaches compiled steady state through
+    // one of two counters: an out-of-line bridge of its own (`BRIDGE_OK`), or,
+    // when it closes back onto its owner's loop, a merge into the owner
+    // (`inline_ok`). Inlining is the default and takes `exception_oserror_fields`,
+    // so only the pair is a stable statement of "not declined".
+    for (bench, compiled_counters) in [
+        (
+            "exception_oserror_fields.py",
+            &["BRIDGE_OK", "inline_ok"][..],
+        ),
+        ("generator_tree_recursion.py", &["accepted_ca"][..]),
     ] {
         let script = root.join("pyre/bench/synth").join(bench);
         let dynasm_run = run_runtime_program(&dynasm, &script, &[]);
@@ -384,9 +392,14 @@ fn wasm_outlier_bridges_stay_compiled_at_runtime() {
         let stderr = String::from_utf8_lossy(&wasm_run.stderr);
         assert_ran_ok(&format!("wasm {bench}"), &wasm_run);
         assert_same_stdout(&format!("wasm {bench}"), &wasm_run, &dynasm_run);
+        let compiled: u64 = compiled_counters
+            .iter()
+            .map(|counter| stat_value(&stderr, counter))
+            .sum();
         assert!(
-            stat_value(&stderr, expected_counter) > 0,
-            "{bench} did not compile its formerly-declined bridge:\n{stderr}"
+            compiled > 0,
+            "{bench} did not compile its formerly-declined bridge \
+             (none of {compiled_counters:?} moved):\n{stderr}"
         );
         assert_eq!(
             stat_value(&stderr, "ml_unsafe_label"),
@@ -1314,6 +1327,62 @@ fn inlined_bridge_without_owner_loop_label_declines() {
     assert!(error.to_string().contains("no local loop LABEL"));
 }
 
+/// A CALL_ASSEMBLER descr carrying a callee token, which the stock
+/// `SimpleCallDescr` cannot: its `call_target_token` answers `None`, and a
+/// merge declines on the missing token before it ever consults `ca.targets`.
+#[derive(Debug)]
+struct TargetTokenCallDescr {
+    arg_types: Vec<Type>,
+    result_type: Type,
+    target_token: u64,
+}
+
+impl majit_ir::Descr for TargetTokenCallDescr {
+    fn index(&self) -> u32 {
+        u32::MAX
+    }
+
+    fn as_call_descr(&self) -> Option<&dyn majit_ir::descr::CallDescr> {
+        Some(self)
+    }
+
+    fn as_loop_token_descr(&self) -> Option<&dyn majit_ir::LoopTokenDescr> {
+        Some(self)
+    }
+}
+
+impl majit_ir::LoopTokenDescr for TargetTokenCallDescr {
+    fn loop_token_number(&self) -> u64 {
+        self.target_token
+    }
+}
+
+impl majit_ir::descr::CallDescr for TargetTokenCallDescr {
+    fn arg_types(&self) -> &[Type] {
+        &self.arg_types
+    }
+
+    fn result_type(&self) -> Type {
+        self.result_type
+    }
+
+    fn result_size(&self) -> usize {
+        8
+    }
+
+    fn call_target_token(&self) -> Option<u64> {
+        Some(self.target_token)
+    }
+
+    fn get_extra_info(&self) -> &EffectInfo {
+        static INFO: EffectInfo = EffectInfo::const_new(
+            majit_ir::ExtraEffect::CanRaise,
+            majit_ir::OopSpecIndex::None,
+        );
+        &INFO
+    }
+}
+
 /// A region merged into an owner brings its own CALL_ASSEMBLER callee, but the
 /// dedicated CA arm is selected by `ca.emit_ca` and bakes the callee geometry
 /// out of `ca.targets` — both decided when the OWNER was compiled. An op that
@@ -1324,6 +1393,12 @@ fn inlined_bridge_without_owner_loop_label_declines() {
 /// callee's — a silent wrong result rather than a trap. Every trace's own ops
 /// are screened for unsupported opcodes before compilation; the merged stream
 /// is the one place that question is never re-asked, so the merge asks it.
+///
+/// Both ways of missing the arm are covered, and they are NOT the same test:
+/// with no arm emitted at all the op never reaches `ca.targets`, while an owner
+/// that does emit the arm still has no geometry for a callee it never compiled
+/// against — and that second case would otherwise reach the CA arm's
+/// `expect("CA op target must be registered")`.
 #[test]
 fn inlined_bridge_carrying_an_unarmed_call_assembler_declines() {
     fn build(
@@ -1393,13 +1468,25 @@ fn inlined_bridge_carrying_an_unarmed_call_assembler_declines() {
     /// The region the decline arms use, with `opcode` producing its one value.
     /// The loop-closing JUMP carries the region's own inputs, so the result
     /// type never reaches the owner's label and only the opcode varies.
-    fn region_ops(opcode: OpCode, result: OpRef) -> Vec<Op> {
+    ///
+    /// `token` gives the op a callee the owner could in principle have an arm
+    /// for; without it the merge declines on the missing token and never
+    /// consults `ca.targets` at all.
+    fn region_ops(opcode: OpCode, result: OpRef, token: Option<u64>) -> Vec<Op> {
+        let call = make_op(
+            opcode,
+            &[OpRef::input_arg_int(40), OpRef::input_arg_int(41)],
+            result,
+        );
+        if let Some(target_token) = token {
+            call.setdescr(std::sync::Arc::new(TargetTokenCallDescr {
+                arg_types: vec![Type::Int],
+                result_type: opcode.result_type(),
+                target_token,
+            }));
+        }
         vec![
-            make_op(
-                opcode,
-                &[OpRef::input_arg_int(40), OpRef::input_arg_int(41)],
-                result,
-            ),
+            call,
             Op::new(
                 OpCode::Jump,
                 &[rb(OpRef::input_arg_int(40)), rb(OpRef::input_arg_int(41))],
@@ -1410,7 +1497,7 @@ fn inlined_bridge_carrying_an_unarmed_call_assembler_declines() {
     // The same region under an ordinary opcode, to pin that what declines
     // below is the CALL_ASSEMBLER and not the fixture.
     let plain = build(
-        region_ops(OpCode::IntAdd, OpRef::int_op(42)),
+        region_ops(OpCode::IntAdd, OpRef::int_op(42), None),
         codegen::CaParams::default(),
     )
     .expect("a loop-closing region with no CALL_ASSEMBLER merges into its owner");
@@ -1420,23 +1507,31 @@ fn inlined_bridge_carrying_an_unarmed_call_assembler_declines() {
         (OpCode::CallAssemblerI, OpRef::int_op(42)),
         (OpCode::CallAssemblerR, OpRef::ref_op(42)),
     ] {
-        for ca in [
-            // The owner emitted no CA arm at all.
-            codegen::CaParams::default(),
-            // The owner has the arm, but not for THIS callee: the region's
-            // target is absent from the table the arm bakes its geometry from.
-            codegen::CaParams {
-                emit_ca: true,
-                ..codegen::CaParams::default()
-            },
+        for (case, token, ca) in [
+            // No CA arm at all, so no table to consult.
+            ("no arm", Some(0x5a5a_u64), codegen::CaParams::default()),
+            // The arm is emitted, but this callee is not one the owner
+            // compiled against, so its geometry is absent from `ca.targets`.
+            (
+                "arm without this callee",
+                Some(0x5a5a_u64),
+                codegen::CaParams {
+                    emit_ca: true,
+                    ..codegen::CaParams::default()
+                },
+            ),
+            // A CALL_ASSEMBLER that names no callee at all.
+            ("no callee token", None, codegen::CaParams::default()),
         ] {
-            let error = match build(region_ops(opcode, result), ca) {
-                Ok(_) => panic!("{opcode:?} has no arm in this build, so the merge must decline"),
+            let error = match build(region_ops(opcode, result, token), ca) {
+                Ok(_) => {
+                    panic!("{opcode:?} with {case} must decline, not build a module")
+                }
                 Err(error) => error,
             };
             assert!(
                 error.to_string().contains("no CALL_ASSEMBLER arm for"),
-                "declined for the wrong reason: {error}"
+                "{case}: declined for the wrong reason: {error}"
             );
         }
     }
@@ -2834,6 +2929,353 @@ fn test_registration_loop_stamps_label_block_id() {
     assert_eq!(recovered, Some(1));
 }
 
+/// Emitted `loop` count and entry-`br_table` arm count, the two things that say
+/// whether a module took the resume-`loop` shape.
+fn loop_and_br_table_shape(bytes: &[u8]) -> (usize, Vec<usize>) {
+    let mut loops = 0usize;
+    let mut tables = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let mut operators = body.get_operators_reader().unwrap();
+            while !operators.eof() {
+                match operators.read().unwrap() {
+                    wasmparser::Operator::Loop { .. } => loops += 1,
+                    wasmparser::Operator::BrTable { targets } => {
+                        tables.push(targets.len() as usize)
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    (loops, tables)
+}
+
+/// A two-label peeled owner (`preamble; LABEL0; segment; LABEL1(header); body;
+/// JUMP->LABEL1`) with one inlined region, whose closing JUMP names `which`.
+fn build_owner_with_region_closing_at(
+    which: usize,
+) -> Result<Vec<u8>, majit_backend::BackendError> {
+    let descr0 = majit_ir::make_loop_target_descr(10, false);
+    let descr1 = majit_ir::make_loop_target_descr(11, false);
+
+    let label0 = Op::new(OpCode::Label, &[rb(OpRef::int_op(1))]);
+    label0.setdescr(descr0.clone());
+    let label1 = Op::new(OpCode::Label, &[rb(OpRef::int_op(2))]);
+    label1.setdescr(descr1.clone());
+    let jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(3))]);
+    jump.setdescr(descr1.clone());
+
+    let ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+            OpRef::int_op(1),
+        ),
+        label0,
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(1), OpRef::const_int(1)],
+            OpRef::int_op(2),
+        ),
+        label1,
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(2), OpRef::const_int(1)],
+            OpRef::int_op(3),
+        ),
+        make_op(
+            OpCode::IntLt,
+            &[OpRef::int_op(3), OpRef::const_int(100)],
+            OpRef::int_op(4),
+        ),
+        make_guard(OpCode::GuardTrue, &[OpRef::int_op(4)], &[OpRef::int_op(3)]),
+        jump,
+    ];
+    // Both LABELs precede the header, so both are resume points.
+    assert!(codegen::is_resumable_peeled(&ops));
+    assert_eq!(codegen::resumable_label_count(&ops), 2);
+
+    let region_jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(11))]);
+    region_jump.setdescr(if which == 0 { descr0 } else { descr1 });
+    let region_ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(10), OpRef::const_int(1)],
+            OpRef::int_op(11),
+        ),
+        region_jump,
+    ];
+
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops,
+        inlined_bridges: vec![codegen::InlinedBridge {
+            source_fail_index: 0,
+            trace_id: 1,
+            inputargs: vec![InputArg::from_type(Type::Int, 10)],
+            ops: region_ops,
+            gc_table_base: 0,
+            constants: indexmap::IndexMap::new(),
+        }],
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb_fn_ptr: 0,
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        external_jump_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::fixed(),
+        ca: codegen::CaParams::default(),
+    };
+    codegen::build_wasm_module(&inputs).map(|(bytes, _, _)| bytes)
+}
+
+/// A region closing at the loop HEADER `br`s to the `loop`, the long-standing
+/// shape: one `loop`, and the entry `br_table` keeps its one arm per label plus
+/// the fresh-entry bucket.
+#[test]
+fn region_closing_at_the_header_keeps_the_single_loop_shape() {
+    let bytes = build_owner_with_region_closing_at(1).expect("header-closing region merges");
+    validate_wasm(&bytes);
+    let (loops, tables) = loop_and_br_table_shape(&bytes);
+    assert_eq!(loops, 1, "only the loop header opens a `loop`");
+    assert_eq!(
+        tables,
+        vec![3],
+        "entry br_table: key 0 plus one arm per label"
+    );
+}
+
+/// A region closing at a NON-header LABEL cannot `br` to the `loop` — that
+/// would skip the segment between its label and the header. It re-enters the
+/// entry dispatch instead, so the module grows a second `loop` around that
+/// dispatch and a second `br_table` bucket per label (`num_labels + 1 + j`,
+/// landing past label j's resume loader with the args already in locals).
+#[test]
+fn region_closing_at_a_non_header_label_wraps_the_dispatch_in_a_loop() {
+    let bytes = build_owner_with_region_closing_at(0).expect("non-header region merges");
+    validate_wasm(&bytes);
+    let (loops, tables) = loop_and_br_table_shape(&bytes);
+    assert_eq!(loops, 2, "the resume `loop` wraps the entry dispatch");
+    assert_eq!(
+        tables,
+        vec![5],
+        "entry br_table: key 0, one loader arm per label, one past-loader arm per label"
+    );
+}
+
+/// Execute a two-label peeled loop whose inlined region closes at the NON-header
+/// LABEL, and report the three values the exit guard spills. The region's
+/// re-entry must land at label 0 and then run the segment between label 0 and
+/// the header, exactly as an out-of-line bridge resuming at key 1 would.
+///
+///   preamble  v1 = v0 + 1
+///   LABEL0    [v1]
+///   segment   v2 = v1 + 1
+///   LABEL1    [v2]                     <- header, the `loop`
+///   body      v3 = v2 + 1
+///             guard v3 > 10            <- fail 0, the region
+///             guard v3 < 1000          <- fail 1, exits with [v3, v2, v1]
+///             JUMP -> LABEL1 [v3]
+///   region    v11 = v10 + 5000; JUMP -> LABEL0 [v11]
+///
+/// v0 = 0 makes v3 = 3, so the first guard fails into the region, which
+/// re-enters at LABEL0 with 5003. The segment then makes v2 = 5004 and the body
+/// v3 = 5005, which passes the first guard and fails the second.
+#[test]
+fn region_closing_at_a_non_header_label_reenters_and_runs_the_segment() {
+    assert_eq!(run_non_header_region_repro(false), (5005, 5004, 5003));
+}
+
+/// The same trace with a Ref label arg carried through both LABELs and rebound
+/// by the region's JUMP, so the region's back edge has to refresh a Ref home
+/// exactly as the resume loader does.
+#[test]
+fn region_closing_at_a_non_header_label_carries_a_ref_label_arg() {
+    assert_eq!(run_non_header_region_repro(true), (5005, 5004, 5003));
+}
+
+fn run_non_header_region_repro(with_ref: bool) -> (i64, i64, i64) {
+    let descr0 = majit_ir::make_loop_target_descr(20, false);
+    let descr1 = majit_ir::make_loop_target_descr(21, false);
+
+    // v6 is a Ref inputarg threaded through both LABELs unchanged.
+    let (label0_args, label1_args, jump_args, region_jump_args) = if with_ref {
+        (
+            vec![rb(OpRef::int_op(1)), rb(OpRef::ref_op(6))],
+            vec![rb(OpRef::int_op(2)), rb(OpRef::ref_op(6))],
+            vec![rb(OpRef::int_op(3)), rb(OpRef::ref_op(6))],
+            vec![rb(OpRef::int_op(11)), rb(OpRef::ref_op(12))],
+        )
+    } else {
+        (
+            vec![rb(OpRef::int_op(1))],
+            vec![rb(OpRef::int_op(2))],
+            vec![rb(OpRef::int_op(3))],
+            vec![rb(OpRef::int_op(11))],
+        )
+    };
+    let label0 = Op::new(OpCode::Label, &label0_args);
+    label0.setdescr(descr0.clone());
+    let label1 = Op::new(OpCode::Label, &label1_args);
+    label1.setdescr(descr1.clone());
+    let jump = Op::new(OpCode::Jump, &jump_args);
+    jump.setdescr(descr1);
+
+    let region_failargs: Vec<_> = if with_ref {
+        vec![OpRef::int_op(3), OpRef::ref_op(6)]
+    } else {
+        vec![OpRef::int_op(3)]
+    };
+    let guard_to_region = make_guard(OpCode::GuardTrue, &[OpRef::int_op(4)], &region_failargs);
+    let guard_exit = make_guard(
+        OpCode::GuardTrue,
+        &[OpRef::int_op(5)],
+        &[OpRef::int_op(3), OpRef::int_op(2), OpRef::int_op(1)],
+    );
+    let ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+            OpRef::int_op(1),
+        ),
+        label0,
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(1), OpRef::const_int(1)],
+            OpRef::int_op(2),
+        ),
+        label1,
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(2), OpRef::const_int(1)],
+            OpRef::int_op(3),
+        ),
+        make_op(
+            OpCode::IntGt,
+            &[OpRef::int_op(3), OpRef::const_int(10)],
+            OpRef::int_op(4),
+        ),
+        guard_to_region,
+        make_op(
+            OpCode::IntLt,
+            &[OpRef::int_op(3), OpRef::const_int(1000)],
+            OpRef::int_op(5),
+        ),
+        guard_exit,
+        jump,
+    ];
+    assert_eq!(codegen::resumable_label_count(&ops), 2);
+
+    let region_jump = Op::new(OpCode::Jump, &region_jump_args);
+    region_jump.setdescr(descr0);
+    let mut region_ops = vec![make_op(
+        OpCode::IntAdd,
+        &[OpRef::input_arg_int(10), OpRef::const_int(5000)],
+        OpRef::int_op(11),
+    )];
+    if with_ref {
+        // The region rebinds the Ref label arg to its own live-in copy, so the
+        // back edge must move it AND refresh its home.
+        region_ops.push(make_op(
+            OpCode::SameAsR,
+            &[OpRef::ref_op(13)],
+            OpRef::ref_op(12),
+        ));
+    }
+    region_ops.push(region_jump);
+
+    let mut inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    if with_ref {
+        inputargs.push(InputArg::from_type(Type::Ref, 6));
+    }
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops,
+        inlined_bridges: vec![codegen::InlinedBridge {
+            source_fail_index: 0,
+            trace_id: 1,
+            inputargs: if with_ref {
+                vec![
+                    InputArg::from_type(Type::Int, 10),
+                    InputArg::from_type(Type::Ref, 13),
+                ]
+            } else {
+                vec![InputArg::from_type(Type::Int, 10)]
+            },
+            ops: region_ops,
+            gc_table_base: 0,
+            constants: indexmap::IndexMap::new(),
+        }],
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb_fn_ptr: 0,
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        external_jump_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::fixed(),
+        ca: codegen::CaParams::default(),
+    };
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("non-header region merges");
+    validate_wasm(&bytes);
+
+    let engine = Engine::default();
+    let module = Module::new(&engine, &bytes).expect("generated trace should compile");
+    let mut store = Store::new(&engine, ());
+    let memory =
+        Memory::new(&mut store, MemoryType::new(2, None)).expect("test memory should allocate");
+    memory
+        .write(
+            &mut store,
+            codegen::FRAME_SLOT_BASE as usize,
+            &0i64.to_le_bytes(),
+        )
+        .unwrap();
+    let mut linker = Linker::new(&engine);
+    linker.define("env", "memory", memory).unwrap();
+    let instance = linker
+        .instantiate_and_start(&mut store, &module)
+        .expect("generated trace should instantiate");
+    instance
+        .get_typed_func::<i32, i32>(&store, "trace")
+        .unwrap()
+        .call(&mut store, 0)
+        .expect("generated trace should execute");
+
+    let read = |off: u64| {
+        let mut buf = [0u8; 8];
+        memory.read(&store, off as usize, &mut buf).unwrap();
+        i64::from_le_bytes(buf)
+    };
+    assert_eq!(read(0), 1, "the second guard is the one that exits");
+    (
+        read(codegen::FRAME_SLOT_BASE),
+        read(codegen::FRAME_SLOT_BASE + 8),
+        read(codegen::FRAME_SLOT_BASE + 16),
+    )
+}
+
 /// Collect every `i32.const` / `i64.const` immediate in the emitted body, so a
 /// test can assert which helper address the allocation arms baked in.
 fn const_immediates(bytes: &[u8]) -> Vec<i64> {
@@ -2939,5 +3381,205 @@ fn test_non_moving_descr_allocates_through_the_oldgen_helper() {
     assert!(
         !non_moving.contains(&NEW_FN) && !non_moving.contains(&NEW_ARRAY_FN),
         "non_moving descrs must not reach the nursery helpers"
+    );
+}
+
+/// Minimal `FailDescr` for driving `Backend::compile_bridge` from the host.
+/// `trace_id` defaults to 0, which is also a freshly compiled loop's, so the
+/// bridge reads as a direct guard of the source loop.
+#[derive(Debug)]
+struct HostFailDescr {
+    fail_index: u32,
+    arg_types: Vec<Type>,
+}
+
+impl majit_ir::Descr for HostFailDescr {}
+
+impl majit_ir::descr::FailDescr for HostFailDescr {
+    fn fail_index(&self) -> u32 {
+        self.fail_index
+    }
+
+    fn fail_arg_types(&self) -> &[Type] {
+        &self.arg_types
+    }
+}
+
+/// A two-input loop whose single LABEL sits at the entry, so
+/// `stamp_and_publish_label_targets` publishes it as a re-enterable target and
+/// a bridge closing onto `label_descr` resolves in-module.
+fn host_loop_ops(label_descr: &std::sync::Arc<dyn majit_ir::Descr>) -> Vec<std::rc::Rc<Op>> {
+    let label = std::rc::Rc::new(Op::new(
+        OpCode::Label,
+        &[rb(OpRef::input_arg_int(0)), rb(OpRef::input_arg_int(1))],
+    ));
+    label.setdescr(label_descr.clone());
+    let advance = std::rc::Rc::new(make_op(
+        OpCode::IntAdd,
+        &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+        OpRef::int_op(2),
+    ));
+    let guard = std::rc::Rc::new(make_guard(
+        OpCode::GuardTrue,
+        &[OpRef::int_op(2)],
+        &[OpRef::int_op(2), OpRef::input_arg_int(1)],
+    ));
+    // Bind the JUMP to the real producer, not to a synthetic stand-in: the
+    // loop-carried advance is read off the arg's producing opcode.
+    let jump = std::rc::Rc::new(Op::new(
+        OpCode::Jump,
+        &[
+            Operand::from_bound_op(&advance),
+            rb(OpRef::input_arg_int(1)),
+        ],
+    ));
+    jump.setdescr(label_descr.clone());
+    vec![label, advance, guard, jump]
+}
+
+/// A loop-closing bridge for the loop above: it advances one loop-carried
+/// value and jumps back onto the owner's published label.
+fn host_bridge_ops(label_descr: &std::sync::Arc<dyn majit_ir::Descr>) -> Vec<std::rc::Rc<Op>> {
+    let advance = std::rc::Rc::new(make_op(
+        OpCode::IntAdd,
+        &[OpRef::input_arg_int(40), OpRef::const_int(1)],
+        OpRef::int_op(42),
+    ));
+    let jump = std::rc::Rc::new(Op::new(
+        OpCode::Jump,
+        &[
+            Operand::from_bound_op(&advance),
+            rb(OpRef::input_arg_int(41)),
+        ],
+    ));
+    jump.setdescr(label_descr.clone());
+    vec![advance, jump]
+}
+
+fn host_bridge_inputargs() -> Vec<InputArg> {
+    vec![
+        InputArg::from_type(Type::Int, 40),
+        InputArg::from_type(Type::Int, 41),
+    ]
+}
+
+/// The global fail-descr space is appended to under the assumption that no
+/// other compile interleaves (`failguard.rs register_fail_descrs`), which the
+/// single-threaded wasm host guarantees and a parallel test runner does not.
+static HOST_COMPILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn host_loop_inputargs() -> Vec<InputArg> {
+    vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
+    ]
+}
+
+/// The complement of the decline below. With the same owner, guard and bridge
+/// but no invalidation, nothing short-circuits the inline arm: the trial runs
+/// every accept precondition and reaches the merged install. On the host that
+/// install cannot complete — there is no wasm host, so the owner's module was
+/// never materialized and the rebuild refuses — which is what `bridge_diag(37)`
+/// records. So this does not assert an accepted inline (only a wasm host can
+/// produce one); it pins that the invalidation decline is the ONLY thing
+/// separating the two tests.
+#[test]
+fn a_valid_owner_reaches_the_inline_trial() {
+    use majit_backend::Backend;
+
+    let _serialized = HOST_COMPILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut backend = majit_backend_wasm::WasmBackend::new();
+    let token = majit_backend::JitCellToken::new(1);
+    let label_descr = majit_ir::make_loop_target_descr(70, false);
+
+    backend
+        .compile_loop(&host_loop_inputargs(), &host_loop_ops(&label_descr), &token)
+        .expect("the owner loop compiles");
+    assert!(!token.is_invalidated());
+
+    let fail_descr = HostFailDescr {
+        fail_index: 0,
+        arg_types: vec![Type::Int, Type::Int],
+    };
+    let declines_before = majit_backend_wasm::bridge_diag(50);
+    let trials_before = majit_backend_wasm::bridge_diag(37);
+    backend
+        .compile_bridge(
+            &fail_descr,
+            &host_bridge_inputargs(),
+            &host_bridge_ops(&label_descr),
+            &token,
+            &[],
+            None,
+        )
+        .expect("the loop-closing bridge compiles");
+
+    assert_eq!(
+        majit_backend_wasm::bridge_diag(50),
+        declines_before,
+        "a valid owner is not declined by the invalidation arm"
+    );
+    assert!(
+        majit_backend_wasm::bridge_diag(37) > trials_before,
+        "the inline trial reached the merged install"
+    );
+}
+
+/// `model.py:145-152`, pinned upstream by `runner_test.py
+/// test_guard_not_invalidated` steps 3 and 4: a bridge compiled AFTER
+/// `invalidate_loop` starts valid, and only a LATER invalidation activates its
+/// GUARD_NOT_INVALIDATED.
+///
+/// A merged region cannot honour that. It runs from the owner's module, whose
+/// `invalidated_flag_addr` is the owner's root flag — already set once the
+/// owner is invalidated — so the region would be dead the moment it is
+/// installed. The inline arm therefore declines on an invalidated owner and
+/// leaves the out-of-line path to mint the fresh, clear generation.
+#[test]
+fn a_bridge_compiled_after_the_owner_was_invalidated_starts_valid() {
+    use majit_backend::Backend;
+
+    let _serialized = HOST_COMPILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut backend = majit_backend_wasm::WasmBackend::new();
+    let token = majit_backend::JitCellToken::new(1);
+    let label_descr = majit_ir::make_loop_target_descr(71, false);
+
+    backend
+        .compile_loop(&host_loop_inputargs(), &host_loop_ops(&label_descr), &token)
+        .expect("the owner loop compiles");
+    assert!(
+        token.latest_bridge_invalidation_flag().is_none(),
+        "no bridge generation exists before any bridge is compiled"
+    );
+
+    token.invalidate();
+    assert!(token.is_invalidated());
+
+    let fail_descr = HostFailDescr {
+        fail_index: 0,
+        arg_types: vec![Type::Int, Type::Int],
+    };
+    let declines_before = majit_backend_wasm::bridge_diag(50);
+    backend
+        .compile_bridge(
+            &fail_descr,
+            &host_bridge_inputargs(),
+            &host_bridge_ops(&label_descr),
+            &token,
+            &[],
+            None,
+        )
+        .expect("the loop-closing bridge compiles out of line");
+
+    assert!(
+        majit_backend_wasm::bridge_diag(50) > declines_before,
+        "the inline arm must decline an invalidated owner"
+    );
+    let generation = token
+        .latest_bridge_invalidation_flag()
+        .expect("the out-of-line path mints a generation for this bridge");
+    assert!(
+        !generation.load(std::sync::atomic::Ordering::Acquire),
+        "a bridge compiled after invalidate_loop starts valid"
     );
 }

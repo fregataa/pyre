@@ -550,9 +550,23 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
     {
         arm.call(&mut store, ())?;
     }
-    if std::env::var_os("PYRE_WASM_INLINE_BRIDGE").is_some()
+    // Loop-closing bridge inlining is the default. The guest has no
+    // environment, so an explicit host-side opt-out must travel through this
+    // export before tracing begins.
+    if std::env::var_os("PYRE_WASM_INLINE_BRIDGE")
+        .is_some_and(|value| matches!(value.to_str().map(str::trim), Some("0" | "false" | "off")))
         && let Ok(arm) =
-            instance.get_typed_func::<(), ()>(&mut store, "pyre_jit_inline_bridge_enable")
+            instance.get_typed_func::<(), ()>(&mut store, "pyre_jit_inline_bridge_disable")
+    {
+        arm.call(&mut store, ())?;
+    }
+    // In-module resume at a non-header LABEL is opt-IN, not opt-out: the shape
+    // is emitted and unit-tested but miscompiles on real IR. This export exists
+    // so the arm can be A/B'd on one binary while that is chased down.
+    if std::env::var_os("PYRE_WASM_INLINE_NONHEADER")
+        .is_some_and(|value| matches!(value.to_str().map(str::trim), Some("1" | "true" | "on")))
+        && let Ok(arm) =
+            instance.get_typed_func::<(), ()>(&mut store, "pyre_jit_inline_nonheader_enable")
     {
         arm.call(&mut store, ())?;
     }
@@ -739,6 +753,8 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 "bridge_param_label_suppressed",
                 "inline_decl_label_resume_layout",
                 "inline_decl_call_assembler",
+                "inline_decl_owner_invalidated",
+                "inline_decl_foreign_label",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {
@@ -1207,6 +1223,25 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             dealloc.call(&mut store, (ptr, len))?;
             eprintln!(
                 "[jit-stats] inline_trial_errors {}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+    }
+    // The per-decline inline-bridge log rides the same string export shape.
+    // `bridge_diag` already counts the reasons; this says which crossings they
+    // left behind, so it is printed only with the rest of the stats.
+    if std::env::var_os("PYRE_WASM_JIT_STATS").is_some()
+        && let Ok(declines) =
+            instance.get_typed_func::<(), u64>(&mut store, "pyre_jit_inline_declines")
+        && let Ok(packed) = declines.call(&mut store, ())
+    {
+        let (ptr, len) = ((packed >> 32) as u32, packed as u32);
+        if len != 0 {
+            let mut bytes = vec![0u8; len as usize];
+            memory.read(&store, ptr as usize, &mut bytes)?;
+            dealloc.call(&mut store, (ptr, len))?;
+            eprintln!(
+                "[jit-stats] inline_declines {}",
                 String::from_utf8_lossy(&bytes)
             );
         }

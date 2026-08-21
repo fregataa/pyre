@@ -1179,11 +1179,22 @@ mod host_abi {
         majit_backend_wasm::reemit_enable();
     }
 
-    /// Arm loop-closing bridge inlining. This also arms module replacement,
-    /// because an accepted region is installed by rebuilding its owner.
+    /// Disable the default loop-closing bridge inlining. The host owns the
+    /// environment, so this call carries its explicit opt-out into the guest
+    /// before tracing begins. Inlining installs an accepted region by
+    /// rebuilding its owner, so leaving it on also leaves module replacement
+    /// reachable without `pyre_jit_reemit_enable`.
     #[unsafe(no_mangle)]
-    pub extern "C" fn pyre_jit_inline_bridge_enable() {
-        majit_backend_wasm::inline_bridge_enable();
+    pub extern "C" fn pyre_jit_inline_bridge_disable() {
+        majit_backend_wasm::inline_bridge_disable();
+    }
+
+    /// Admit an inlined region that closes at a non-header LABEL. Opt-in: the
+    /// shape is emitted and unit-tested but miscompiles on real IR, so only a
+    /// host debugging that arm turns it on.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_jit_inline_nonheader_enable() {
+        majit_backend_wasm::inline_nonheader_enable();
     }
 
     /// Disable the default guard-to-bridge parameter entries. The host owns
@@ -1214,6 +1225,13 @@ mod host_abi {
     #[unsafe(no_mangle)]
     pub extern "C" fn pyre_jit_inline_trial_errors() -> u64 {
         pack_into_guest(majit_backend_wasm::inline_trial_errors().into_bytes())
+    }
+
+    /// Why each loop-closing bridge was refused a merge into its owner, with
+    /// the `(slot, key)` that joins each record against the trace-entry census.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_jit_inline_declines() -> u64 {
+        pack_into_guest(majit_backend_wasm::inline_declines().into_bytes())
     }
 
     /// Status the last `pyre_run_python` ended with: `SystemExit`'s code, 1 for
