@@ -9,8 +9,14 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::sync::OnceLock;
 
+/// Short-lived normalizer for the three-argument generator `throw` surface.
+///
+/// This is not an interpreter exception carrier: it only converts the legacy
+/// `(type, value, traceback)` input spelling into one application exception
+/// before evaluation resumes.  Live exception propagation uses
+/// [`OperationError`] below.
 #[derive(Debug, Clone)]
-pub struct OperationError {
+pub(crate) struct ExceptionNormalization {
     pub w_type: PyObjectRef,
     pub w_value: PyObjectRef,
     pub _application_traceback: Option<PyObjectRef>,
@@ -57,7 +63,7 @@ pub fn exception_object_matches_stop_async_iteration(exc_object: PyObjectRef) ->
     crate::eval::check_exc_match_against(exc_object, stop_async_iteration)
 }
 
-impl OperationError {
+impl ExceptionNormalization {
     pub fn new(w_type: PyObjectRef, w_value: PyObjectRef) -> Self {
         Self {
             w_type,
@@ -69,10 +75,6 @@ impl OperationError {
     pub fn get_w_value(&self, _space: PyObjectRef) -> PyObjectRef {
         let _ = _space;
         self.w_value
-    }
-
-    pub fn match_(&self, _space: PyObjectRef, _check: PyObjectRef) -> bool {
-        false
     }
 
     /// pypy/interpreter/error.py `normalize_exception`.
@@ -235,49 +237,6 @@ impl OperationError {
         }
         Ok(w_type)
     }
-
-    /// `pypy/interpreter/error.py chain_exceptions` parity:
-    ///
-    /// ```python
-    /// def chain_exceptions(self, space, context):
-    ///     w_value = self.normalize_exception(space)
-    ///     w_context = context.normalize_exception(space)
-    ///     if not space.is_w(w_value, w_context):
-    ///         if not isinstance(w_value, W_BaseException):
-    ///             raise oefmt(space.w_SystemError, "not an instance of Exception: %T", w_value)
-    ///         if w_value.w_context is None:
-    ///             _break_context_cycle(space, w_value, w_context)
-    ///             w_value.descr_setcontext(space, w_context)
-    /// ```
-    ///
-    /// Writes flow through the typed `w_context` slot on
-    /// `W_BaseException` (`pyre-object/src/interp_exceptions.rs`'s
-    /// `W_BaseException.w_context` class default).
-    pub fn chain_exceptions(
-        &mut self,
-        space: PyObjectRef,
-        context: &mut OperationError,
-    ) -> Result<(), PyError> {
-        let w_value = self.normalize_exception(space)?;
-        let w_context = context.normalize_exception(space)?;
-        if std::ptr::eq(w_value, w_context) {
-            return Ok(());
-        }
-        if !unsafe { pyre_object::is_exception(w_value) } {
-            return Err(PyError::new(
-                crate::PyErrorKind::SystemError,
-                "not an instance of Exception".to_string(),
-            ));
-        }
-        // `:432-434` — only set __context__ when it isn't already
-        // stamped; mirrors CPython's `_PyErr_ChainExceptions` precedent.
-        let existing = unsafe { pyre_object::interp_exceptions::w_exception_get_context(w_value) };
-        if existing.is_null() {
-            _break_context_cycle(w_value, w_context)?;
-            unsafe { pyre_object::interp_exceptions::w_exception_set_context(w_value, w_context) };
-        }
-        Ok(())
-    }
 }
 
 /// The TypeError raised when instantiating a raised exception class yields
@@ -382,26 +341,6 @@ pub fn chain_context(exc: PyObjectRef, active: PyObjectRef) {
     }
 }
 
-impl From<OperationError> for PyError {
-    fn from(value: OperationError) -> Self {
-        let message = if value.w_value.is_null() {
-            Wtf8Buf::new()
-        } else {
-            Wtf8Buf::from_string("operation error".to_string())
-        };
-        PyError {
-            kind: PyErrorKind::RuntimeError,
-            message,
-            exc_object: value.w_value,
-            attach_tb: true,
-            context_recorded: false,
-            reraise_lasti: -1,
-            w_name_context: std::ptr::null_mut(),
-            w_obj_context: std::ptr::null_mut(),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct ClearedOpErr;
 
@@ -476,6 +415,15 @@ pub struct PyError {
     /// Carried and applied alongside `w_name_context`; `PY_NULL` = unset.
     pub w_obj_context: PyObjectRef,
 }
+
+/// The one interpreter-level exception carrier, corresponding to
+/// `pypy.interpreter.error.OperationError`.
+///
+/// `PyError` remains the Rust-facing compatibility name used by existing
+/// `Result<T, PyError>` signatures and by the source translator; both names
+/// denote this same value and therefore cannot diverge in type, value,
+/// traceback, or context state.
+pub type OperationError = PyError;
 
 impl PyError {
     /// Forward the up-to-three GC-managed references a `PyError` holds — the
@@ -1489,6 +1437,63 @@ impl PyError {
         }
         self.exc_object = w_value;
         Ok(w_value)
+    }
+
+    /// pypy/interpreter/error.py `OperationError.match`.
+    ///
+    /// ```python
+    /// def match(self, space, w_check_class):
+    ///     "Check if this application-level exception matches 'w_check_class'."
+    ///     return space.exception_match(self.w_type, w_check_class)
+    /// ```
+    ///
+    /// Upstream reads `self.w_type`, the class it carries beside the value.
+    /// This carrier keeps the class on the instance instead, so the class is
+    /// materialised the way every other reader gets it — `to_exc_object` — and
+    /// `check_exc_match_against` performs the `space.type` step before the
+    /// match.  That materialisation is why this takes `&mut self`.
+    pub fn match_(&mut self, _space: PyObjectRef, w_check_class: PyObjectRef) -> bool {
+        let w_value = self.to_exc_object();
+        !w_value.is_null() && crate::eval::check_exc_match_against(w_value, w_check_class)
+    }
+
+    /// pypy/interpreter/error.py `chain_exceptions`.
+    ///
+    /// ```python
+    /// def chain_exceptions(self, space, context):
+    ///     w_value = self.normalize_exception(space)
+    ///     w_context = context.normalize_exception(space)
+    ///     if not space.is_w(w_value, w_context):
+    ///         if not isinstance(w_value, W_BaseException):
+    ///             raise oefmt(space.w_SystemError,
+    ///                         "not an instance of Exception: %T", w_value)
+    ///         if w_value.w_context is None:
+    ///             _break_context_cycle(space, w_value, w_context)
+    ///             w_value.descr_setcontext(space, w_context)
+    /// ```
+    ///
+    /// The `w_context is None` test, the cycle break and the write are the
+    /// three steps [`chain_context`] already performs on a pair of normalized
+    /// exceptions, so they are taken there rather than spelled twice; what
+    /// stays here is the part that reports instead of skipping.
+    pub fn chain_exceptions(
+        &mut self,
+        space: PyObjectRef,
+        context: &mut OperationError,
+    ) -> Result<(), PyError> {
+        let w_value = self.normalize_exception(space)?;
+        let w_context = context.normalize_exception(space)?;
+        if std::ptr::eq(w_value, w_context) {
+            return Ok(());
+        }
+        if !unsafe { pyre_object::is_exception(w_value) } {
+            return Err(PyError::new(
+                crate::PyErrorKind::SystemError,
+                "not an instance of Exception".to_string(),
+            ));
+        }
+        chain_context(w_value, w_context);
+        Ok(())
     }
 
     /// pypy/interpreter/error.py `write_unraisable`, with the
@@ -3338,19 +3343,71 @@ pub fn system_exit_code(err: &PyError) -> i32 {
     1
 }
 
+/// pypy/interpreter/error.py `ClearedOpErr`.
+///
+/// ```python
+/// class ClearedOpErr:
+///     def __init__(self, space):
+///         self.operr = OperationError(space.w_None, space.w_None)
+/// ```
+///
+/// Both halves are `space.w_None`, so the cleared carrier names no exception
+/// at all — it is the value "nothing is being handled", not an error.  Here
+/// that is `w_None` in the exception slot: `normalize_exception` refuses it, so
+/// a sentinel that escaped cannot be reported as a raised exception.  The
+/// `kind` tag has no "no exception" spelling and is never read while the slot
+/// holds `w_None`.
 pub fn get_cleared_operation_error(_space: PyObjectRef) -> OperationError {
     let _ = _space;
-    OperationError::new(std::ptr::null_mut(), std::ptr::null_mut())
+    let mut operr = PyError::runtime_error("");
+    operr.exc_object = pyre_object::w_none();
+    operr.attach_tb = false;
+    operr
 }
 
+/// pypy/interpreter/error.py `get_converted_unexpected_exception`.
+///
+/// ```python
+/// except KeyboardInterrupt:
+///     return OperationError(space.w_KeyboardInterrupt, space.w_None)
+/// except MemoryError:
+///     return OperationError(space.w_MemoryError, space.w_None)
+/// except rstackovf.StackOverflow as e:
+///     rstackovf.check_stack_overflow()
+///     return oefmt(space.w_RecursionError, "maximum recursion depth exceeded")
+/// except RuntimeError:   # not on top of py.py
+///     return OperationError(space.w_RuntimeError, space.w_None)
+/// except:
+///     return OperationError(space.w_SystemError, space.newtext(
+///         "unexpected internal exception (please report a bug): %r%s"
+///         % (e, extra)))
+/// ```
+///
+/// The four typed arms re-raise `e` to sort it by RPython exception class.
+/// A `dyn Error` carries no such class: an interrupt reaches pyre through the
+/// signal module rather than as a host error, an allocation failure aborts the
+/// process instead of unwinding, and a stack overflow is caught by the
+/// recursion guard before any host error exists.  So every host error lands in
+/// the `except:` arm, which is also the one that reads `e` — reporting the
+/// failure instead of discarding it.  `extra` names the traceback
+/// `debug_print_traceback` dumps, and nothing dumps one here.
 pub fn get_converted_unexpected_exception(
     _space: PyObjectRef,
-    _error: &dyn std::error::Error,
+    error: &dyn std::error::Error,
 ) -> OperationError {
-    let _ = (_space, _error);
-    OperationError::new(std::ptr::null_mut(), std::ptr::null_mut())
+    let _ = _space;
+    PyError::new(
+        crate::PyErrorKind::SystemError,
+        format!("unexpected internal exception (please report a bug): {error:?}"),
+    )
 }
 
+/// pypy/interpreter/error.py `decompose_valuefmt`.
+///
+/// Upstream splits on `'%'` and asserts `len(parts) == len(formats) + 1`:
+/// every format code has a literal part on each side, so a format string that
+/// ends in one still contributes a trailing empty part.  `_compute_value`
+/// relies on that — it walks the parts and the formats in lockstep.
 pub fn decompose_valuefmt(valuefmt: &str) -> (Vec<String>, Vec<String>) {
     let mut strings = Vec::new();
     let mut formats = Vec::new();
@@ -3373,9 +3430,9 @@ pub fn decompose_valuefmt(valuefmt: &str) -> (Vec<String>, Vec<String>) {
         }
     }
 
-    if !current.is_empty() {
-        strings.push(current);
-    }
+    // Unconditionally, so `"%s"`-terminated formats keep the empty tail part
+    // that makes `strings` one longer than `formats`.
+    strings.push(current);
 
     (strings, formats)
 }
@@ -3389,10 +3446,103 @@ pub fn get_operr_class(valuefmt: &str) -> (PyObjectRef, Vec<String>) {
     get_operrcls2(valuefmt)
 }
 
-pub fn oefmt(w_type: PyObjectRef, valuefmt: &str, _args: impl std::fmt::Display) -> OperationError {
-    let _ = valuefmt;
-    let _ = format!("{}", _args);
-    OperationError::new(w_type, std::ptr::null_mut())
+/// `OperationError(w_type, w_error)` over the instance a class call produced.
+///
+/// Upstream stores the class and the value side by side; `PyError` has no
+/// separate `w_type` slot, so the class survives as the instance's own
+/// `ob_type` and [`PyError::from_exc_object`] reads it back out — which is also
+/// why `wrap_oserror2`'s `space.type(w_error)` needs no separate step here.
+///
+/// A constructor that raised reports its own failure: upstream's
+/// `space.call_function` propagates out of `exception_from_errno` and
+/// `_wrap_oserror2_impl` rather than being replaced by the error they were
+/// assembling.  Only a call that answered with something that is not an
+/// exception has no instance to carry, and takes `fallback`.
+fn operation_error_from_instance(
+    called: Result<PyObjectRef, PyError>,
+    fallback: impl FnOnce() -> OperationError,
+) -> OperationError {
+    match called {
+        Ok(w_error) if !w_error.is_null() && unsafe { pyre_object::is_exception(w_error) } => unsafe {
+            PyError::from_exc_object(w_error)
+        },
+        Err(err) => err,
+        Ok(_) => fallback(),
+    }
+}
+
+/// Instantiate `w_type` with `message`, and carry the result as the error.
+///
+/// A null class falls back to the message alone — a value cannot be reported
+/// through a class that is not there.
+fn operation_error_from_class(w_type: PyObjectRef, message: &str) -> OperationError {
+    if w_type.is_null() {
+        return PyError::runtime_error(message);
+    }
+    // The class and the argument outlive an allocating call only as roots, and
+    // a collection rewrites the root SLOT rather than this frame's copy of the
+    // pointer — so each is read back out of its slot before the call, the way
+    // `alloc_dict_object` re-reads `dstorage` across its header malloc.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = _roots.base();
+    _roots.pin_root(w_type);
+    let w_message = pyre_object::w_str_new(message);
+    _roots.pin_root(w_message);
+    let (w_type, w_message) = (_roots.get(base), _roots.get(base + 1));
+    operation_error_from_instance(
+        crate::call::call_function_impl_result(w_type, &[w_message]),
+        || PyError::runtime_error(message),
+    )
+}
+
+/// pypy/interpreter/error.py `oefmt`.
+///
+/// ```python
+/// def oefmt(w_type, valuefmt, *args):
+///     if not len(args):
+///         return OpErrFmtNoArgs(w_type, valuefmt)
+///     OpErrFmt, strings = get_operr_class(valuefmt)
+///     return OpErrFmt(w_type, strings, *args)
+/// ```
+///
+/// The two `OpErrFmt` classes exist so RPython can defer `%`-interleaving until
+/// something reads the message; `get_operrcls2` cannot mint a class here, so
+/// the work `OpErrFmt._compute_value` does happens up front instead, and what
+/// is left is the step upstream takes in both arms — build the error **from
+/// `w_type`**.
+///
+/// The arguments arrive rendered, one per format code, because the format
+/// codes themselves (`%T`, `%N`, `%R`, …) name object-space spellings a
+/// `Display` already carries.  They stay a sequence rather than one joined
+/// value: a single `Display` handed to a `valuefmt` with several codes reports
+/// the same text in every one of them.
+pub fn oefmt(
+    w_type: PyObjectRef,
+    valuefmt: &str,
+    args: &[&dyn std::fmt::Display],
+) -> OperationError {
+    use std::fmt::Write as _;
+
+    // `OpErrFmtNoArgs(w_type, valuefmt)` — no argument, so the format string is
+    // the message verbatim, `%` sequences and all.
+    let message = if args.is_empty() {
+        valuefmt.to_string()
+    } else {
+        // `OpErrFmt, strings = get_operr_class(valuefmt)`, then the walk
+        // `_compute_value` makes over them: a literal part, the argument
+        // belonging to the format code that followed it, and so on to the
+        // trailing part `decompose_valuefmt` guarantees.
+        let (_op_err_fmt, strings) = get_operr_class(valuefmt);
+        let mut message = String::new();
+        for (i, part) in strings.iter().enumerate() {
+            message.push_str(part);
+            if let Some(arg) = args.get(i) {
+                let _ = write!(message, "{arg}");
+            }
+        }
+        message
+    };
+    operation_error_from_class(w_type, &message)
 }
 
 pub fn debug_print(text: &str, file: Option<&mut dyn Write>, _newline: bool) {
@@ -3401,49 +3551,264 @@ pub fn debug_print(text: &str, file: Option<&mut dyn Write>, _newline: bool) {
     }
 }
 
+/// pypy/interpreter/error.py `exception_from_errno`.
+///
+/// ```python
+/// def exception_from_errno(space, w_type, errno):
+///     msg, lgt = strerror(errno)
+///     w_error = space.call_function(w_type, space.newint(errno),
+///                                   space.newtext(msg, lgt))
+///     return OperationError(w_type, w_error)
+/// ```
 pub fn exception_from_errno(
     _space: PyObjectRef,
     w_type: PyObjectRef,
-    _errno: i32,
+    errno: i32,
 ) -> OperationError {
     let _ = _space;
-    OperationError::new(w_type, std::ptr::null_mut())
+    let msg = PyError::clean_strerror(errno);
+    if w_type.is_null() {
+        // No class to call: `OSError(errno, strerror)` is what the family's
+        // own constructor would have produced.
+        return PyError::os_error_with_errno(errno, "");
+    }
+    // Each argument is read back out of its root slot after the last
+    // allocation: pinning keeps the object alive, but a collection updates the
+    // slot rather than this frame's copy of the pointer.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = _roots.base();
+    _roots.pin_root(w_type);
+    let w_errno = pyre_object::w_int_new(errno as i64);
+    _roots.pin_root(w_errno);
+    let w_msg = pyre_object::w_str_new(&msg);
+    _roots.pin_root(w_msg);
+    let (w_type, w_errno, w_msg) = (_roots.get(base), _roots.get(base + 1), _roots.get(base + 2));
+    operation_error_from_instance(
+        crate::call::call_function_impl_result(w_type, &[w_errno, w_msg]),
+        || PyError::os_error_with_errno(errno, ""),
+    )
 }
 
-pub fn exception_from_saved_errno(_space: PyObjectRef, w_type: PyObjectRef) -> OperationError {
-    let _ = _space;
-    OperationError::new(w_type, std::ptr::null_mut())
+/// pypy/interpreter/error.py `exception_from_saved_errno`.
+///
+/// ```python
+/// def exception_from_saved_errno(space, w_type):
+///     from rpython.rlib.rposix import get_saved_errno
+///     errno = get_saved_errno()
+///     return exception_from_errno(space, w_type, errno)
+/// ```
+///
+/// `rposix.get_saved_errno` reads the errno RPython stashed around the last
+/// external call; the host `errno` this build reads back through
+/// `last_os_error` is the same thread-local the C library wrote.
+pub fn exception_from_saved_errno(space: PyObjectRef, w_type: PyObjectRef) -> OperationError {
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    exception_from_errno(space, w_type, errno)
 }
 
+/// pypy/interpreter/error.py `new_exception_class`.
+///
+/// ```python
+/// def new_exception_class(space, name, w_bases=None, w_dict=None):
+///     if '.' in name:
+///         module, name = name.rsplit('.', 1)
+///     else:
+///         module = None
+///     if w_bases is None:
+///         w_bases = space.newtuple([space.w_Exception])
+///     elif not space.isinstance_w(w_bases, space.w_tuple):
+///         w_bases = space.newtuple([w_bases])
+///     if w_dict is None:
+///         w_dict = space.newdict()
+///     w_exc = space.call_function(
+///         space.w_type, space.newtext(name), w_bases, w_dict)
+///     if module:
+///         space.setattr(w_exc, space.newtext("__module__"), space.newtext(module))
+///     return w_exc
+/// ```
 pub fn new_exception_class(
     _space: PyObjectRef,
-    _name: &str,
-    _bases: Option<PyObjectRef>,
-    _dict: Option<PyObjectRef>,
+    name: &str,
+    w_bases: Option<PyObjectRef>,
+    w_dict: Option<PyObjectRef>,
 ) -> PyObjectRef {
-    let _ = (_space, _name, _bases, _dict);
-    std::ptr::null_mut()
-}
-
-pub fn wrap_oserror2(
-    _space: PyObjectRef,
-    _error: &dyn std::error::Error,
-    _filename: Option<PyObjectRef>,
-    _exception_class: Option<PyObjectRef>,
-) -> OperationError {
-    let _ = (_filename, _exception_class, _error);
     let _ = _space;
-    OperationError::new(std::ptr::null_mut(), std::ptr::null_mut())
+    let (module, name) = match name.rsplit_once('.') {
+        Some((module, name)) => (Some(module), name),
+        None => (None, name),
+    };
+    // Every argument below is pinned and then read back out of its slot: a
+    // collection during a later allocation rewrites the root SLOT and leaves
+    // this frame's copy of the pointer behind, the way `alloc_dict_object`
+    // re-reads `dstorage` across its header malloc.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let w_bases = match w_bases {
+        None => pyre_object::w_tuple_new(vec![crate::typedef::gettypeobject(
+            &pyre_object::interp_exceptions::EXC_EXCEPTION_TYPE,
+        )]),
+        Some(w_bases) if unsafe { !pyre_object::is_tuple(w_bases) } => {
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            _roots.pin_root(w_bases);
+            pyre_object::w_tuple_new(vec![_roots.get(slot)])
+        }
+        Some(w_bases) => w_bases,
+    };
+    let bases_slot = pyre_object::gc_roots::shadow_stack_len();
+    _roots.pin_root(w_bases);
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    _roots.pin_root(w_dict.unwrap_or_else(pyre_object::w_dict_new));
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    _roots.pin_root(pyre_object::w_str_new(name));
+    let args = [
+        _roots.get(name_slot),
+        _roots.get(bases_slot),
+        _roots.get(dict_slot),
+    ];
+    // `space.call_function` propagates its failure; this signature answers with
+    // NULL instead, so the error travels the bare-return convention's channel —
+    // `set_call_error`, which `take_call_error` hands back — rather than being
+    // dropped for a caller that then reads whatever an earlier call left.
+    let w_exc = match crate::call::call_function_impl_result(crate::typedef::w_type(), &args) {
+        Ok(w_exc) => w_exc,
+        Err(err) => {
+            crate::call::set_call_error(err);
+            return std::ptr::null_mut();
+        }
+    };
+    if let Some(module) = module {
+        let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+        _roots.pin_root(w_exc);
+        let w_module = pyre_object::w_str_new(module);
+        let _ = crate::baseobjspace::setattr_str(_roots.get(exc_slot), "__module__", w_module);
+        return _roots.get(exc_slot);
+    }
+    w_exc
 }
 
+/// pypy/interpreter/error.py `wrap_oserror2`, with the body
+/// `_wrap_oserror2_impl` holds.
+///
+/// ```python
+/// if w_exception_class is None:
+///     w_exc = space.w_OSError
+/// else:
+///     w_exc = w_exception_class
+/// ...
+/// errno = e.errno
+/// if errno == EINTR:
+///     space.getexecutioncontext().checksignals()
+/// msg, lgt = strerror(errno)
+/// w_error = space.call_function(w_exc, w_errno, w_msg, w_filename,
+///                               w_winerror, w_filename2)
+/// operror = OperationError(space.type(w_error), w_error)
+/// ```
+///
+/// The `eintr_retry` half of the double API has no caller here, so this is the
+/// `eintr_retry=False` arm: EINTR still runs `checksignals`, and the error is
+/// returned rather than raised.  `w_winerror` stays `None` — the Windows arm
+/// keys on `rwin32.WIN32 and isinstance(e, WindowsError)`, and this build
+/// resolves a host error to its POSIX errno through `io_error_posix_errno` on
+/// every platform.
+pub fn wrap_oserror2(
+    space: PyObjectRef,
+    error: &(dyn std::error::Error + 'static),
+    w_filename: Option<PyObjectRef>,
+    w_exception_class: Option<PyObjectRef>,
+    w_filename2: Option<PyObjectRef>,
+) -> OperationError {
+    let _ = space;
+    // `assert isinstance(e, OSError)` — a host error that is not an io error
+    // carries no errno, so it reports as the generic failure it is.
+    let Some(io_error) = error.downcast_ref::<std::io::Error>() else {
+        return PyError::os_error(error.to_string());
+    };
+    let errno = crate::builtins::io_error_posix_errno(io_error, 0);
+    // wasm32 has neither `libc::EINTR` nor the `signal` module
+    // (`module/mod.rs` gates `pub mod signal` off), so there is no handler for
+    // the retry to check for — the same gate `builtins::eintr_retry_with`
+    // carries.
+    #[cfg(not(target_arch = "wasm32"))]
+    if errno == libc::EINTR {
+        if let Err(err) = crate::module::signal::interp_signal::checksignals_now() {
+            return err;
+        }
+    }
+    let msg = PyError::clean_strerror(errno);
+    let Some(w_exc) = w_exception_class else {
+        // `space.w_OSError` with both names the caller kept.  The custom-class
+        // arm below hands the constructor `w_filename2`, and the default class
+        // takes it in the same position, so a two-path syscall keeps its
+        // `.filename2` slot and the `" -> 'dest'"` suffix `str(e)` renders.
+        return PyError::os_error_syscall2(
+            errno,
+            w_filename.unwrap_or(pyre_object::PY_NULL),
+            w_filename2.unwrap_or(pyre_object::PY_NULL),
+        );
+    };
+    // Pinned, then re-read from the slots: a collection during a later
+    // allocation rewrites the root SLOT and not this frame's copy of the
+    // pointer.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = _roots.base();
+    _roots.pin_root(w_exc);
+    _roots.pin_root(pyre_object::w_int_new(errno as i64));
+    _roots.pin_root(pyre_object::w_str_new(&msg));
+    _roots.pin_root(w_filename.unwrap_or_else(pyre_object::w_none));
+    _roots.pin_root(w_filename2.unwrap_or_else(pyre_object::w_none));
+    // The five the constructor takes, in `_wrap_oserror2_impl`'s order.  A
+    // subclass reading `filename2` sees the argument it declares rather than a
+    // short call.
+    let args = [
+        _roots.get(base + 1),
+        _roots.get(base + 2),
+        _roots.get(base + 3),
+        pyre_object::w_none(),
+        _roots.get(base + 4),
+    ];
+    operation_error_from_instance(
+        crate::call::call_function_impl_result(_roots.get(base), &args),
+        || PyError::os_error_syscall(errno, pyre_object::PY_NULL),
+    )
+}
+
+/// pypy/interpreter/error.py `wrap_oserror`.
+///
+/// ```python
+/// w_filename = None
+/// w_filename2 = None
+/// if filename is not None:
+///     w_filename = space.newfilename(filename)
+///     if filename2 is not None:
+///         w_filename2 = space.newfilename(filename2)
+/// return wrap_oserror2(space, e, w_filename, w_exception_class,
+///                      w_filename2, eintr_retry)
+/// ```
+///
+/// The second name is wrapped only inside the first's arm, so a caller that
+/// passes `filename2` alone reports neither — upstream's nesting, kept.
 pub fn wrap_oserror(
     space: PyObjectRef,
-    error: &dyn std::error::Error,
-    _filename: Option<&str>,
+    error: &(dyn std::error::Error + 'static),
+    filename: Option<&str>,
     w_exception_class: Option<PyObjectRef>,
+    filename2: Option<&str>,
 ) -> OperationError {
-    let _ = _filename;
-    wrap_oserror2(space, error, None, w_exception_class)
+    let Some(filename) = filename else {
+        return wrap_oserror2(space, error, None, w_exception_class, None);
+    };
+    // The first name is rooted across the second's allocation and read back
+    // from its slot afterwards.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = _roots.base();
+    _roots.pin_root(pyre_object::w_str_new(filename));
+    let w_filename2 = filename2.map(pyre_object::w_str_new);
+    wrap_oserror2(
+        space,
+        error,
+        Some(_roots.get(base)),
+        w_exception_class,
+        w_filename2,
+    )
 }
 
 #[cfg(test)]
@@ -3454,6 +3819,63 @@ mod tests {
     fn render_exception_omits_empty_message_separator() {
         let err = PyError::new(PyErrorKind::StopIteration, "");
         assert_eq!(err.render_exception(), "StopIteration");
+    }
+
+    #[test]
+    fn decompose_valuefmt_keeps_one_more_part_than_formats() {
+        // `error.py get_operrcls2` asserts `len(strings) == len(formats) + 1`
+        // on what `decompose_valuefmt` hands back — including when a format
+        // code sits at either end.
+        for valuefmt in [
+            "cannot do %s to %s",
+            "%s leads",
+            "trails %s",
+            "no format codes",
+            "",
+            "%N takes %R and %T",
+        ] {
+            let (strings, formats) = super::decompose_valuefmt(valuefmt);
+            assert_eq!(
+                strings.len(),
+                formats.len() + 1,
+                "{valuefmt:?} -> {strings:?} / {formats:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decompose_valuefmt_folds_a_doubled_percent() {
+        let (strings, formats) = super::decompose_valuefmt("100%% of %s");
+        assert_eq!(strings, vec!["100% of ".to_string(), String::new()]);
+        assert_eq!(formats, vec!["s".to_string()]);
+    }
+
+    #[test]
+    fn oefmt_without_arguments_keeps_the_format_string_verbatim() {
+        // `OpErrFmtNoArgs(w_type, valuefmt)` reports `valuefmt` itself.
+        let err = super::oefmt(std::ptr::null_mut(), "dictionary is empty", &[]);
+        assert_eq!(err.render_exception(), "RuntimeError: dictionary is empty");
+    }
+
+    #[test]
+    fn oefmt_interleaves_the_rendered_argument() {
+        let err = super::oefmt(std::ptr::null_mut(), "cannot add %s", &[&"int"]);
+        assert_eq!(err.render_exception(), "RuntimeError: cannot add int");
+    }
+
+    #[test]
+    fn oefmt_fills_each_format_code_from_its_own_argument() {
+        // One argument per format code, in order: a shape carrying several
+        // codes must not report one of them in all the others' places.
+        let err = super::oefmt(
+            std::ptr::null_mut(),
+            "cannot add %s to %s",
+            &[&"int", &"str"],
+        );
+        assert_eq!(
+            err.render_exception(),
+            "RuntimeError: cannot add int to str"
+        );
     }
 
     #[test]
