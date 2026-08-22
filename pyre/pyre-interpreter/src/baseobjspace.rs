@@ -421,6 +421,24 @@ pub(crate) unsafe fn issubtype_w(w_type: PyObjectRef, cls: PyObjectRef) -> bool 
     issubtype_slow_and_wrong(w_type, cls)
 }
 
+/// JIT walker accessor for `issubtype_w` without exposing the internal helper
+/// as a general cross-crate API.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn jit_issubtype_w(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
+    unsafe { issubtype_w(w_type, cls) }
+}
+
+/// JIT walker accessor for abstractinst.py's `space.isinstance_w(obj, type)`
+/// class test.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn jit_is_type_like_w(obj: PyObjectRef) -> bool {
+    unsafe { is_type_like_w(obj) }
+}
+
 /// `typeobject.py _issubtype_slow_and_wrong` — the subtype test
 /// for a partially-initialised `w_type` whose MRO is not yet installed
 /// (reached only from a custom `MetaCls.mro()`).  Walks the best-base chain
@@ -4853,18 +4871,12 @@ pub(crate) fn len_slot(obj: PyObjectRef) -> PyResult {
                 )),
             };
         }
-        if pyre_object::is_long_range_iter(obj) {
-            // `functional.py W_LongRangeIterator.descr_len → w_len - w_index`.
-            return Ok(pyre_object::range_bigint_to_obj(
-                pyre_object::w_long_range_iter_len(obj),
-            ));
-        }
-        if is_range_iter(obj) {
-            // `functional.py W_IntRangeIterator.descr_len` reports the
-            // stored `remaining` count directly.
-            let r = &*(obj as *const pyre_object::functional::W_IntRangeIterator);
-            return Ok(w_int_new(r.remaining.max(0)));
-        }
+        // A range iterator deliberately has `__length_hint__`, not `__len__`.
+        // `functional.py W_AbstractRangeIterator.typedef` exposes `descr_len`
+        // only under the former name, just like CPython 3.14's
+        // `range_iterator` and `longrange_iterator` type dictionaries.  Do
+        // not turn the concrete payload's remaining count into a length slot:
+        // `len(iter(range(...)))` must fall through and raise TypeError.
         // descroperation.py `_len` — `space.lookup(w_obj, '__len__')`
         // then `space.get_and_call_function(w_descr, w_obj)`.  Routed through
         // `r#type` so a true user instance, a W_Root type (e.g. `deque`), and
@@ -5413,6 +5425,10 @@ fn getdictvalue(obj: PyObjectRef, name: &str) -> Result<Option<PyObjectRef>, PyE
 ///
 /// MapdictWeakrefSupport.getweakref overrides it.
 pub fn getweakref(obj: PyObjectRef) -> Option<PyObjectRef> {
+    if unsafe { crate::pycode::is_code(obj) } {
+        let lifeline = unsafe { crate::pycode::w_code_getweakref(obj) };
+        return (!lifeline.is_null()).then_some(lifeline);
+    }
     if unsafe { pyre_object::memoryview::is_w_memoryview(obj) } {
         let lifeline = unsafe { pyre_object::memoryview::w_memoryview_getweakref(obj) };
         return (!lifeline.is_null()).then_some(lifeline);
@@ -5471,6 +5487,10 @@ pub fn getweakref(obj: PyObjectRef) -> Option<PyObjectRef> {
 ///
 /// MapdictWeakrefSupport.setweakref overrides it.
 pub fn setweakref(obj: PyObjectRef, weakreflifeline: PyObjectRef) -> Result<(), PyError> {
+    if unsafe { crate::pycode::is_code(obj) } {
+        unsafe { crate::pycode::w_code_setweakref(obj, weakreflifeline) };
+        return Ok(());
+    }
     if unsafe { pyre_object::memoryview::is_w_memoryview(obj) } {
         unsafe { pyre_object::memoryview::w_memoryview_setweakref(obj, weakreflifeline) };
         return Ok(());
@@ -5530,6 +5550,10 @@ pub fn setweakref(obj: PyObjectRef, weakreflifeline: PyObjectRef) -> Result<(), 
 ///     pass
 /// ```
 pub fn delweakref(obj: PyObjectRef) {
+    if unsafe { crate::pycode::is_code(obj) } {
+        unsafe { crate::pycode::w_code_setweakref(obj, PY_NULL) };
+        return;
+    }
     if unsafe { pyre_object::memoryview::is_w_memoryview(obj) } {
         unsafe { pyre_object::memoryview::w_memoryview_setweakref(obj, PY_NULL) };
         return;
@@ -5579,7 +5603,13 @@ pub fn delweakref(obj: PyObjectRef) {
 
 pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
     // `space.getattr` — the full path, including the `__getattr__` fallback.
-    getattr_str_impl(obj, name, true, false)
+    getattr_str_impl(obj, name, true, false).map_err(|mut err| {
+        // PyPy 9883bb2a9d `DescrOperation.getattr`: enrich an AttributeError
+        // only after the complete `__getattribute__` / `__getattr__` chain has
+        // failed, preserving a more specific inner lookup's existing context.
+        err.enrich_attribute_error_str(obj, name);
+        err
+    })
 }
 
 /// Shared body of `space.getattr` and the bare `object.__getattribute__` slot.
@@ -6396,14 +6426,36 @@ pub fn getattr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
             crate::type_methods::arg_type_name(w_name)
         )));
     }
+    // A user-defined `__getattribute__` / `__getattr__` runs below and can
+    // allocate enough to move both operands.  The collector rewrites roots,
+    // not this frame's Rust locals, and the enrichment stores the operands on
+    // the exception itself, so hold them on the shadow stack across the lookup
+    // and read them back from their slots rather than from the addresses
+    // captured here.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let operands = pyre_object::gc_roots::pin_roots(&[obj, w_name]);
     let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
-    if unsafe { pyre_object::dictmultiobject::wtf8_key_is_utf8(name) } {
-        getattr_str(obj, unsafe {
-            pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(name)
-        })
+    let result = if unsafe { pyre_object::dictmultiobject::wtf8_key_is_utf8(name) } {
+        // `getattr_str_impl` rather than `getattr_str`: this entry point already
+        // holds the wrapped name, so the enrichment below can hand it over
+        // directly instead of letting `enrich_attribute_error_str` allocate a
+        // fresh one, matching the `w_name`-taking `DescrOperation.getattr`.
+        getattr_str_impl(
+            obj,
+            unsafe { pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(name) },
+            true,
+            false,
+        )
     } else {
         unsafe { getattr_surrogate(obj, w_name, name) }
-    }
+    };
+    result.map_err(|mut err| {
+        err.enrich_attribute_error(
+            pyre_object::gc_roots::shadow_stack_get(operands),
+            pyre_object::gc_roots::shadow_stack_get(operands + 1),
+        );
+        err
+    })
 }
 
 /// `_PyObject_LookupAttr` — the full `space.getattr` protocol for a caller
@@ -6707,7 +6759,7 @@ pub(crate) unsafe fn object_setattr_surrogate(
         // (correct: a surrogate can never name `__eq__`/`__hash__`).
         if is_type(obj) {
             // typeobject.py — only heap types may have their dict mutated.
-            if !pyre_object::w_type_is_heaptype(obj) {
+            if pyre_object::w_type_is_cpython_immutabletype(obj) {
                 return Err(PyError::type_error(format!(
                     "cannot set {} attribute of immutable type '{}'",
                     crate::display::format_wtf8_repr(name),
@@ -6796,7 +6848,7 @@ pub(crate) unsafe fn object_delattr_surrogate(
         }
         if is_type(obj) {
             // typeobject.py:437 — only heap types may have attributes deleted.
-            if !pyre_object::w_type_is_heaptype(obj) {
+            if pyre_object::w_type_is_cpython_immutabletype(obj) {
                 return Err(PyError::type_error(format!(
                     "cannot delete attributes on immutable type object '{}'",
                     w_type_get_name(obj)
@@ -7185,7 +7237,7 @@ pub(crate) fn type_get_annotations(obj: PyObjectRef) -> PyResult {
     // Static builtin types cannot acquire annotations, so reject them before
     // consulting their namespace.  Heap types below may have an explicit
     // class-body entry with this name.
-    if !unsafe { pyre_object::w_type_is_heaptype(obj) } {
+    if !unsafe { pyre_object::w_type_is_cpython_heaptype(obj) } {
         return Err(PyError::attribute_error(format!(
             "type object '{}' has no attribute '__annotations__'",
             unsafe { w_type_get_name(obj) },
@@ -7224,7 +7276,7 @@ pub(crate) fn type_get_annotations(obj: PyObjectRef) -> PyResult {
 }
 
 pub(crate) fn type_set_annotations(obj: PyObjectRef, value: PyObjectRef) -> PyResult {
-    if !unsafe { pyre_object::w_type_is_heaptype(obj) } {
+    if unsafe { pyre_object::w_type_is_cpython_immutabletype(obj) } {
         return Err(PyError::type_error(format!(
             "cannot set '__annotations__' attribute of immutable type '{}'",
             unsafe { w_type_get_name(obj) },
@@ -7249,7 +7301,7 @@ pub(crate) fn type_set_annotations(obj: PyObjectRef, value: PyObjectRef) -> PyRe
 /// own-type slot, never inherited, and replacing it invalidates the result
 /// cached by `type_get_annotations`.
 pub(crate) fn type_set_annotate(obj: PyObjectRef, value: PyObjectRef) -> PyResult {
-    if !unsafe { pyre_object::w_type_is_heaptype(obj) } {
+    if unsafe { pyre_object::w_type_is_cpython_immutabletype(obj) } {
         return Err(PyError::type_error(format!(
             "cannot set '__annotate__' attribute of immutable type '{}'",
             unsafe { w_type_get_name(obj) },
@@ -7278,7 +7330,7 @@ pub(crate) fn type_set_annotate(obj: PyObjectRef, value: PyObjectRef) -> PyResul
 /// None.  A class-body `__annotate__` entry is an ordinary own-class value
 /// and takes precedence over the compiler-facing slot.
 pub(crate) fn type_get_annotate(obj: PyObjectRef) -> PyResult {
-    if !unsafe { pyre_object::w_type_is_heaptype(obj) } {
+    if !unsafe { pyre_object::w_type_is_cpython_heaptype(obj) } {
         return Err(PyError::attribute_error(format!(
             "type object '{}' has no attribute '__annotate__'",
             unsafe { w_type_get_name(obj) },
@@ -7295,7 +7347,7 @@ pub(crate) fn type_get_annotate(obj: PyObjectRef) -> PyResult {
 /// the empty tuple.  Unlike function type parameters, the class slot accepts
 /// any object; the compiler normally stores a tuple.
 pub(crate) fn type_get_type_params(obj: PyObjectRef) -> PyResult {
-    if unsafe { pyre_object::w_type_is_heaptype(obj) }
+    if unsafe { pyre_object::w_type_is_cpython_heaptype(obj) }
         && let Some(value) = crate::type_dict_lookup(obj, "__type_params__")
     {
         return Ok(value);
@@ -7304,7 +7356,7 @@ pub(crate) fn type_get_type_params(obj: PyObjectRef) -> PyResult {
 }
 
 pub(crate) fn type_set_type_params(obj: PyObjectRef, value: PyObjectRef) -> PyResult {
-    if !unsafe { pyre_object::w_type_is_heaptype(obj) } {
+    if unsafe { pyre_object::w_type_is_cpython_immutabletype(obj) } {
         return Err(PyError::type_error(format!(
             "cannot set '__type_params__' attribute of immutable type '{}'",
             unsafe { w_type_get_name(obj) },
@@ -7317,7 +7369,7 @@ pub(crate) fn type_set_type_params(obj: PyObjectRef, value: PyObjectRef) -> PyRe
 }
 
 pub(crate) fn type_del_annotations(obj: PyObjectRef) -> PyResult {
-    if !unsafe { pyre_object::w_type_is_heaptype(obj) } {
+    if unsafe { pyre_object::w_type_is_cpython_immutabletype(obj) } {
         return Err(PyError::type_error(format!(
             "cannot delete '__annotations__' attribute of immutable type '{}'",
             unsafe { w_type_get_name(obj) },
@@ -7365,7 +7417,7 @@ pub(crate) fn type_get_doc(obj: PyObjectRef) -> PyResult {
         let Some(value) = crate::type_dict_lookup(obj, "__doc__") else {
             return Ok(w_none());
         };
-        if w_type_is_heaptype(obj) {
+        if w_type_is_cpython_heaptype(obj) {
             return match get(value, PY_NULL, obj)? {
                 Some(result) => Ok(result),
                 None => Ok(value),
@@ -7377,7 +7429,7 @@ pub(crate) fn type_get_doc(obj: PyObjectRef) -> PyResult {
 
 /// PyPy `typeobject.py descr_set__doc`.
 pub(crate) fn type_set_doc(obj: PyObjectRef, value: PyObjectRef) -> PyResult {
-    if !unsafe { w_type_is_heaptype(obj) } {
+    if unsafe { w_type_is_cpython_immutabletype(obj) } {
         return Err(PyError::type_error(format!(
             "cannot set '__doc__' attribute of immutable type '{}'",
             unsafe { w_type_get_name(obj) },
@@ -9659,7 +9711,7 @@ pub unsafe fn _pure_version_tag(w_type: *mut PyObject) -> u64 {
 #[inline]
 pub(crate) unsafe fn w_type_version_tag(w_type: PyObjectRef) -> u64 {
     if majit_metainterp::jit::we_are_jitted() {
-        if pyre_object::typeobject::w_type_is_heaptype(w_type) {
+        if !pyre_object::w_type_is_cpython_immutabletype(w_type) {
             // Heap types can still be mutated; read the live field (the
             // caller promotes the result).
             return pyre_object::typeobject::w_type_get_version_tag(w_type);
@@ -9933,7 +9985,7 @@ pub unsafe fn getfulltypename(w_obj: PyObjectRef) -> String {
 /// # Safety
 /// `w_type` must be a valid `W_TypeObject`.
 pub unsafe fn getfulltypename_of_type(w_type: PyObjectRef) -> String {
-    if !pyre_object::w_type_is_heaptype(w_type) {
+    if !pyre_object::w_type_is_cpython_heaptype(w_type) {
         return w_type_get_name(w_type).to_string();
     }
     let qualname = pyre_object::w_type_get_qualname(w_type).to_string();
@@ -9954,7 +10006,7 @@ pub unsafe fn getfulltypename_of_type(w_type: PyObjectRef) -> String {
 /// `w_type` must be a valid `W_TypeObject`.
 pub unsafe fn type_repr_qualified_name(w_type: PyObjectRef) -> String {
     let name = w_type_get_name(w_type).to_string();
-    if !pyre_object::w_type_is_heaptype(w_type) {
+    if !pyre_object::w_type_is_cpython_heaptype(w_type) {
         return name;
     }
     let module = lookup_in_type_where(w_type, "__module__")
@@ -10025,7 +10077,7 @@ pub fn load_special_resolve(obj: PyObjectRef, name: &str) -> Result<PyObjectRef,
 /// # Safety
 /// `w_type` must be a valid `W_TypeObject`.
 pub unsafe fn type_fully_qualified_name(w_type: PyObjectRef) -> String {
-    if !pyre_object::w_type_is_heaptype(w_type) {
+    if !pyre_object::w_type_is_cpython_heaptype(w_type) {
         return w_type_get_name(w_type).to_string();
     }
     let qualname = pyre_object::w_type_get_qualname(w_type).to_string();
@@ -10607,7 +10659,7 @@ pub(crate) unsafe fn compute_and_set_mro(w_self: PyObjectRef) -> PyResult {
     }
     let default_mro =
         |index: usize| pyre_object::gc_roots::shadow_stack_get(default_mro_start + index);
-    if pyre_object::w_type_is_heaptype(w_self) {
+    if pyre_object::w_type_is_cpython_heaptype(w_self) {
         let w_metaclass = (*w_self).w_class;
         if !w_metaclass.is_null()
             && let Some((w_where, w_mro_func)) = lookup_where_with_method_cache(w_metaclass, "mro")
@@ -11476,12 +11528,21 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
         let w_module_type =
             crate::typedef::gettypefor(&pyre_object::MODULE_TYPE as *const pyre_object::PyType)
                 .map_or(PY_NULL, |p| p.as_ptr());
-        let old_supported =
-            w_type_is_heaptype(w_oldcls.as_ptr()) || std::ptr::eq(w_oldcls.as_ptr(), w_module_type);
-        let new_supported = w_type_is_heaptype(w_newcls) || std::ptr::eq(w_newcls, w_module_type);
+        // A heap projection is not by itself a mutable one: the extension
+        // families marked through `mark_cpython_heap_type(tp, true)` — array,
+        // the sre types, the _io stack, the posix result types — carry
+        // IMMUTABLETYPE beside HEAPTYPE, and an exact instance of one must not
+        // be retagged to a layout-compatible no-slot subclass.  Both ends need
+        // the mutable half.
+        let old_mutable_heap = w_type_is_cpython_heaptype(w_oldcls.as_ptr())
+            && !w_type_is_cpython_immutabletype(w_oldcls.as_ptr());
+        let new_mutable_heap =
+            w_type_is_cpython_heaptype(w_newcls) && !w_type_is_cpython_immutabletype(w_newcls);
+        let old_supported = old_mutable_heap || std::ptr::eq(w_oldcls.as_ptr(), w_module_type);
+        let new_supported = new_mutable_heap || std::ptr::eq(w_newcls, w_module_type);
         if !old_supported || !new_supported {
             return Err(crate::PyError::type_error(
-                "__class__ assignment only supported for heap types or ModuleType subclasses"
+                "__class__ assignment only supported for mutable types or ModuleType subclasses"
                     .to_string(),
             ));
         }
@@ -11582,7 +11643,7 @@ pub fn type_immutable_attr_raise_is_stable(obj: PyObjectRef, name: &str, is_dele
     unsafe {
         if obj.is_null()
             || !pyre_object::typeobject::is_type(obj)
-            || pyre_object::w_type_is_heaptype(obj)
+            || pyre_object::w_type_is_cpython_heaptype(obj)
         {
             return false;
         }
@@ -12071,7 +12132,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
     unsafe {
         if is_type(obj) {
             // typeobject.py — only heap types may have their dict mutated.
-            if !pyre_object::w_type_is_heaptype(obj) {
+            if pyre_object::w_type_is_cpython_immutabletype(obj) {
                 return Err(PyError::type_error(format!(
                     "cannot set '{}' attribute of immutable type '{}'",
                     name,
@@ -12906,7 +12967,7 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
     unsafe {
         if is_type(obj) {
             // typeobject.py:437 — only heap types may have attributes deleted.
-            if !pyre_object::w_type_is_heaptype(obj) {
+            if pyre_object::w_type_is_cpython_immutabletype(obj) {
                 return Err(PyError::type_error(format!(
                     "cannot delete attributes on immutable type object '{}'",
                     w_type_get_name(obj)
@@ -12985,36 +13046,72 @@ pub fn call(
     w_args: PyObjectRef,
     w_kwds: Option<PyObjectRef>,
 ) -> PyObjectRef {
-    if let Some(w_kwargs) = w_kwds
-        && !w_kwargs.is_null()
-        && !unsafe { is_none(w_kwargs) }
-    {
-        panic!("call with kwargs is not yet implemented in pyre");
-    }
+    // baseobjspace.py:1213-1215 — the packed objects remain live while
+    // `Arguments.frompacked` expands `*args` / `**kwargs`, either of which can
+    // execute Python and collect.  RPython's GC transform roots these locals;
+    // publish and reload the corresponding raw pointers explicitly.
+    let roots = pyre_object::gc_roots::push_roots();
+    let root_base = roots.base();
+    roots.pin_root(callable);
+    roots.pin_root(w_args);
+    roots.pin_root(w_kwds.unwrap_or(PY_NULL));
+    let callable = || roots.get(root_base);
+    let w_args = || roots.get(root_base + 1);
+    let w_kwds = || roots.get(root_base + 2);
 
-    let mut args = Vec::new();
-    unsafe {
-        if is_tuple(w_args) {
-            let len = w_tuple_len(w_args);
-            args.reserve(len);
-            for i in 0..len {
-                if let Some(arg) = w_tuple_getitem(w_args, i as i64) {
-                    args.push(arg);
-                }
-            }
-        } else if is_list(w_args) {
-            let len = w_list_len(w_args);
-            args.reserve(len);
-            for i in 0..len {
-                if let Some(arg) = w_list_getitem(w_args, i as i64) {
-                    args.push(arg);
-                }
-            }
-        } else if !w_args.is_null() {
-            panic!("call() expects tuple or list positional arguments");
+    let args = crate::argument::Arguments::frompacked(
+        (!w_args().is_null()).then_some(w_args()),
+        (!w_kwds().is_null()).then_some(w_kwds()),
+    );
+    let args = match args {
+        Ok(args) => args,
+        Err(error) => {
+            crate::call::set_call_error(error);
+            return PY_NULL;
+        }
+    };
+    match call_args(callable(), &args) {
+        Ok(result) => result,
+        Err(error) => {
+            crate::call::set_call_error(error);
+            PY_NULL
         }
     }
-    call_function(callable, &args)
+}
+
+/// PyPy `descroperation.py:189 call_args` — dispatch one structured
+/// `Arguments` instance without flattening its keyword half.
+pub fn call_args(
+    callable: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, PyError> {
+    if let (Some(keyword_names_w), Some(keywords_w)) =
+        (args.keyword_names_w.as_ref(), args.keywords_w.as_ref())
+        && !keyword_names_w.is_empty()
+    {
+        debug_assert_eq!(keyword_names_w.len(), keywords_w.len());
+        let mut kwargs = Vec::with_capacity(keyword_names_w.len());
+        for (&name, &value) in keyword_names_w.iter().zip(keywords_w.iter()) {
+            // `do_combine_starstarargs_wrapped` already rejects a non-string
+            // key while `**` is expanded, so this only guards the WTF-8 read
+            // below for `Arguments` values built natively instead.
+            if unsafe { !is_str(name) } {
+                return Err(PyError::type_error("keywords must be strings"));
+            }
+            kwargs.push((unsafe { w_str_get_wtf8(name) }.to_owned(), value));
+        }
+        return crate::call::call_with_kwargs_in_ctx(
+            crate::call::getexecutioncontext(),
+            callable,
+            &args.arguments_w,
+            &kwargs,
+        );
+    }
+    crate::call::call_callable_in_ctx(
+        crate::call::getexecutioncontext(),
+        callable,
+        &args.arguments_w,
+    )
 }
 
 /// PyPy: baseobjspace.py `call_obj_args` — add a leading object before args.
@@ -18494,19 +18591,18 @@ fn async_generator_init_hooks(async_gen: PyObjectRef) -> PyResult {
 pub(crate) fn async_generator_anext_method(args: &[PyObjectRef]) -> PyResult {
     let async_gen = args.first().copied().unwrap_or(PY_NULL);
     async_generator_init_hooks(async_gen)?;
-    Ok(pyre_object::generator::w_async_gen_asend_new(
-        async_gen,
-        w_none(),
-    ))
+    let awaitable = pyre_object::generator::w_async_gen_asend_new(async_gen, w_none());
+    crate::executioncontext::register_finalizer(awaitable);
+    Ok(awaitable)
 }
 
 pub(crate) fn async_generator_asend_method(args: &[PyObjectRef]) -> PyResult {
     let async_gen = args.first().copied().unwrap_or(PY_NULL);
     let value = crate::type_methods::arg_or_none(args, 1);
     async_generator_init_hooks(async_gen)?;
-    Ok(pyre_object::generator::w_async_gen_asend_new(
-        async_gen, value,
-    ))
+    let awaitable = pyre_object::generator::w_async_gen_asend_new(async_gen, value);
+    crate::executioncontext::register_finalizer(awaitable);
+    Ok(awaitable)
 }
 
 pub(crate) fn async_generator_athrow_method(args: &[PyObjectRef]) -> PyResult {
@@ -18532,23 +18628,23 @@ pub(crate) fn async_generator_athrow_method(args: &[PyObjectRef]) -> PyResult {
     }
     let async_gen = args[0];
     async_generator_init_hooks(async_gen)?;
-    Ok(pyre_object::generator::w_async_gen_athrow_new(
+    let awaitable = pyre_object::generator::w_async_gen_athrow_new(
         async_gen,
         args[1],
         crate::type_methods::arg_or_none(args, 2),
         crate::type_methods::arg_or_none(args, 3),
-    ))
+    );
+    crate::executioncontext::register_finalizer(awaitable);
+    Ok(awaitable)
 }
 
 pub(crate) fn async_generator_aclose_method(args: &[PyObjectRef]) -> PyResult {
     let async_gen = args.first().copied().unwrap_or(PY_NULL);
     async_generator_init_hooks(async_gen)?;
-    Ok(pyre_object::generator::w_async_gen_athrow_new(
-        async_gen,
-        PY_NULL,
-        w_none(),
-        w_none(),
-    ))
+    let awaitable =
+        pyre_object::generator::w_async_gen_athrow_new(async_gen, PY_NULL, w_none(), w_none());
+    crate::executioncontext::register_finalizer(awaitable);
+    Ok(awaitable)
 }
 
 fn async_gen_unwrap_value(async_gen: PyObjectRef, value: PyObjectRef) -> PyResult {
@@ -18895,6 +18991,95 @@ pub(crate) fn async_gen_athrow_throw_method(args: &[PyObjectRef]) -> PyResult {
             .state = pyre_object::generator::ASYNC_GEN_STATE_CLOSED;
     }
     result
+}
+
+/// CPython 3.14 `async_gen_asend_finalize` /
+/// `async_gen_athrow_finalize`: an async-generator method awaitable that never
+/// left its initial state reports a `RuntimeWarning` from finalizer context.
+/// PyPy's tracing collector reaches the same lifetime through
+/// `W_Root.register_finalizer`; unlike CPython's refcount-triggered
+/// `tp_finalize`, the queue is drained at a GC safe point.
+pub(crate) fn async_gen_awaitable_finalize(awaitable: PyObjectRef) {
+    use pyre_object::generator::{
+        ASYNC_GEN_STATE_INIT, AsyncGenASend, AsyncGenAThrow, w_generator_get_qualname,
+    };
+
+    let (async_gen, method, state) = if let Some(payload) = AsyncGenASend::from_obj(awaitable) {
+        (payload.async_gen, "asend", payload.state)
+    } else if let Some(payload) = AsyncGenAThrow::from_obj(awaitable) {
+        (
+            payload.async_gen,
+            if payload.w_exc_type.is_null() {
+                "aclose"
+            } else {
+                "athrow"
+            },
+            payload.state,
+        )
+    } else {
+        return;
+    };
+    if state != ASYNC_GEN_STATE_INIT {
+        return;
+    }
+
+    // `py_repr_wtf8` and `warn_category_w` both run Python and are therefore
+    // collection points.  `async_gen` and its qualname are plain Rust locals,
+    // which no root walker scans, so pin them on the shadow stack and read
+    // them back at every use past this point.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let async_gen_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(async_gen);
+
+    let qualname = unsafe {
+        w_generator_get_qualname(pyre_object::gc_roots::shadow_stack_get(async_gen_slot))
+    };
+    let qualname_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(qualname);
+    let method_repr = unsafe { crate::display::py_repr_wtf8(w_str_new(method)) }
+        .unwrap_or_else(|_| Wtf8Buf::from_string(format!("'{method}'")));
+    let qualname_repr = unsafe {
+        crate::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(qualname_slot))
+    }
+    .unwrap_or_else(|_| Wtf8Buf::from_string("'<unknown>'".to_owned()));
+    let message = crate::display::wtf8_format!(
+        "coroutine method ",
+        method_repr,
+        " of ",
+        qualname_repr,
+        " was never awaited"
+    );
+    let w_message = w_str_from_wtf8(message);
+    if let Err(mut err) = crate::warn::warn_category_w(w_message, "RuntimeWarning", 1) {
+        // A filter turned into `error` hands back the only reference to the
+        // materialised exception, and it lives in this Rust `PyError`, which
+        // the collector does not scan.  `py_repr_wtf8` below runs app-level
+        // `__repr__` and allocates, so hold the exception on the shadow stack
+        // across the formatting and read it back before it is reported.
+        let exc_slot = if err.exc_object.is_null() {
+            None
+        } else {
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(err.exc_object);
+            Some(slot)
+        };
+        let repr = unsafe {
+            crate::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(async_gen_slot))
+        }
+        .unwrap_or_else(|_| Wtf8Buf::from_string("<async_generator object>".to_owned()));
+        let where_desc = crate::display::wtf8_format!(
+            "Exception ignored while finalizing async generator ",
+            repr
+        );
+        if let Some(slot) = exc_slot {
+            err.exc_object = pyre_object::gc_roots::shadow_stack_get(slot);
+        }
+        err.write_unraisable(
+            w_none(),
+            &where_desc,
+            pyre_object::gc_roots::shadow_stack_get(async_gen_slot),
+        );
+    }
 }
 
 /// generator.py `_finalize_` — called by the GC finalizer when a suspended generator
@@ -19702,6 +19887,62 @@ pub fn dict_move_to_end(obj: PyObjectRef, key: PyObjectRef, last: bool) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn call_expands_packed_arguments_and_keywords() {
+        crate::typedef::init_typeobjects();
+        crate::test_hooks::install_hash_hook();
+        crate::call::clear_call_error();
+
+        let kwargs = w_dict_new();
+        setitem(kwargs, w_str_new("answer"), w_int_new(42)).unwrap();
+        let dict_type = crate::typedef::gettypeobject(&pyre_object::DICT_TYPE);
+        let result = call(dict_type, w_tuple_new(Vec::new()), Some(kwargs));
+        assert!(!result.is_null(), "dict(**kwargs) must return a dict");
+        assert!(crate::call::take_call_error().is_none());
+        let value = unsafe { w_dict_getitem_str(result, "answer") }.expect("keyword stored");
+        assert_eq!(unsafe { w_int_get_value(value) }, 42);
+    }
+
+    #[test]
+    fn call_reports_packed_shape_errors_instead_of_panicking() {
+        crate::typedef::init_typeobjects();
+        crate::test_hooks::install_hash_hook();
+        let dict_type = crate::typedef::gettypeobject(&pyre_object::DICT_TYPE);
+
+        crate::call::clear_call_error();
+        let result = call(dict_type, w_int_new(1), None);
+        assert!(result.is_null());
+        let error = crate::call::take_call_error().expect("non-iterable *args error");
+        assert_eq!(error.kind, PyErrorKind::TypeError);
+        // Not the bare `argument after *`, which is a prefix of the `**`
+        // message and would pass on either error.
+        assert!(
+            error
+                .message_text()
+                .contains("argument after * must be an iterable")
+        );
+
+        crate::call::clear_call_error();
+        let result = call(dict_type, w_tuple_new(Vec::new()), Some(w_none()));
+        assert!(result.is_null());
+        let error = crate::call::take_call_error().expect("non-mapping **kwargs error");
+        assert_eq!(error.kind, PyErrorKind::TypeError);
+        assert!(error.message_text().contains("argument after **"));
+
+        // A mapping whose keys are not strings is rejected while `**` is
+        // expanded, before any of them reaches `call_args`; the identical
+        // check there only guards the unsafe text read for `Arguments`
+        // instances built natively rather than from a packed mapping.
+        crate::call::clear_call_error();
+        let int_keyed = w_dict_new();
+        setitem(int_keyed, w_int_new(1), w_int_new(2)).unwrap();
+        let result = call(dict_type, w_tuple_new(Vec::new()), Some(int_keyed));
+        assert!(result.is_null());
+        let error = crate::call::take_call_error().expect("non-string keyword error");
+        assert_eq!(error.kind, PyErrorKind::TypeError);
+        assert!(error.message_text().contains("keywords must be strings"));
+    }
 
     #[test]
     fn uint_and_truncatedint_use_rbigint_word_conversions() {

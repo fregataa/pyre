@@ -106,6 +106,13 @@ struct Host {
     /// `PYRE_WASM_GUEST_PROFILE` sampling profiler; taken/restored around each
     /// epoch tick so `sample` can borrow the store it lives in.
     guest_profiler: Option<wasmtime::GuestProfiler>,
+    /// Trace slots whose compile exported a `trace_wide`, and whose `slot + 1`
+    /// is therefore a published call target. The reserved spare slot holds the
+    /// narrow function when a compile had no wide entry, so the table alone
+    /// cannot tell the two apart; a replacement that would drop the wide entry
+    /// is rejected against this set rather than leaving `slot + 1` pointing at
+    /// the replaced compile.
+    wide_slots: std::collections::HashSet<u32>,
 }
 
 /// Report `PYRE_*` / `MAJIT_*` settings the guest cannot see.
@@ -1519,10 +1526,18 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>> {
             // Only a trace slot may be cleared; nulling a main-module slot
             // (`id < trace_base`) would corrupt the shared dispatch table.
             if (func_id as u64) >= caller.data().trace_base {
-                // Release the table's hold on the trace function; the slot
-                // itself stays (wasm tables cannot shrink).
+                // Release the table's hold on the trace function; the slots
+                // themselves stay (wasm tables cannot shrink).  `jit_compile`
+                // appends the entry as a pair, so `func_id + 1` holds this
+                // same trace — the wide entry where one was published, the
+                // spare copy of the narrow function otherwise.  Clearing only
+                // the first half leaves the freed trace reachable through
+                // `call_indirect func_id + 1` and rooted for the store's
+                // lifetime, so both halves and the wide record go together.
+                caller.data_mut().wide_slots.remove(&func_id);
                 if let Some(table) = caller.data().table {
                     let _ = table.set(&mut caller, func_id as u64, Ref::Func(None));
+                    let _ = table.set(&mut caller, func_id as u64 + 1, Ref::Func(None));
                 }
             }
         },
@@ -1656,7 +1671,7 @@ fn jit_compile_trace(
     caller: &mut Caller<'_, Host>,
     bytes_ptr: u32,
     bytes_len: u32,
-) -> Result<(Table, Func)> {
+) -> Result<(Table, Func, Option<Func>)> {
     caller.data_mut().jit_compile_count += 1;
     let memory = caller
         .data()
@@ -1745,18 +1760,31 @@ fn jit_compile_trace(
     let trace = instance
         .get_func(&mut *caller, "trace")
         .context("trace module is missing its `trace` export")?;
+    let trace_wide = instance.get_func(&mut *caller, "trace_wide");
 
-    Ok((table, trace))
+    Ok((table, trace, trace_wide))
 }
 
 /// Compile and instantiate a trace, then append its export to the trace table.
 fn jit_compile(caller: &mut Caller<'_, Host>, bytes_ptr: u32, bytes_len: u32) -> Result<u32> {
-    let (table, trace) = jit_compile_trace(caller, bytes_ptr, bytes_len)?;
+    let (table, trace, trace_wide) = jit_compile_trace(caller, bytes_ptr, bytes_len)?;
     // Register the trace into the shared indirect function table so it is
     // reachable by table index. `grow` returns the newly appended slot.
+    //
+    // The pair is appended even for a narrow module. An emitted module names
+    // its wide entry `handle + 1`, and `jit_replace` may install a wide entry
+    // where this compile had none; without the reservation that write would
+    // land on the next trace's own entry. The spare slot holds the narrow
+    // function, which nothing calls: absence is encoded as `wide_slot == 0`.
     let slot = table
-        .grow(&mut *caller, 1, Ref::Func(Some(trace)))
+        .grow(&mut *caller, 2, Ref::Func(Some(trace)))
         .context("register trace into shared table")? as u32;
+    if let Some(wide) = trace_wide {
+        table
+            .set(&mut *caller, slot as u64 + 1, Ref::Func(Some(wide)))
+            .context("register wide trace entry into shared table")?;
+        caller.data_mut().wide_slots.insert(slot);
+    }
     Ok(slot)
 }
 
@@ -1772,7 +1800,7 @@ fn jit_replace(
             "jit_replace_wasm: id {func_id} is not a trace slot"
         )));
     }
-    let (table, trace) = jit_compile_trace(caller, bytes_ptr, bytes_len)?;
+    let (table, trace, trace_wide) = jit_compile_trace(caller, bytes_ptr, bytes_len)?;
     if !matches!(
         table.get(&mut *caller, func_id as u64),
         Some(Ref::Func(Some(_)))
@@ -1781,12 +1809,28 @@ fn jit_replace(
             "jit_replace_wasm: id {func_id} is not a live trace"
         )));
     }
+    // Modules emitted while this slot was wide carry `call_indirect func_id +
+    // 1` baked in. A narrow replacement cannot retract those, so accepting one
+    // would leave the pair straddling two compiles: `func_id` on the new trace
+    // and `func_id + 1` still on the old. Reject the shape change before
+    // either table is touched; a narrow-to-wide replacement stays allowed.
+    if trace_wide.is_none() && caller.data().wide_slots.contains(&func_id) {
+        return Err(Error::msg(format!(
+            "jit_replace_wasm: id {func_id} has a published wide entry the replacement does not"
+        )));
+    }
     // The Store retains every instantiated module. Replacing this table entry
     // therefore leaves an old trace live when a non-tail indirect call still
     // has one of its frames on the guest stack.
     table
         .set(&mut *caller, func_id as u64, Ref::Func(Some(trace)))
         .context("replace trace in shared table")?;
+    if let Some(wide) = trace_wide {
+        table
+            .set(&mut *caller, func_id as u64 + 1, Ref::Func(Some(wide)))
+            .context("replace wide trace entry in shared table")?;
+        caller.data_mut().wide_slots.insert(func_id);
+    }
     Ok(func_id)
 }
 

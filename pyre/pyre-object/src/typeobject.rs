@@ -131,6 +131,35 @@ pub struct W_TypeObject {
     pub mro_w: *mut crate::object_array::FixedObjectArray,
     /// typeobject.py:184 `flag_heaptype` — immutable after creation.
     pub flag_heaptype: bool,
+    /// [3.14-spec] CPython's public `Py_TPFLAGS_HEAPTYPE` ownership axis.
+    ///
+    /// PyPy deliberately collapses every interpreter `TypeDef` to
+    /// `flag_heaptype = False` (`TypeDef.heaptype`, `typeobject.py`).
+    /// CPython 3.14 instead builds many extension-module types through
+    /// `PyType_FromModuleAndSpec`, so they publish HEAPTYPE while remaining
+    /// PyPy-style builtin TypeDefs internally.  Keep that observable owner
+    /// bit separate rather than changing the load-bearing PyPy field above.
+    pub flag_cpython_heaptype: bool,
+    /// CPython-internal `_Py_TPFLAGS_STATIC_BUILTIN` (bit 1).  This is not the
+    /// inverse of HEAPTYPE: a legacy extension type readied through the public
+    /// `PyType_Ready` API has neither bit, whereas an interpreter-owned core
+    /// type initialized by `_PyStaticType_InitBuiltin` carries this one.
+    pub flag_cpython_static_builtin: bool,
+    /// [3.14-spec] CPython's orthogonal `Py_TPFLAGS_IMMUTABLETYPE` axis.
+    ///
+    /// A CPython heap type may still be immutable (the common extension-type
+    /// shape), and `PyType_Freeze` can make an existing heap type immutable.
+    /// PyPy uses `not flag_heaptype` for this question, so the 3.14 projection
+    /// needs its own field instead of overloading the PyPy owner bit.
+    pub flag_cpython_immutabletype: std::sync::atomic::AtomicBool,
+    /// Suppress CPython's public `Py_TPFLAGS_BASETYPE` without changing
+    /// PyPy's load-bearing `Layout.acceptable_as_base_class` field.
+    ///
+    /// PyPy can reject subclassing in a custom metaclass while leaving the
+    /// ordinary app-level layout acceptable.  A CPython static counterpart
+    /// instead records the rejection directly in `tp_flags`; projecting that
+    /// observable difference must not perturb constructor dispatch.
+    pub flag_cpython_suppress_basetype: bool,
     /// typeobject.py `layout` — pointer to shared Layout object.
     pub layout: *const Layout,
     /// typeobject.py:179 `hasdict` — True when instances have __dict__.
@@ -403,6 +432,10 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         bases,
         dict: dict_ptr,
         flag_heaptype: true,
+        flag_cpython_heaptype: true,
+        flag_cpython_static_builtin: false,
+        flag_cpython_immutabletype: std::sync::atomic::AtomicBool::new(false),
+        flag_cpython_suppress_basetype: false,
         layout: std::ptr::null(),
         hasdict: false,
         weakrefable: false,
@@ -526,6 +559,10 @@ pub fn w_type_new_builtin(
         bases,
         dict: dict_ptr,
         flag_heaptype: false,
+        flag_cpython_heaptype: false,
+        flag_cpython_static_builtin: true,
+        flag_cpython_immutabletype: std::sync::atomic::AtomicBool::new(true),
+        flag_cpython_suppress_basetype: false,
         layout: std::ptr::null(),
         hasdict: false,
         weakrefable: false,
@@ -1211,6 +1248,34 @@ pub unsafe fn w_type_issubtype(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
     (*mro_ptr).as_slice().iter().any(|&t| std::ptr::eq(t, cls))
 }
 
+/// Whether a class pattern with one positional sub-pattern receives the
+/// subject itself. CPython stores this as `_Py_TPFLAGS_MATCH_SELF`; PyPy's
+/// pattern opcode recognizes the same builtin atomic families. Membership in
+/// any family's MRO makes the property inherit exactly as CPython's
+/// `inherit_special` does.
+pub unsafe fn w_type_has_match_self(w_type: PyObjectRef) -> bool {
+    if w_type.is_null() || !is_type(w_type) {
+        return false;
+    }
+    for base in [
+        get_instantiate(&INT_TYPE),
+        get_instantiate(&FLOAT_TYPE),
+        get_instantiate(&STR_TYPE),
+        get_instantiate(&LIST_TYPE),
+        get_instantiate(&TUPLE_TYPE),
+        get_instantiate(&DICT_TYPE),
+        get_instantiate(&crate::bytesobject::BYTES_TYPE),
+        get_instantiate(&crate::bytearrayobject::BYTEARRAY_TYPE),
+        get_instantiate(&crate::setobject::SET_TYPE),
+        get_instantiate(&crate::setobject::FROZENSET_TYPE),
+    ] {
+        if !base.is_null() && w_type_issubtype(w_type, base) {
+            return true;
+        }
+    }
+    false
+}
+
 /// typeobject.py find_best_base — the type base whose instance
 /// layout a subtype extends (most-derived layout among the type bases).
 /// Non-raising variant for the null-mro subtype fallback.
@@ -1324,6 +1389,72 @@ pub unsafe fn w_type_set_heaptype(obj: PyObjectRef, value: bool) {
     (*(obj as *mut W_TypeObject)).flag_heaptype = value;
 }
 
+/// Publish the CPython 3.14 owner and mutability axes for a type whose PyPy
+/// storage owner remains unchanged.  Construction sites call this once after
+/// creating an interpreter builtin TypeDef; `PyType_Freeze` only changes the
+/// immutable half through [`w_type_set_cpython_immutabletype`].
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_type_set_cpython_type_flags(
+    obj: PyObjectRef,
+    heaptype: bool,
+    static_builtin: bool,
+    immutabletype: bool,
+) {
+    let t = &mut *(obj as *mut W_TypeObject);
+    t.flag_cpython_heaptype = heaptype;
+    t.flag_cpython_static_builtin = static_builtin;
+    t.flag_cpython_immutabletype
+        .store(immutabletype, std::sync::atomic::Ordering::Release);
+}
+
+/// CPython 3.14 public HEAPTYPE ownership, distinct from PyPy's
+/// [`w_type_is_heaptype`] implementation classification.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_type_is_cpython_heaptype(obj: PyObjectRef) -> bool {
+    (*(obj as *const W_TypeObject)).flag_cpython_heaptype
+}
+
+/// Read CPython's internal STATIC_BUILTIN owner bit.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_type_is_cpython_static_builtin(obj: PyObjectRef) -> bool {
+    (*(obj as *const W_TypeObject)).flag_cpython_static_builtin
+}
+
+/// Set only CPython's public IMMUTABLETYPE axis (used by `PyType_Freeze`).
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_type_set_cpython_immutabletype(obj: PyObjectRef, value: bool) {
+    (*(obj as *const W_TypeObject))
+        .flag_cpython_immutabletype
+        .store(value, std::sync::atomic::Ordering::Release);
+}
+
+/// Read CPython's public IMMUTABLETYPE axis.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_type_is_cpython_immutabletype(obj: PyObjectRef) -> bool {
+    (*(obj as *const W_TypeObject))
+        .flag_cpython_immutabletype
+        .load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Suppress CPython's public BASETYPE bit while preserving PyPy's canonical
+/// layout-level subclassability field and all of its internal readers.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_type_suppress_cpython_basetype(obj: PyObjectRef) {
+    (*(obj as *mut W_TypeObject)).flag_cpython_suppress_basetype = true;
+}
+
 /// typeobject.py `W_TypeObject.get_flags` — compute PyPy's public type flags
 /// from their canonical fields on `W_TypeObject`.
 /// # Safety
@@ -1333,42 +1464,172 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
     if obj.is_null() || !is_type(obj) {
         return 0;
     }
+    const STATIC_BUILTIN: i64 = 1 << 1;
     const HEAPTYPE: i64 = 1 << 9; // copy_reg._HEAPTYPE
+    const INLINE_VALUES: i64 = 1 << 2;
+    const MANAGED_WEAKREF: i64 = 1 << 3;
+    const MANAGED_DICT: i64 = 1 << 4;
     const IMMUTABLETYPE: i64 = 1 << 8;
+    const DISALLOW_INSTANTIATION: i64 = 1 << 7;
+    const BASETYPE: i64 = 1 << 10;
+    const READY: i64 = 1 << 12;
+    const READYING: i64 = 1 << 13;
     const ABSTRACT: i64 = 1 << 20;
+    const MATCH_SELF: i64 = 1 << 22;
+    const HAVE_GC: i64 = 1 << 14;
     const PATMA_SEQUENCE: i64 = 1 << 5;
     const PATMA_MAPPING: i64 = 1 << 6;
     const METHOD_DESCRIPTOR: i64 = 1 << 17;
+    const LONG_SUBCLASS: i64 = 1 << 24;
+    const LIST_SUBCLASS: i64 = 1 << 25;
+    const TUPLE_SUBCLASS: i64 = 1 << 26;
+    const BYTES_SUBCLASS: i64 = 1 << 27;
+    const UNICODE_SUBCLASS: i64 = 1 << 28;
+    const DICT_SUBCLASS: i64 = 1 << 29;
+    const BASE_EXC_SUBCLASS: i64 = 1 << 30;
+    const TYPE_SUBCLASS: i64 = 1 << 31;
 
     let t = &*(obj as *const W_TypeObject);
     let mut flags = 0;
-    if t.flag_heaptype {
+    if t.flag_cpython_static_builtin {
+        flags |= STATIC_BUILTIN;
+    }
+    if t.flag_cpython_heaptype {
         flags |= HEAPTYPE;
-    } else {
-        // `Py_TPFLAGS_IMMUTABLETYPE` (`object.h`, read at v3.14.6): a type
-        // whose attributes cannot be set.  `get_flags` publishes no such bit
-        // — it reports the heap flag and stops — while every type pyre builds
-        // itself already answers "cannot set 'x' attribute of immutable type"
-        // to a store, so the flag names something already true here rather
-        // than changing what any of them does.  Measured over 39 builtins on
-        // 3.14: the bit is set on exactly the types that are not heap types,
-        // and those are exactly the ones that refuse the store, in both
-        // interpreters.  `test_ctypes/_support.py` spells the constant and
-        // `test_win32.py:81` reads it back off `COMError`.
+    }
+
+    if t.flag_cpython_heaptype {
+        // [3.14-spec] `type_new_descriptors` represents a dict slot added by
+        // a heap type with MANAGED_DICT (`typeobject.c`, read at v3.14.6).
+        // PyPy records the same ownership boundary as
+        // `self.hasdict and not self.layout.typedef.hasdict` when choosing a
+        // DictTerminator (typeobject.py:255-257). Project those canonical
+        // fields; do not infer ownership merely from the public capability,
+        // since module instances own their dict in the builtin layout.
+        let layout = t.layout;
+        let typedef_hasdict = !layout.is_null() && (*layout).typedef_hasdict;
+        if t.hasdict && !typedef_hasdict {
+            flags |= MANAGED_DICT;
+            // CPython's `type_ready_managed_dict` adds INLINE_VALUES only to
+            // fixed-size managed-dict types.  This projection shares the
+            // layout typedef used by `type.__itemsize__`.
+            if !w_type_cpython_has_variable_items(obj) {
+                flags |= INLINE_VALUES;
+            }
+        }
+        if w_type_has_cpython_managed_weakref(obj) {
+            flags |= MANAGED_WEAKREF;
+        }
+    }
+    if t.flag_cpython_immutabletype
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        // `Py_TPFLAGS_IMMUTABLETYPE` (`object.h`, read at v3.14.6) is
+        // orthogonal to HEAPTYPE: modern extension types commonly carry both.
+        // PyPy's `descr__flags__` reports neither axis for builtin TypeDefs;
+        // this field publishes CPython's observable split without changing
+        // PyPy's internal type ownership.
         flags |= IMMUTABLETYPE;
     }
-    // typeobject.py `flag_cpytype` marks cpyext-defined static types; pyre has
-    // no equivalent type owner, so its bit is always absent.
     if t.flag_abstract.load(std::sync::atomic::Ordering::Acquire) {
         flags |= ABSTRACT;
+    }
+    // [3.14-spec] CPython `type_ready` exposes READYING while a custom
+    // metaclass's `mro()` is running, then replaces it with READY when the MRO
+    // is installed (`Objects/typeobject.c:450-466, 8986-8991`). PyPy's
+    // partially initialized `W_TypeObject` likewise has `mro_w is None`
+    // (`typeobject.py:1080-1084`), which is pyre's canonical readiness state.
+    if t.mro_w.is_null() {
+        flags |= READYING;
+    } else {
+        flags |= READY;
+    }
+    if t.flag_disallow_instantiation
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        // [3.14-spec] CPython v3.14.6 `Include/object.h:540` assigns bit 7
+        // to `Py_TPFLAGS_DISALLOW_INSTANTIATION`, and
+        // `Objects/typeobject.c:1407` exposes the complete `tp_flags` word.
+        // PyPy `typeobject.py:990-1004` publishes a smaller computed subset.
+        // Preserve that field-by-field shape while exposing the canonical
+        // flag that pyre's `type.__call__` already enforces.
+        flags |= DISALLOW_INSTANTIATION;
+    }
+    if w_type_get_acceptable_as_base_class(obj) && !t.flag_cpython_suppress_basetype {
+        // [3.14-spec] CPython v3.14.6 `Include/object.h:549` assigns bit 10
+        // to `Py_TPFLAGS_BASETYPE`, and `Objects/typeobject.c:3638` uses that
+        // same bit to accept or reject a base class. PyPy
+        // `typeobject.py:990-1004` omits it from the public subset while
+        // `typeobject.py:1116-1118` enforces the canonical
+        // `layout.typedef.acceptable_as_base_class` value. Keep PyPy's
+        // field-by-field shape and publish that existing value.
+        flags |= BASETYPE;
+    }
+    if t.flag_have_gc {
+        // [3.14-spec] CPython v3.14.6 exposes the complete `tp_flags` word
+        // through `Objects/typeobject.c:1407`, and
+        // `Include/object.h:567` assigns this bit to `Py_TPFLAGS_HAVE_GC`.
+        // PyPy `typeobject.py:990-1004` computes a deliberately smaller
+        // public subset. Keep its field-by-field `descr__flags__` shape, but
+        // publish pyre's canonical per-type GC flag for the 3.14 surface.
+        flags |= HAVE_GC;
     }
     if t.flag_method_descriptor {
         flags |= METHOD_DESCRIPTOR;
     }
     match t.flag_map_or_seq.load(std::sync::atomic::Ordering::Acquire) {
         b'M' => flags |= PATMA_MAPPING,
-        b'S' => flags |= PATMA_SEQUENCE,
+        // CPython deliberately omits the sequence-pattern flag from str,
+        // bytes and bytearray (`unicodeobject.c:15805`,
+        // `bytesobject.c:3118`, `bytearrayobject.c:2867`). Pyre keeps PyPy's
+        // internal S marker on these types for `issequence_w`; MATCH_SEQUENCE
+        // applies the same exclusion, so only the public bit is masked here.
+        b'S' if !w_type_issubtype(obj, get_instantiate(&STR_TYPE))
+            && !w_type_issubtype(obj, get_instantiate(&crate::bytesobject::BYTES_TYPE))
+            && !w_type_issubtype(
+                obj,
+                get_instantiate(&crate::bytearrayobject::BYTEARRAY_TYPE),
+            ) =>
+        {
+            flags |= PATMA_SEQUENCE
+        }
         _ => {}
+    }
+    if w_type_has_match_self(obj) {
+        // [3.14-spec] CPython `inherit_special` inherits MATCH_SELF from the
+        // dominant base (`typeobject.c:8204-8206`). PyPy implements the same
+        // observable class-pattern rule with its builtin atomic-type test;
+        // `w_type_has_match_self` centralizes that MRO classification for the
+        // opcode and this public flag.
+        flags |= MATCH_SELF;
+    }
+    // [3.14-spec] CPython v3.14.6 `Objects/typeobject.c:8175-8200`
+    // computes these mutually exclusive fast-subclass flags from the base
+    // MRO in this exact order. PyPy does not publish them from
+    // `descr__flags`, but its canonical classification is the MRO membership
+    // scan in `typeobject.py:603/1640`, ported as `w_type_issubtype`.
+    for (base, bit) in [
+        (
+            crate::interp_exceptions::lookup_exc_class_for_kind(
+                crate::interp_exceptions::ExcKind::BaseException,
+            ),
+            BASE_EXC_SUBCLASS,
+        ),
+        (get_instantiate(&TYPE_TYPE), TYPE_SUBCLASS),
+        (get_instantiate(&INT_TYPE), LONG_SUBCLASS),
+        (
+            get_instantiate(&crate::bytesobject::BYTES_TYPE),
+            BYTES_SUBCLASS,
+        ),
+        (get_instantiate(&STR_TYPE), UNICODE_SUBCLASS),
+        (get_instantiate(&TUPLE_TYPE), TUPLE_SUBCLASS),
+        (get_instantiate(&LIST_TYPE), LIST_SUBCLASS),
+        (get_instantiate(&DICT_TYPE), DICT_SUBCLASS),
+    ] {
+        if !base.is_null() && w_type_issubtype(obj, base) {
+            flags |= bit;
+            break;
+        }
     }
     flags
 }
@@ -1399,6 +1660,49 @@ pub unsafe fn w_type_get_typedef_hasdict(obj: PyObjectRef) -> bool {
     } else {
         (*layout).typedef_hasdict
     }
+}
+
+/// Whether CPython 3.14 projects a non-zero `tp_itemsize` for this PyPy
+/// instance layout.  The exact byte count remains in the interpreter's
+/// `cpython_type_layout`; `type.__flags__` only needs the zero/non-zero split
+/// used by `type_ready_managed_dict` to decide INLINE_VALUES.
+unsafe fn w_type_cpython_has_variable_items(obj: PyObjectRef) -> bool {
+    let typedef = w_type_get_layout(obj);
+    std::ptr::eq(typedef, &TYPE_TYPE)
+        || std::ptr::eq(typedef, &INT_TYPE)
+        || std::ptr::eq(typedef, &LONG_TYPE)
+        || std::ptr::eq(typedef, &TUPLE_TYPE)
+        || std::ptr::eq(typedef, &crate::bytesobject::BYTES_TYPE)
+        || std::ptr::eq(typedef, &crate::memoryview::MEMORYVIEW_TYPE)
+}
+
+/// CPython 3.14 `Py_TPFLAGS_MANAGED_WEAKREF`, projected through PyPy's
+/// `weakrefable` inheritance and `find_best_base` layout owner.
+///
+/// A heap type whose best base is not weakrefable introduced the managed
+/// weakref slot itself.  Otherwise the storage kind follows the best base:
+/// another heap type propagates the managed flag, while a builtin owner such
+/// as `type`, `set`, or `module` terminates the walk with an intrinsic slot.
+/// `copy_flags_from_bases` may also obtain the capability from a compatible
+/// secondary base; when the best base itself lacks it, CPython creates the
+/// managed slot on the new type, which is the first arm below.
+///
+/// This deliberately follows the owner chain instead of testing whether the
+/// `__weakref__` descriptor is still present: deleting a descriptor cannot
+/// rewrite the immutable type-layout flag.
+unsafe fn w_type_has_cpython_managed_weakref(obj: PyObjectRef) -> bool {
+    if obj.is_null() || !is_type(obj) {
+        return false;
+    }
+    let t = &*(obj as *const W_TypeObject);
+    if !t.flag_heaptype || !t.weakrefable {
+        return false;
+    }
+    let bestbase = find_best_base(obj);
+    if bestbase.is_null() || !w_type_get_weakrefable(bestbase) {
+        return true;
+    }
+    w_type_has_cpython_managed_weakref(bestbase)
 }
 /// Override acceptable_as_base_class by cloning the Layout.
 /// typedef.py:742,765,664 explicit overrides after initial creation.
@@ -1719,6 +2023,140 @@ mod tests {
         assert!(Layout::expands_equal(root, true, true, root, true, true));
         // Different hasdict → not equal
         assert!(!Layout::expands_equal(root, true, true, root, false, true));
+    }
+
+    #[test]
+    fn type_flags_project_managed_dict_and_inline_values_from_layout_owner() {
+        const INLINE_VALUES: i64 = 1 << 2;
+        const MANAGED_DICT: i64 = 1 << 4;
+        const BASETYPE: i64 = 1 << 10;
+        const MASK: i64 = INLINE_VALUES | MANAGED_DICT;
+
+        unsafe fn heap_type_with_layout(
+            typedef: *const PyType,
+            typedef_hasdict: bool,
+        ) -> PyObjectRef {
+            let w_type = w_type_new("C", PY_NULL, std::ptr::null_mut());
+            let layout = leak_layout(Layout {
+                typedef,
+                nslots: 0,
+                newslotnames: vec![],
+                base_layout: std::ptr::null(),
+                acceptable_as_base_class: true,
+                typedef_hasdict,
+            });
+            w_type_set_layout(w_type, layout);
+            w_type_set_hasdict(w_type, true);
+            w_type
+        }
+
+        unsafe {
+            // A normal heap instance uses PyPy's DictTerminator and CPython's
+            // fixed-size inline-values representation.
+            let plain = heap_type_with_layout(&INSTANCE_TYPE, false);
+            assert_eq!(w_type_get_flags(plain) & MASK, MASK);
+
+            // An app-level PyPy class may stand in for a CPython static
+            // builtin.  Keep its internal heap owner, but do not publish the
+            // managed-layout bits CPython only assigns to heap types.
+            w_type_set_cpython_type_flags(plain, false, true, true);
+            assert!(w_type_is_heaptype(plain));
+            assert_eq!(w_type_get_flags(plain) & MASK, 0);
+            assert_ne!(w_type_get_flags(plain) & BASETYPE, 0);
+            w_type_suppress_cpython_basetype(plain);
+            assert_eq!(w_type_get_flags(plain) & BASETYPE, 0);
+
+            // A tuple subtype still owns a managed dict, but a non-zero
+            // CPython tp_itemsize excludes INLINE_VALUES.
+            let tuple_subclass = heap_type_with_layout(&TUPLE_TYPE, false);
+            assert_eq!(w_type_get_flags(tuple_subclass) & MASK, MANAGED_DICT);
+
+            // A builtin typedef such as module owns its dict directly, so a
+            // heap subtype sharing that layout has neither managed bit.
+            let native_dict = heap_type_with_layout(&MODULE_TYPE, true);
+            assert_eq!(w_type_get_flags(native_dict) & MASK, 0);
+        }
+    }
+
+    #[test]
+    fn type_flags_project_managed_weakref_through_the_best_base_owner() {
+        const MANAGED_WEAKREF: i64 = 1 << 3;
+        let layout = leak_layout(Layout {
+            typedef: &INSTANCE_TYPE,
+            nslots: 0,
+            newslotnames: vec![],
+            base_layout: std::ptr::null(),
+            acceptable_as_base_class: true,
+            typedef_hasdict: false,
+        });
+
+        unsafe fn builtin_with_layout(name: &str, layout: *const Layout) -> PyObjectRef {
+            let w_type = w_type_new_builtin(name, PY_NULL, std::ptr::null_mut(), &INSTANCE_TYPE);
+            w_type_set_layout(w_type, layout);
+            w_type
+        }
+
+        unsafe fn heap_with_base(
+            name: &str,
+            base: PyObjectRef,
+            layout: *const Layout,
+        ) -> PyObjectRef {
+            let bases = crate::w_tuple_new(vec![base]);
+            let w_type = w_type_new(name, bases, std::ptr::null_mut());
+            w_type_set_layout(w_type, layout);
+            w_type
+        }
+
+        unsafe {
+            let object = builtin_with_layout("object", layout);
+            let plain = heap_with_base("Plain", object, layout);
+            w_type_set_weakrefable(plain, true);
+            assert_ne!(w_type_get_flags(plain) & MANAGED_WEAKREF, 0);
+
+            let derived = heap_with_base("Derived", plain, layout);
+            w_type_set_weakrefable(derived, true);
+            assert_ne!(w_type_get_flags(derived) & MANAGED_WEAKREF, 0);
+
+            let intrinsic = builtin_with_layout("intrinsic", layout);
+            w_type_set_weakrefable(intrinsic, true);
+            let intrinsic_subclass = heap_with_base("IntrinsicChild", intrinsic, layout);
+            w_type_set_weakrefable(intrinsic_subclass, true);
+            assert_eq!(w_type_get_flags(intrinsic_subclass) & MANAGED_WEAKREF, 0);
+        }
+    }
+
+    #[test]
+    fn type_flags_keep_cpython_owner_and_immutability_orthogonal() {
+        const STATIC_BUILTIN: i64 = 1 << 1;
+        const IMMUTABLETYPE: i64 = 1 << 8;
+        const HEAPTYPE: i64 = 1 << 9;
+        const MASK: i64 = STATIC_BUILTIN | IMMUTABLETYPE | HEAPTYPE;
+
+        unsafe {
+            // `_PyStaticType_InitBuiltin`: interpreter-owned static builtin.
+            let core = w_type_new_builtin("core", PY_NULL, std::ptr::null_mut(), &INSTANCE_TYPE);
+            assert_eq!(
+                w_type_get_flags(core) & MASK,
+                STATIC_BUILTIN | IMMUTABLETYPE
+            );
+
+            // `PyType_FromModuleAndSpec`: a heap-owned but immutable extension
+            // type.  Its PyPy implementation owner remains a builtin TypeDef.
+            let extension =
+                w_type_new_builtin("extension", PY_NULL, std::ptr::null_mut(), &INSTANCE_TYPE);
+            w_type_set_cpython_type_flags(extension, true, false, true);
+            assert!(!w_type_is_heaptype(extension));
+            assert_eq!(w_type_get_flags(extension) & MASK, HEAPTYPE | IMMUTABLETYPE);
+
+            // A legacy static extension readied through public PyType_Ready is
+            // neither a core static builtin nor a heap type, but is immutable.
+            w_type_set_cpython_type_flags(extension, false, false, true);
+            assert_eq!(w_type_get_flags(extension) & MASK, IMMUTABLETYPE);
+
+            // An app-level class remains mutable and heap-owned.
+            let user = w_type_new("User", PY_NULL, std::ptr::null_mut());
+            assert_eq!(w_type_get_flags(user) & MASK, HEAPTYPE);
+        }
     }
 
     #[test]

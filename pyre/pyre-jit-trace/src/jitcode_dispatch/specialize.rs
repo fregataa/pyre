@@ -522,6 +522,44 @@ pub(crate) fn try_walker_specialize_unary_invert_int<Sym: WalkSym>(
 /// not both concrete `W_IntObject`, or an unsupported helper arm is reached — the caller
 /// then falls through to the generic `CallMayForce` record so the
 /// Python-level `__op__` semantics are preserved.
+/// The raw machine int of an int/bool operand, for the specialized IR.
+///
+/// The ordinary path guards the operand's exact class and loads `intval` out
+/// of the box.  A bool this same walk boxed still carries the truth Int it was
+/// built from ([`bool_box_truth_lookup`]), so the arithmetic reads that
+/// directly and the box, its class guard and its `intval` load all go dead —
+/// the arithmetic twin of the `POP_JUMP_IF_*` fold, which is this walker's
+/// runtime reconstruction of `jtransform.py optimize_goto_if_not`.
+///
+/// The branch consumer may take the truth operand as it stands because it only
+/// asks whether it is nonzero.  Arithmetic may not: `jit_bool_value_from_truth`
+/// maps *every* nonzero truth to `intval` 1, so the value the box would have
+/// yielded is the normalized `int_is_true`, not the operand itself.
+fn walker_int_operand_raw<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    operand: OpRef,
+    operand_obj: pyre_object::PyObjectRef,
+    type_addr: i64,
+    intval_descr: majit_ir::DescrRef,
+    concrete: i64,
+) -> Result<OpRef, DispatchError> {
+    if let Some(truth) = bool_box_truth_lookup(operand) {
+        let normalized = ctx.trace_ctx.record_op(OpCode::IntIsTrue, &[truth]);
+        ctx.trace_ctx
+            .set_opref_concrete(normalized, majit_ir::Value::Int(concrete));
+        return Ok(normalized);
+    }
+    let raw = walker_unbox_int_typed(ctx, op_pc, operand, type_addr, intval_descr)?;
+    walker_guard_exact_w_class(
+        ctx,
+        op_pc,
+        operand,
+        walker_numeric_builtin_class(operand_obj),
+    )?;
+    Ok(raw)
+}
+
 pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -697,10 +735,8 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
     // (BOOL_TYPE / INT_TYPE) so a bool unboxes through its own class.
     let (lhs_type, lhs_descr) = crate::state::int_or_bool_unbox_type_descr(lhs_obj);
     let (rhs_type, rhs_descr) = crate::state::int_or_bool_unbox_type_descr(rhs_obj);
-    let lhs_raw = walker_unbox_int_typed(ctx, op_pc, lhs, lhs_type, lhs_descr)?;
-    walker_guard_exact_w_class(ctx, op_pc, lhs, walker_numeric_builtin_class(lhs_obj))?;
-    let rhs_raw = walker_unbox_int_typed(ctx, op_pc, rhs, rhs_type, rhs_descr)?;
-    walker_guard_exact_w_class(ctx, op_pc, rhs, walker_numeric_builtin_class(rhs_obj))?;
+    let lhs_raw = walker_int_operand_raw(ctx, op_pc, lhs, lhs_obj, lhs_type, lhs_descr, la)?;
+    let rhs_raw = walker_int_operand_raw(ctx, op_pc, rhs, rhs_obj, rhs_type, rhs_descr, rb)?;
     if overflows {
         let concrete_value = match op_code {
             OpCode::IntAddOvf => la.wrapping_add(rb),
@@ -2545,13 +2581,17 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
 /// this shape, so a successful fold provably cannot raise `AttributeError` —
 /// dropping the residual's exception guard is sound even in a handler-bearing
 /// body (same reasoning as the LoadGlobal fold).
-#[allow(clippy::too_many_arguments)]
+///
+/// `name` is the already-resolved attribute name, so the fold serves both the
+/// `LOAD_ATTR` residual — whose caller reads it out of the jitcode's own
+/// `co_names` — and the `getattr(obj, "name")` builtin, whose name arrives as a
+/// constant string operand.  Both spell one `space.getattr`, so they must reach
+/// the same read.
 pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     obj: OpRef,
-    w_code_ptr: usize,
-    name_idx: usize,
+    name: &str,
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
@@ -2563,11 +2603,6 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     // The receiver must be a concrete instance for the map/storageindex
     // resolution below; a non-concrete or non-instance receiver declines.
     let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
-        return Ok(None);
-    };
-    // Resolve the attribute name from the jitcode's own PyCode `co_names`
-    // (mirrors `bh_load_attr_fn`; the codewriter passes the raw co_names index).
-    let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
         return Ok(None);
     };
     // CPython 3.14 exposes an optimized frame's locals as a fresh
@@ -2618,9 +2653,9 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     }
     // `mapdict.py` resolution, returning the fold ingredients (the
     // read is left to the caller so it can be folded to a guarded inline read).
-    if let Some((w_type, version_tag, map, storageindex)) = unsafe {
-        pyre_interpreter::objspace::std::mapdict::load_attr_fast_path(concrete_obj, &name)
-    } {
+    if let Some((w_type, version_tag, map, storageindex)) =
+        unsafe { pyre_interpreter::objspace::std::mapdict::load_attr_fast_path(concrete_obj, name) }
+    {
         walker_guard_mapdict_instance_shape(
             ctx,
             op_pc,
@@ -2644,7 +2679,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         return Ok(Some(()));
     }
 
-    if let Some(walk_field) = traceback_walk_field(concrete_obj, &name) {
+    if let Some(walk_field) = traceback_walk_field(concrete_obj, name) {
         if let Some(()) = walker_specialize_traceback_walk_field(
             ctx,
             op_pc,
@@ -2680,7 +2715,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
             pyre_interpreter::objspace::std::mapdict::instance_dict_attr_fast_path(
                 concrete_obj,
                 dict,
-                &name,
+                name,
             )
         }
         // An unboxed float slot keeps the `f64` bit pattern in the same
@@ -2805,7 +2840,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     }
 
     if let Some((slot, kind, w_type, version_tag, stored)) = unsafe {
-        pyre_interpreter::baseobjspace::exception_attr_slot_fold(concrete_obj, &name, false)
+        pyre_interpreter::baseobjspace::exception_attr_slot_fold(concrete_obj, name, false)
     } {
         if slot == pyre_interpreter::baseobjspace::ExceptionAttrSlot::Args
             && unsafe { (*(stored as *const pyre_object::listobject::W_ListObject)).strategy }
@@ -3021,15 +3056,12 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
             pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::MODULE_TYPE),
         )
         && !unsafe {
-            pyre_interpreter::baseobjspace::type_lookup_is_data_descr(
-                (*concrete_obj).w_class,
-                &name,
-            )
+            pyre_interpreter::baseobjspace::type_lookup_is_data_descr((*concrete_obj).w_class, name)
         }
     {
         let w_dict = unsafe { pyre_object::w_module_get_w_dict(concrete_obj) };
         if !w_dict.is_null() && !majit_gc::can_move(majit_ir::GcRef(w_dict as usize)) {
-            if let Some(slot) = crate::state::module_dict_cell_slot_direct(w_dict, &name) {
+            if let Some(slot) = crate::state::module_dict_cell_slot_direct(w_dict, name) {
                 if let Some(stored) = crate::state::module_dict_cell_value_direct(w_dict, slot) {
                     if !stored.is_null() && !majit_gc::can_move(majit_ir::GcRef(stored as usize)) {
                         // Pin the receiver to THIS module so the baked dict
@@ -3055,7 +3087,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     }
 
     let Some((w_type, version_tag, map, storageindex, listindex, unbox_type)) = (unsafe {
-        pyre_interpreter::objspace::std::mapdict::load_attr_unboxed_fast_path(concrete_obj, &name)
+        pyre_interpreter::objspace::std::mapdict::load_attr_unboxed_fast_path(concrete_obj, name)
     }) else {
         return Ok(None);
     };
@@ -7135,6 +7167,290 @@ pub(crate) fn try_walker_specialize_builtin_len<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+fn walker_isinstance_exact_type_hit(
+    obj: pyre_object::PyObjectRef,
+    cls: pyre_object::PyObjectRef,
+) -> Option<(i64, Option<pyre_object::PyObjectRef>)> {
+    let obj_type = pyre_interpreter::typedef::r#type(obj)?;
+    if !std::ptr::eq(obj_type.as_ptr(), cls) {
+        return None;
+    }
+    walker_isinstance_obj_type_guard_info(obj, cls)
+}
+
+fn walker_isinstance_obj_type_guard_info(
+    obj: pyre_object::PyObjectRef,
+    obj_type: pyre_object::PyObjectRef,
+) -> Option<(i64, Option<pyre_object::PyObjectRef>)> {
+    let physical_type = unsafe { (*obj).ob_type as i64 };
+    let stored_w_class = unsafe { (*obj).w_class };
+    if stored_w_class.is_null() {
+        Some((physical_type, None))
+    } else if std::ptr::eq(stored_w_class, obj_type) {
+        Some((physical_type, Some(stored_w_class)))
+    } else {
+        None
+    }
+}
+
+fn walker_isinstance_tuple_element_can_precede_hit(item: pyre_object::PyObjectRef) -> bool {
+    pyre_interpreter::typedef::r#type(item)
+        .is_some_and(|meta| std::ptr::eq(meta.as_ptr(), pyre_interpreter::typedef::w_type()))
+}
+
+fn walker_guard_ref_value<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    opref: OpRef,
+    expected_obj: pyre_object::PyObjectRef,
+) -> Result<(), DispatchError> {
+    if !opref.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(expected_obj as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[opref, expected], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+        ctx.trace_ctx.heap_cache_mut().replace_box(opref, expected);
+    }
+    Ok(())
+}
+
+struct WalkerIsinstanceFold {
+    physical_type: i64,
+    exact_w_class: Option<pyre_object::PyObjectRef>,
+    guarded_cls: pyre_object::PyObjectRef,
+    pinned_obj_type: Option<pyre_object::PyObjectRef>,
+    result: bool,
+}
+
+/// `isinstance(obj, cls)` in the quick exact-type cases from
+/// `abstractinst.py` `abstract_isinstance_w`: before union recursion or
+/// `__instancecheck__` lookup, `type(obj) is cls` returns `True`; for tuple
+/// classinfo the interpreter loops the tuple and recurses into that same test.
+///
+/// A scalar miss where `type(cls) is type` can also fold through
+/// `p_recursive_isinstance_type_w`: a positive `issubtype_w(type(obj), cls)`
+/// never reads `obj.__class__`; a negative answer is folded only when the
+/// receiver type resolves `__class__` to the stock `object.__class__`
+/// descriptor.
+pub(crate) fn try_walker_specialize_builtin_isinstance<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    // Plain `bh_call_fn(callable, PY_NULL, obj, cls)` shape only.
+    if r_args.len() != 4 {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (
+        ConcreteValue::Ref(concrete_callable),
+        ConcreteValue::Ref(null_or_self),
+        ConcreteValue::Ref(obj),
+        ConcreteValue::Ref(cls),
+    ) = (
+        arg_concretes[0],
+        arg_concretes[1],
+        arg_concretes[2],
+        arg_concretes[3],
+    )
+    else {
+        return Ok(None);
+    };
+    // A non-null `null_or_self` is a bound receiver `bh_call_fn_impl`
+    // prepends as arg0, not a plain `isinstance(obj, cls)` call.
+    if concrete_callable.is_null() || !null_or_self.is_null() || obj.is_null() || cls.is_null() {
+        return Ok(None);
+    }
+    if !pyre_interpreter::builtins::is_builtin_isinstance_function(concrete_callable) {
+        return Ok(None);
+    }
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
+        return Ok(None);
+    }
+    let fold = unsafe {
+        if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(cls) {
+            return Ok(None);
+        }
+        if std::ptr::eq((*cls).ob_type, &pyre_object::pyobject::TUPLE_TYPE) {
+            let tuple_class =
+                pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE);
+            if !std::ptr::eq((*cls).w_class, tuple_class) {
+                return Ok(None);
+            }
+            let n = pyre_object::w_tuple_len(cls);
+            for i in 0..n {
+                let Some(item) = pyre_object::w_tuple_getitem(cls, i as i64) else {
+                    return Ok(None);
+                };
+                if pyre_object::is_tuple(item) {
+                    return Ok(None);
+                }
+            }
+            let mut hit = None;
+            for i in 0..n {
+                let Some(item) = pyre_object::w_tuple_getitem(cls, i as i64) else {
+                    return Ok(None);
+                };
+                if let Some(proof) = walker_isinstance_exact_type_hit(obj, item) {
+                    hit = Some(proof);
+                    break;
+                }
+                if !walker_isinstance_tuple_element_can_precede_hit(item) {
+                    return Ok(None);
+                }
+            }
+            let Some((physical_type, exact_w_class)) = hit else {
+                return Ok(None);
+            };
+            WalkerIsinstanceFold {
+                physical_type,
+                exact_w_class,
+                guarded_cls: cls,
+                pinned_obj_type: None,
+                result: true,
+            }
+        } else {
+            if let Some((physical_type, exact_w_class)) = walker_isinstance_exact_type_hit(obj, cls)
+            {
+                WalkerIsinstanceFold {
+                    physical_type,
+                    exact_w_class,
+                    guarded_cls: cls,
+                    pinned_obj_type: None,
+                    result: true,
+                }
+            } else {
+                if !pyre_object::is_type(cls) {
+                    return Ok(None);
+                }
+                let Some(cls_type) = pyre_interpreter::typedef::r#type(cls) else {
+                    return Ok(None);
+                };
+                if !std::ptr::eq(cls_type.as_ptr(), pyre_interpreter::typedef::w_type()) {
+                    return Ok(None);
+                }
+                let Some(obj_type) = pyre_interpreter::typedef::r#type(obj) else {
+                    return Ok(None);
+                };
+                let obj_type = obj_type.as_ptr();
+                if !pyre_object::is_type(obj_type) {
+                    return Ok(None);
+                }
+                let version_tag = pyre_object::typeobject::w_type_get_version_tag(obj_type);
+                if version_tag == 0 {
+                    return Ok(None);
+                }
+                let Some((physical_type, exact_w_class)) =
+                    walker_isinstance_obj_type_guard_info(obj, obj_type)
+                else {
+                    return Ok(None);
+                };
+                let result = pyre_interpreter::baseobjspace::jit_issubtype_w(obj_type, cls);
+                if !result
+                    && !pyre_interpreter::baseobjspace::isinstance_miss_class_lookup_is_pure(
+                        obj_type,
+                    )
+                {
+                    return Ok(None);
+                }
+                WalkerIsinstanceFold {
+                    physical_type,
+                    exact_w_class,
+                    guarded_cls: cls,
+                    pinned_obj_type: Some(obj_type),
+                    result,
+                }
+            }
+        }
+    };
+
+    // --- emit the specialized IR (walker-native) ---
+    // Pin the callable identity (LOAD_GLOBAL `isinstance` is usually already
+    // constant via the namespace cell fold).
+    let callable_op = r_args[0];
+    walker_guard_ref_value(ctx, op.pc, callable_op, concrete_callable)?;
+    let obj_op = r_args[2];
+    walker_guard_class(ctx, op.pc, obj_op, fold.physical_type)?;
+    if let Some(exact_w_class) = fold.exact_w_class {
+        walker_guard_exact_w_class(ctx, op.pc, obj_op, exact_w_class)?;
+    }
+    let cls_op = r_args[3];
+    walker_guard_ref_value(ctx, op.pc, cls_op, fold.guarded_cls)?;
+    if let Some(obj_type) = fold.pinned_obj_type {
+        let obj_type_const = ctx.trace_ctx.const_ref(obj_type as i64);
+        walker_pin_type_version_tag(ctx, op.pc, obj_type_const)?;
+    }
+    walker_write_const_bool_result(ctx, op.pc, fold.result, dst, 'r')?;
+    Ok(Some(()))
+}
+
+pub(crate) fn try_walker_specialize_builtin_issubclass<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    // Plain `bh_call_fn(callable, PY_NULL, derived, cls)` shape only.
+    if r_args.len() != 4 {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (
+        ConcreteValue::Ref(concrete_callable),
+        ConcreteValue::Ref(null_or_self),
+        ConcreteValue::Ref(derived),
+        ConcreteValue::Ref(cls),
+    ) = (
+        arg_concretes[0],
+        arg_concretes[1],
+        arg_concretes[2],
+        arg_concretes[3],
+    )
+    else {
+        return Ok(None);
+    };
+    if concrete_callable.is_null() || !null_or_self.is_null() || derived.is_null() || cls.is_null()
+    {
+        return Ok(None);
+    }
+    if !pyre_interpreter::builtins::is_builtin_issubclass_function(concrete_callable) {
+        return Ok(None);
+    }
+
+    let result = unsafe {
+        if pyre_object::is_generic_alias(derived)
+            || !pyre_object::is_type(derived)
+            || !pyre_object::is_type(cls)
+            || !pyre_interpreter::baseobjspace::jit_is_type_like_w(derived)
+            || !pyre_interpreter::baseobjspace::jit_is_type_like_w(cls)
+        {
+            return Ok(None);
+        }
+        let Some(cls_type) = pyre_interpreter::typedef::r#type(cls) else {
+            return Ok(None);
+        };
+        if !std::ptr::eq(cls_type.as_ptr(), pyre_interpreter::typedef::w_type()) {
+            return Ok(None);
+        }
+        let version_tag = pyre_object::typeobject::w_type_get_version_tag(derived);
+        if version_tag == 0 {
+            return Ok(None);
+        }
+        pyre_interpreter::baseobjspace::jit_issubtype_w(derived, cls)
+    };
+
+    walker_guard_ref_value(ctx, op.pc, r_args[0], concrete_callable)?;
+    walker_guard_ref_value(ctx, op.pc, r_args[2], derived)?;
+    walker_guard_ref_value(ctx, op.pc, r_args[3], cls)?;
+    let derived_const = ctx.trace_ctx.const_ref(derived as i64);
+    walker_pin_type_version_tag(ctx, op.pc, derived_const)?;
+    walker_write_const_bool_result(ctx, op.pc, result, dst, 'r')?;
+    Ok(Some(()))
+}
+
 /// Fold plain `getattr(type, name)` when
 /// [`pyre_interpreter::type_attr_value_fast_path`] proves that
 /// `typeobject.py:811-828` returns the class-MRO value unchanged.  The exact
@@ -7248,6 +7564,242 @@ pub(crate) fn try_walker_specialize_builtin_type_getattr<Sym: WalkSym>(
 
     let value_const = ctx.trace_ctx.const_ref(w_value as i64);
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', value_const)?;
+    Ok(Some(()))
+}
+
+/// `getattr(obj, "name")` — the builtin spelling of the `LOAD_ATTR` fold.
+///
+/// `space.getattr` is the one operation both `obj.name` and this builtin
+/// reach, so a constant `str` name admits exactly the instance-shape read
+/// [`try_walker_specialize_load_attr`] already emits, and the two forms stay on
+/// one implementation rather than drifting the way a fast-path pair can
+/// (`getattr(obj, 'm')` versus `obj.m` is the classic discriminator).
+///
+/// The three-argument `getattr(obj, name, default)` stays on the residual: the
+/// fold's map guard proves the attribute is *present*, which says nothing about
+/// the branch that supplies the default.
+pub(crate) fn try_walker_specialize_builtin_getattr<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    // Plain `bh_call_fn(callable, PY_NULL, obj, name)` shape only; the
+    // three-argument form arrives one operand longer and declines here.
+    if r_args.len() != 4 {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (
+        ConcreteValue::Ref(concrete_callable),
+        ConcreteValue::Ref(null_or_self),
+        ConcreteValue::Ref(concrete_obj),
+        ConcreteValue::Ref(concrete_name),
+    ) = (
+        arg_concretes[0],
+        arg_concretes[1],
+        arg_concretes[2],
+        arg_concretes[3],
+    )
+    else {
+        return Ok(None);
+    };
+    // A non-null `null_or_self` is a bound receiver `bh_call_fn_impl` prepends
+    // as arg0 — not a plain `getattr(obj, name)` call.
+    if concrete_callable.is_null()
+        || !null_or_self.is_null()
+        || concrete_obj.is_null()
+        || concrete_name.is_null()
+    {
+        return Ok(None);
+    }
+    if !pyre_interpreter::builtins::is_builtin_getattr_function(concrete_callable) {
+        return Ok(None);
+    }
+    // The name is rejected before any lookup unless it is a string, and the
+    // resolved bytes below stay valid only while this exact string is the
+    // operand.  A name that is not valid UTF-8 cannot match an attribute the
+    // fold's `&str` lookups can find, so it declines with the rest.
+    if !unsafe { pyre_object::is_exact_type(concrete_name, &pyre_object::pyobject::STR_TYPE) } {
+        return Ok(None);
+    }
+    let Ok(name) = (unsafe { pyre_object::w_str_get_wtf8(concrete_name) }).as_str() else {
+        return Ok(None);
+    };
+
+    let pre_emit_pos = ctx.trace_ctx.get_trace_position();
+    let callable_op = r_args[0];
+    if !callable_op.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op.pc,
+            OpCode::GuardValue,
+            &[callable_op, expected],
+        )?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(callable_op, expected);
+    }
+    let name_ref = r_args[3];
+    if !name_ref.is_constant() {
+        let name_const = ctx.trace_ctx.const_ref(concrete_name as i64);
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op.pc,
+            OpCode::GuardValue,
+            &[name_ref, name_const],
+        )?;
+    }
+
+    // Every shape the read declines has to leave the trace as it found it: the
+    // two guards above are the premise of a fold that is no longer there, and
+    // the residual the caller falls through to recomputes the lookup from the
+    // unguarded operands.
+    if (try_walker_specialize_load_attr(ctx, op.pc, r_args[2], name, dst, 'r')?).is_none() {
+        ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+        return Ok(None);
+    }
+    Ok(Some(()))
+}
+
+/// `hasattr(obj, "name")` — settled by the instance shape, without a read.
+///
+/// [`builtin_hasattr`] answers False only for the `AttributeError` its lookup
+/// raises, and the map `guard_value` below proves the attribute is present on
+/// this exact shape.  So the guards alone decide the call: the result is a
+/// constant True and the attribute's value is never loaded, which is strictly
+/// less work than the `getattr` fold does for the same receiver.
+///
+/// Absence is a different proof, and `getattr_absent_fast_path` is the one that
+/// carries it: the two pins keep `name` off both the type and the receiver's
+/// own storage, and with no `__getattr__` left to run the access ends in the
+/// `AttributeError` this builtin reports as False.  Neither hit resolver can
+/// stand in for it — they decline a name they cannot *place*, which is not the
+/// same claim as "not here".
+pub(crate) fn try_walker_specialize_builtin_hasattr<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    // `hasattr` takes exactly two application arguments, so the residual is
+    // `bh_call_fn(callable, PY_NULL, obj, name)` and nothing else.
+    if r_args.len() != 4 {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (
+        ConcreteValue::Ref(concrete_callable),
+        ConcreteValue::Ref(null_or_self),
+        ConcreteValue::Ref(concrete_obj),
+        ConcreteValue::Ref(concrete_name),
+    ) = (
+        arg_concretes[0],
+        arg_concretes[1],
+        arg_concretes[2],
+        arg_concretes[3],
+    )
+    else {
+        return Ok(None);
+    };
+    // A non-null `null_or_self` is a bound receiver `bh_call_fn_impl` prepends
+    // as arg0 — not a plain `hasattr(obj, name)` call.
+    if concrete_callable.is_null()
+        || !null_or_self.is_null()
+        || concrete_obj.is_null()
+        || concrete_name.is_null()
+    {
+        return Ok(None);
+    }
+    if !pyre_interpreter::builtins::is_builtin_hasattr_function(concrete_callable) {
+        return Ok(None);
+    }
+    // `checkattrname` rejects a non-string name with TypeError, which is not an
+    // answer this fold may replace with a bool.
+    if !unsafe { pyre_object::is_exact_type(concrete_name, &pyre_object::pyobject::STR_TYPE) } {
+        return Ok(None);
+    }
+    let Ok(name) = (unsafe { pyre_object::w_str_get_wtf8(concrete_name) }).as_str() else {
+        return Ok(None);
+    };
+    // Decide before emitting: every decline below this point would have to
+    // rewind guards for a fold that is no longer there.
+    //
+    // Presence is a property of the map, so either resolution answers it and
+    // neither storage kind changes the answer — an int attribute lands in an
+    // unboxed slot, which the boxed resolution alone declines.  Both twins run
+    // the same refusals first (custom `__getattribute__`, an `INVALID`
+    // classify, an uncacheable `version_tag`), so a `Some` from either means
+    // the lookup this fold replaces cannot raise.
+    //
+    // Absence is its own proof, not the failure of these two:
+    // `getattr_absent_fast_path` reports it only when the same two pins keep
+    // `name` off both the type and the receiver's storage AND there is no
+    // `__getattr__` left to run, which is exactly when the access ends in the
+    // AttributeError this builtin reports as False.
+    let Some((w_type, version_tag, map, answer)) = (unsafe {
+        pyre_interpreter::objspace::std::mapdict::load_attr_fast_path(concrete_obj, name)
+            .map(|(w_type, version_tag, map, _storageindex)| (w_type, version_tag, map, true))
+            .or_else(|| {
+                pyre_interpreter::objspace::std::mapdict::load_attr_unboxed_fast_path(
+                    concrete_obj,
+                    name,
+                )
+                .map(
+                    |(w_type, version_tag, map, _storageindex, _listindex, _unbox)| {
+                        (w_type, version_tag, map, true)
+                    },
+                )
+            })
+            .or_else(|| {
+                pyre_interpreter::objspace::std::mapdict::getattr_absent_fast_path(
+                    concrete_obj,
+                    name,
+                )
+                .map(|(w_type, version_tag, map)| (w_type, version_tag, map, false))
+            })
+    }) else {
+        return Ok(None);
+    };
+
+    let obj_ref = r_args[2];
+    let callable_op = r_args[0];
+    if !callable_op.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op.pc,
+            OpCode::GuardValue,
+            &[callable_op, expected],
+        )?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(callable_op, expected);
+    }
+    let name_ref = r_args[3];
+    if !name_ref.is_constant() {
+        let name_const = ctx.trace_ctx.const_ref(concrete_name as i64);
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op.pc,
+            OpCode::GuardValue,
+            &[name_ref, name_const],
+        )?;
+    }
+    walker_guard_mapdict_instance_shape(
+        ctx,
+        op.pc,
+        obj_ref,
+        concrete_obj,
+        w_type,
+        version_tag,
+        map,
+    )?;
+    walker_write_const_bool_result(ctx, op.pc, answer, dst, 'r')?;
     Ok(Some(()))
 }
 

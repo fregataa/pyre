@@ -7,9 +7,11 @@ These cases share one process and one descriptor-checking harness so adding a
 type does not duplicate the test machinery or interpreter startup.
 """
 
+import array
 import builtins
 import inspect
 import sys
+import types
 
 
 def check_descriptors(owner, expected):
@@ -98,6 +100,31 @@ assert str(inspect.signature(open)) == (
 assert str(inspect.signature(print)) == (
     "(*args, sep=' ', end='\\n', file=None, flush=False)"
 )
+
+# Constructor signatures are metadata on the type object, separate from the
+# signatures on each type's ``__new__`` descriptor.
+TYPE_EXPECTED = {
+    bool: "(object=False, /)",
+    float: "(x=0, /)",
+    complex: "(real=0, imag=0)",
+    memoryview: "(object)",
+    list: "(iterable=(), /)",
+    tuple: "(iterable=(), /)",
+    set: "(iterable=(), /)",
+    frozenset: "(iterable=(), /)",
+    property: "(fget=None, fset=None, fdel=None, doc=None)",
+    enumerate: "(iterable, start=0)",
+    reversed: "(sequence, /)",
+    map: "(function, iterable, /, *iterables, strict=False)",
+    filter: "(function, iterable, /)",
+    zip: "(*iterables, strict=False)",
+}
+
+for cls, signature in TYPE_EXPECTED.items():
+    assert cls.__text_signature__ == signature, cls
+
+for cls in (int, str, bytes, bytearray, dict, range, slice, super, type):
+    assert cls.__text_signature__ is None, cls
 
 
 # bytearray_text_signatures_python314
@@ -427,6 +454,94 @@ for typ, names in METHODS.items():
 assert str(inspect.signature(enumerate.__next__)) == "(self, /)"
 assert str(inspect.signature(reversed.__setstate__)) == "(self, object, /)"
 assert str(inspect.signature(enumerate.__class_getitem__)) == "(object, /)"
+
+
+class Sequence:
+    def __getitem__(self, index):
+        raise IndexError
+
+
+ITERATOR_METHODS = [
+    (
+        type(iter(Sequence())),
+        ("__iter__", "__next__", "__reduce__", "__length_hint__", "__setstate__"),
+    ),
+    (
+        type(iter([])),
+        ("__iter__", "__next__", "__length_hint__", "__reduce__", "__setstate__"),
+    ),
+    (
+        type(reversed([])),
+        ("__iter__", "__next__", "__length_hint__", "__reduce__", "__setstate__"),
+    ),
+    (
+        type(iter(())),
+        ("__iter__", "__next__", "__length_hint__", "__reduce__", "__setstate__"),
+    ),
+    (
+        type(iter(b"")),
+        ("__iter__", "__next__", "__reduce__", "__length_hint__", "__setstate__"),
+    ),
+    (
+        type(iter(bytearray())),
+        ("__iter__", "__next__", "__reduce__", "__length_hint__", "__setstate__"),
+    ),
+    (
+        type(iter("")),
+        ("__iter__", "__next__", "__reduce__", "__length_hint__", "__setstate__"),
+    ),
+    (
+        type(iter("é")),
+        ("__iter__", "__next__", "__reduce__", "__length_hint__", "__setstate__"),
+    ),
+    (
+        type(iter(range(1))),
+        ("__iter__", "__next__", "__length_hint__", "__reduce__", "__setstate__"),
+    ),
+    (
+        type(iter(range(2**100))),
+        ("__iter__", "__next__", "__length_hint__", "__reduce__", "__setstate__"),
+    ),
+    (type(iter(set())), ("__iter__", "__next__", "__length_hint__", "__reduce__")),
+    (type(iter({})), ("__iter__", "__next__", "__length_hint__", "__reduce__")),
+    (
+        type(iter({}.values())),
+        ("__iter__", "__next__", "__length_hint__", "__reduce__"),
+    ),
+    (type(iter({}.items())), ("__iter__", "__next__", "__length_hint__", "__reduce__")),
+    (type(reversed({})), ("__iter__", "__next__", "__length_hint__", "__reduce__")),
+    (
+        type(reversed({}.values())),
+        ("__iter__", "__next__", "__length_hint__", "__reduce__"),
+    ),
+    (
+        type(reversed({}.items())),
+        ("__iter__", "__next__", "__length_hint__", "__reduce__"),
+    ),
+    (type(iter(lambda: None, None)), ("__iter__", "__next__", "__reduce__")),
+    (type(iter(memoryview(b""))), ("__iter__", "__next__")),
+    (
+        type(iter(array.array("i"))),
+        ("__iter__", "__next__", "__reduce__", "__setstate__"),
+    ),
+]
+
+for typ, names in ITERATOR_METHODS:
+    for name in names:
+        parameter = "state" if typ.__name__ == "arrayiterator" else "object"
+        expected = (
+            f"($self, {parameter}, /)" if name == "__setstate__" else "($self, /)"
+        )
+        assert typ.__dict__[name].__text_signature__ == expected, (typ, name)
+
+callable_iterator = type(iter(lambda: None, None))
+assert "__doc__" in callable_iterator.__dict__
+assert callable_iterator.__dict__["__doc__"] is None
+assert str(inspect.signature(type(iter([])).__setstate__)) == "(self, object, /)"
+assert (
+    str(inspect.signature(type(iter(array.array("i"))).__setstate__))
+    == "(self, state, /)"
+)
 
 
 # int_text_signatures_python314
@@ -907,5 +1022,51 @@ check_descriptors(type, EXPECTED)
 assert str(inspect.signature(type.__call__)) == "(self, /, *args, **kwargs)"
 assert str(inspect.signature(type.__prepare__)) == "(name, bases, /, **kwds)"
 assert str(inspect.signature(type.__instancecheck__)) == "(self, instance, /)"
+
+
+# internal_type_text_signatures_python314
+#
+# The signature sits on the type object rather than on a `__new__` descriptor,
+# so `inspect.signature` resolves against it instead of falling back to
+# `(*args, **kwargs)`.
+
+EXPECTED_TYPES = {
+    types.EllipsisType: "()",
+    types.GenericAlias: "(origin, args, /)",
+    types.NotImplementedType: "()",
+    types.ModuleType: "(name, doc=None)",
+    types.MappingProxyType: "(mapping)",
+    types.CellType: "([contents])",
+    types.MethodType: "(function, instance, /)",
+    types.FunctionType: (
+        "(code, globals, name=None, argdefs=None, closure=None,\n"
+        "         kwdefaults=None)"
+    ),
+    types.CodeType: (
+        "(argcount, posonlyargcount, kwonlyargcount, nlocals, stacksize,\n"
+        "     flags, codestring, constants, names, varnames, filename, name,\n"
+        "     qualname, firstlineno, linetable, exceptiontable, freevars=(),\n"
+        "     cellvars=(), /)"
+    ),
+}
+
+for owner, signature in EXPECTED_TYPES.items():
+    assert owner.__text_signature__ == signature, (owner, owner.__text_signature__)
+
+assert str(inspect.signature(types.MethodType)) == "(function, instance, /)"
+assert str(inspect.signature(types.ModuleType)) == "(name, doc=None)"
+
+
+# module_doc_python314
+#
+# Every module publishes `__doc__` in its own dict, so the key is listed by
+# `dir()` and the read never falls through to the `module` type's docstring.
+
+assert "__doc__" in builtins.__dict__
+assert "__doc__" in dir(builtins)
+assert isinstance(builtins.__doc__, str)
+
+for name in ("sys", "gc", "_ast", "_io"):
+    assert "__doc__" in __import__(name).__dict__, name
 
 print("OK")

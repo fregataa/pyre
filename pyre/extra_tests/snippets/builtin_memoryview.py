@@ -15,6 +15,15 @@ obj = b"abcde"
 a = memoryview(obj)
 assert a.obj == obj
 
+# A view is weak-referenceable without a published `__weakref__` descriptor:
+# `PyMemoryView_Type` sets `tp_weaklistoffset` and leaves the getset table
+# without an entry for it.
+assert "__weakref__" not in memoryview.__dict__
+with assert_raises(AttributeError):
+    a.__weakref__
+a_ref = weakref.ref(a)
+assert a_ref() is a
+
 assert a[2:3] == b"c"
 
 assert hash(obj) == hash(a)
@@ -120,7 +129,17 @@ def test_bytesio_readinto():
     assert writable.tobytes() == b"hello"
 
     stream.seek(0)
-    assert_raises(TypeError, lambda: stream.readinto(memoryview(b"hello")))
+    with assert_raises(TypeError) as error:
+        stream.readinto(memoryview(b"hello"))
+    assert str(error.exception) == (
+        "readinto() argument must be read-write bytes-like object, not memoryview"
+    )
+
+    with assert_raises(TypeError) as error:
+        stream.readinto("hello")
+    assert str(error.exception) == (
+        "readinto() argument must be read-write bytes-like object, not str"
+    )
 
 
 test_bytesio_readinto()

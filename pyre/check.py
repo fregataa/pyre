@@ -902,15 +902,29 @@ def _dump_output_mismatch(actual, expected, limit=80):
 def _first_stderr_line(stderr):
     """Return `"  <first non-empty stderr line>"`, or `""` when there is none.
 
+    A traceback additionally carries its final line, which is the one that
+    names the exception.
+
     A crash reason is otherwise just an exit code, which on a binary that dies
     before it writes any stdout says nothing about why. The empty answer is
     itself informative: it names a process that produced no diagnostic at all.
+
+    An app-level crash is the one case where the first line carries nothing:
+    every Python traceback opens with the same banner, so a fixture that dies
+    on an assertion reports only `Traceback (most recent call last):` and the
+    CI log holds no other copy of the frames. The line that names the failure
+    is the last one, so append it — the same reason `_jit_panic_reason`
+    appends the message line that follows a Rust panic's location.
     """
-    for line in (stderr or "").splitlines():
-        line = line.strip()
-        if line:
-            return f"  {line[:160]}"
-    return ""
+    lines = [line.strip() for line in (stderr or "").splitlines()]
+    lines = [line for line in lines if line]
+    if not lines:
+        return ""
+    reason = lines[0][:160]
+    banner = "Traceback (most recent call last):"
+    if len(lines) > 1 and any(line.startswith(banner) for line in lines):
+        reason += f" | {lines[-1][:400]}"
+    return f"  {reason}"
 
 
 def _jit_panic_reason(stderr):
@@ -936,10 +950,16 @@ def _jit_panic_reason(stderr):
                 # actionable detail (e.g. a GC 'invalid type_id ... site=...'
                 # diagnostic); the location line alone is not enough to triage
                 # a flaky crash from CI logs, so append the first message line.
+                #
+                # The width has to reach `site=`, which the GC prints last. At
+                # 200 the varsize-length diagnostic was cut mid-`nursery_start`,
+                # dropping both `forwarded=` and `site=` — the two fields that
+                # name which path reached the object — and leaving a CI-only
+                # crash with no way to attribute it.
                 for follow in lines[idx + 1 :]:
                     follow = follow.strip()
                     if follow:
-                        reason += f" | {follow[:200]}"
+                        reason += f" | {follow[:400]}"
                         break
                 return reason
         return "rust panic"

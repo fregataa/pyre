@@ -55,8 +55,8 @@ function jitCallTrampoline(framePtr, callAreaOfs = CALL_RESULT_OFS) {
 }
 
 export function jit_compile_wasm(bytesPtr, bytesLen) {
-  const trace = instantiateTrace(bytesPtr, bytesLen);
-  return registerTrace(trace);
+  const entries = instantiateTrace(bytesPtr, bytesLen);
+  return registerTrace(entries);
 }
 
 function instantiateTrace(bytesPtr, bytesLen) {
@@ -74,14 +74,22 @@ function instantiateTrace(bytesPtr, bytesLen) {
     const instance = new WebAssembly.Instance(module, {
       env: { memory: mainMemory, jit_call: jitCallTrampoline, jit_call_compact: jitCallTrampoline, __indirect_function_table: mainTable }
     });
-    return instance.exports.trace;
+    return traceEntries(instance);
   } catch (e) {
     // Retry without jit_call (for traces without CALL ops)
     const instance = new WebAssembly.Instance(module, {
       env: { memory: mainMemory }
     });
-    return instance.exports.trace;
+    return traceEntries(instance);
   }
+}
+
+// A resumable peeled loop exports a fixed-arity `trace_wide` beside the narrow
+// `trace` shim, and the backend publishes its table slot as `handle + 1`. Both
+// hosts must therefore install the pair adjacently or that published slot names
+// an unrelated trace.
+function traceEntries(instance) {
+  return { trace: instance.exports.trace, wide: instance.exports.trace_wide };
 }
 
 // Compile and instantiate a trace, then overwrite an existing shared-table
@@ -92,11 +100,29 @@ export function jit_replace_wasm(funcId, bytesPtr, bytesLen) {
     if (!funcTable[funcId]) {
       return 0;
     }
-    const trace = instantiateTrace(bytesPtr, bytesLen);
+    const { trace, wide } = instantiateTrace(bytesPtr, bytesLen);
+    // Modules emitted while this slot was wide carry `call_indirect funcId + 1`
+    // baked in. A narrow replacement cannot retract those, so accepting one
+    // would leave the pair straddling two compiles: `funcId` on the new trace
+    // and `funcId + 1` still on the old. `funcTable` records the wide entry
+    // only when one existed, so it is the discriminator the shared table
+    // cannot be — its spare slot holds the narrow function either way. Reject
+    // the shape change before touching either table; narrow-to-wide stays
+    // allowed, mirroring the wasmtime host.
+    if (!wide && funcTable[funcId + 1] !== undefined) {
+      console.error('[jit_replace_wasm] refused: id', funcId, 'has a published wide entry the replacement does not');
+      return 0;
+    }
     if (mainTable) {
       mainTable.set(funcId, trace);
+      if (wide) {
+        mainTable.set(funcId + 1, wide);
+      }
     }
     funcTable[funcId] = trace;
+    if (wide) {
+      funcTable[funcId + 1] = wide;
+    }
     return funcId;
   } catch (e) {
     console.error('[jit_replace_wasm] failed:', e);
@@ -108,15 +134,27 @@ export function jit_replace_wasm(funcId, bytesPtr, bytesLen) {
 // table slot as the id, mirroring the wasmtime host. The slot is both the
 // jit_execute_wasm handle and the index an in-module call_indirect targets.
 // Falls back to a private counter when no table is available.
-function registerTrace(traceFn) {
+function registerTrace(entries) {
+  const { trace, wide } = entries;
   let id;
+  // The pair is appended even for a narrow module, mirroring the wasmtime
+  // host. An emitted module names its wide entry `id + 1`, and a later
+  // `jit_replace_wasm` may install one where this compile had none; without
+  // the reservation that write would land on the next trace's own entry.
   if (mainTable) {
-    id = mainTable.grow(1);
-    mainTable.set(id, traceFn);
+    id = mainTable.grow(2, trace);
+    mainTable.set(id, trace);
+    if (wide) {
+      mainTable.set(id + 1, wide);
+    }
   } else {
-    id = nextFuncId++;
+    id = nextFuncId;
+    nextFuncId += 2;
   }
-  funcTable[id] = traceFn;
+  funcTable[id] = trace;
+  if (wide) {
+    funcTable[id + 1] = wide;
+  }
   return id;
 }
 

@@ -369,14 +369,18 @@ pub fn init_typeobjects() {
         );
 
         // array.array — interp_array.py, bases=(object,)
+        let array_type = new_typeobject_with_base_and_layout(
+            "array.array",
+            crate::module::array::init_array_type,
+            object_type,
+            &pyre_object::interp_array::ARRAY_TYPE as *const PyType,
+        );
+        // CPython 3.14 Modules/arraymodule.c:array_modexec uses
+        // PyType_FromModuleAndSpec; array_spec carries IMMUTABLETYPE.
+        mark_cpython_heap_type(array_type, true);
         reg.insert(
             &pyre_object::interp_array::ARRAY_TYPE as *const PyType as usize,
-            new_typeobject_with_base_and_layout(
-                "array.array",
-                crate::module::array::init_array_type,
-                object_type,
-                &pyre_object::interp_array::ARRAY_TYPE as *const PyType,
-            ) as usize,
+            array_type as usize,
         );
 
         // bool — boolobject.py, bases=(int,)
@@ -853,6 +857,9 @@ pub fn init_typeobjects() {
             crate::module::_sre::interp_sre::init_sre_pattern_type,
             object_type,
         );
+        // CPython 3.14 Modules/_sre/sre.c:sre_exec creates the Pattern spec
+        // with PyType_FromModuleAndSpec and IMMUTABLETYPE.
+        mark_cpython_heap_type(sre_pattern_type, true);
         unsafe { pyre_object::w_type_set_acceptable_as_base_class(sre_pattern_type, false) };
         reg.insert(
             &pyre_object::interp_sre::SRE_PATTERN_TYPE as *const PyType as usize,
@@ -863,6 +870,8 @@ pub fn init_typeobjects() {
             crate::module::_sre::interp_sre::init_sre_match_type,
             object_type,
         );
+        // Same `sre_exec` immutable heap owner as Pattern.
+        mark_cpython_heap_type(sre_match_type, true);
         unsafe { pyre_object::w_type_set_acceptable_as_base_class(sre_match_type, false) };
         reg.insert(
             &pyre_object::interp_sre::SRE_MATCH_TYPE as *const PyType as usize,
@@ -877,6 +886,8 @@ pub fn init_typeobjects() {
             crate::module::_sre::interp_sre::init_sre_scanner_type,
             object_type,
         );
+        // Same `sre_exec` immutable heap owner as Pattern.
+        mark_cpython_heap_type(sre_scanner_type, true);
         unsafe { pyre_object::w_type_set_acceptable_as_base_class(sre_scanner_type, false) };
         reg.insert(
             &pyre_object::interp_sre::SRE_SCANNER_TYPE as *const PyType as usize,
@@ -1161,6 +1172,14 @@ pub fn init_typeobjects() {
             ),
         ] {
             let iterator_type = new_typeobject_with_base(name, init, object_type);
+            if std::ptr::eq(
+                pytype,
+                &pyre_object::iterobject::ARRAY_ITER_TYPE as *const PyType,
+            ) {
+                // CPython 3.14 Modules/arraymodule.c creates arrayiter_spec
+                // through PyType_FromModuleAndSpec with IMMUTABLETYPE.
+                mark_cpython_heap_type(iterator_type, true);
+            }
             unsafe {
                 pyre_object::w_type_set_disallow_instantiation(iterator_type);
                 pyre_object::w_type_set_acceptable_as_base_class(iterator_type, false);
@@ -1504,6 +1523,40 @@ pub fn init_typeobjects() {
                 &pyre_object::interp_itertools::CHAIN_TYPE as *const PyType,
             ) as usize,
         );
+        // [3.14-spec] CPython 3.14 Modules/itertoolsmodule.c:itertools_exec
+        // creates every spec in `typelist` through PyType_FromModuleAndSpec.
+        // Each spec includes IMMUTABLETYPE.  PyPy keeps the same classes as
+        // builtin TypeDefs; publish the CPython owner on those exact registry
+        // rows without changing their internal `flag_heaptype`.
+        for pytype in [
+            &pyre_object::interp_itertools::COUNT_TYPE as *const PyType,
+            &pyre_object::interp_itertools::REPEAT_TYPE as *const PyType,
+            &pyre_object::interp_itertools::TAKEWHILE_TYPE as *const PyType,
+            &pyre_object::interp_itertools::DROPWHILE_TYPE as *const PyType,
+            &pyre_object::interp_itertools::FILTERFALSE_TYPE as *const PyType,
+            &pyre_object::interp_itertools::ISLICE_TYPE as *const PyType,
+            &pyre_object::interp_itertools::BATCHED_TYPE as *const PyType,
+            &pyre_object::interp_itertools::PRODUCT_TYPE as *const PyType,
+            &pyre_object::interp_itertools::COMBINATIONS_TYPE as *const PyType,
+            &pyre_object::interp_itertools::COMBINATIONS_WITH_REPLACEMENT_TYPE
+                as *const PyType,
+            &pyre_object::interp_itertools::PERMUTATIONS_TYPE as *const PyType,
+            &pyre_object::interp_itertools::GROUPBY_TYPE as *const PyType,
+            &pyre_object::interp_itertools::GROUPBY_ITERATOR_TYPE as *const PyType,
+            &pyre_object::interp_itertools::TEE_DATAOBJECT_TYPE as *const PyType,
+            &pyre_object::interp_itertools::TEE_ITERABLE_TYPE as *const PyType,
+            &pyre_object::interp_itertools::COMPRESS_TYPE as *const PyType,
+            &pyre_object::interp_itertools::STARMAP_TYPE as *const PyType,
+            &pyre_object::interp_itertools::ACCUMULATE_TYPE as *const PyType,
+            &pyre_object::interp_itertools::ZIP_LONGEST_TYPE as *const PyType,
+            &pyre_object::interp_itertools::PAIRWISE_TYPE as *const PyType,
+            &pyre_object::interp_itertools::CYCLE_TYPE as *const PyType,
+            &pyre_object::interp_itertools::CHAIN_TYPE as *const PyType,
+        ] {
+            if let Some(&type_obj) = reg.get(&(pytype as usize)) {
+                mark_cpython_heap_type(type_obj as PyObjectRef, true);
+            }
+        }
         // `pypy/objspace/std/specialisedtupleobject.py` — three SpecialisedTuple
         // variants share the public `tuple` PyType name, so all three
         // foreign statics map to a "tuple" typedef.  `gettypefor` keys
@@ -1526,6 +1579,106 @@ pub fn init_typeobjects() {
                 as usize,
             new_typeobject_with_base("tuple", |_| {}, object_type) as usize,
         );
+
+        // TypeDef constructor signatures live on W_TypeObject itself, not on
+        // the `__new__` descriptor.  PyPy supplies this field explicitly for
+        // list (`listobject.py:2459`) and the two functional types
+        // (`functional.py:341,434`).  Python 3.14 publishes the additional
+        // signatures below; pyre targets that newer public surface when it
+        // differs from the vendored PyPy 3.11 sources.  Types omitted here
+        // intentionally expose None (for example int, str, bytes and dict).
+        for (pytype, signature) in [
+            (
+                &pyre_object::BOOL_TYPE as *const PyType,
+                "(object=False, /)",
+            ),
+            (&pyre_object::FLOAT_TYPE as *const PyType, "(x=0, /)"),
+            (
+                &pyre_object::COMPLEX_TYPE as *const PyType,
+                "(real=0, imag=0)",
+            ),
+            (
+                &pyre_object::memoryview::MEMORYVIEW_TYPE as *const PyType,
+                "(object)",
+            ),
+            (&pyre_object::LIST_TYPE as *const PyType, "(iterable=(), /)"),
+            (
+                &pyre_object::TUPLE_TYPE as *const PyType,
+                "(iterable=(), /)",
+            ),
+            (
+                &pyre_object::setobject::SET_TYPE as *const PyType,
+                "(iterable=(), /)",
+            ),
+            (
+                &pyre_object::setobject::FROZENSET_TYPE as *const PyType,
+                "(iterable=(), /)",
+            ),
+            (
+                &pyre_object::descriptor::PROPERTY_TYPE as *const PyType,
+                "(fget=None, fset=None, fdel=None, doc=None)",
+            ),
+            (
+                &pyre_object::functional::ENUMERATE_TYPE as *const PyType,
+                "(iterable, start=0)",
+            ),
+            (
+                &pyre_object::functional::REVERSED_TYPE as *const PyType,
+                "(sequence, /)",
+            ),
+            (
+                &pyre_object::functional::MAP_TYPE as *const PyType,
+                "(function, iterable, /, *iterables, strict=False)",
+            ),
+            (
+                &pyre_object::functional::FILTER_TYPE as *const PyType,
+                "(function, iterable, /)",
+            ),
+            (
+                &pyre_object::functional::ZIP_TYPE as *const PyType,
+                "(*iterables, strict=False)",
+            ),
+            // The internal object families 3.14 also publishes a signature
+            // for. Each is constructible from Python, so `inspect.signature`
+            // resolves against these rather than falling back to `(*args,
+            // **kwargs)`.
+            (&pyre_object::ELLIPSIS_TYPE as *const PyType, "()"),
+            (
+                &pyre_object::GENERIC_ALIAS_TYPE as *const PyType,
+                "(origin, args, /)",
+            ),
+            (
+                &pyre_object::pyobject::NOTIMPLEMENTED_TYPE as *const PyType,
+                "()",
+            ),
+            (&pyre_object::MODULE_TYPE as *const PyType, "(name, doc=None)"),
+            (
+                &pyre_object::MAPPING_PROXY_TYPE as *const PyType,
+                "(mapping)",
+            ),
+            (
+                &pyre_object::nestedscope::CELL_TYPE as *const PyType,
+                "([contents])",
+            ),
+            (
+                &pyre_object::function::METHOD_TYPE as *const PyType,
+                "(function, instance, /)",
+            ),
+            (
+                &crate::function::FUNCTION_TYPE as *const PyType,
+                "(code, globals, name=None, argdefs=None, closure=None,\n         kwdefaults=None)",
+            ),
+            (
+                &crate::pycode::CODE_TYPE as *const PyType,
+                "(argcount, posonlyargcount, kwonlyargcount, nlocals, stacksize,\n     flags, codestring, constants, names, varnames, filename, name,\n     qualname, firstlineno, linetable, exceptiontable, freevars=(),\n     cellvars=(), /)",
+            ),
+        ] {
+            let w_typeobject = *reg
+                .get(&(pytype as usize))
+                .expect("text-signature type must already be registered")
+                as PyObjectRef;
+            unsafe { pyre_object::w_type_set_text_signature(w_typeobject, signature) };
+        }
 
         // rclass.py:739-743 parity — cache W_TypeObject on each PyType
         // so allocators can set w_class at allocation time (like RPython's
@@ -1586,6 +1739,9 @@ pub fn init_typeobjects() {
             &pyre_object::pyobject::NOTIMPLEMENTED_TYPE,
             &pyre_object::ELLIPSIS_TYPE,
             &pyre_object::functional::RANGE_TYPE,
+            &crate::pycode::CODE_TYPE,
+            &pyre_object::functional::RANGE_ITER_TYPE,
+            &pyre_object::functional::LONG_RANGE_ITER_TYPE,
         ] {
             let w_typeobject = *reg
                 .get(&(pytype as *const PyType as usize))
@@ -2522,7 +2678,7 @@ pub fn make_builtin_type_with_bases(
                 newslotnames: vec![],
                 base_layout: parent_layout,
                 acceptable_as_base_class: has_new,
-                typedef_hasdict: false,
+                typedef_hasdict: has_dict,
             })
         };
         pyre_object::w_type_set_layout(type_obj, layout);
@@ -2579,6 +2735,24 @@ pub fn make_builtin_type_with_layout(
     layout_pytype: *const PyType,
 ) -> PyObjectRef {
     new_typeobject_with_base_and_layout(name, init, base, layout_pytype)
+}
+
+/// [3.14-spec] Project a CPython `PyType_From*Spec` owner onto a PyPy builtin
+/// `TypeDef`.  The latter remains `flag_heaptype = False`; only the public
+/// HEAPTYPE / STATIC_BUILTIN / IMMUTABLETYPE axes change.  Each caller cites
+/// the CPython 3.14 construction site that requires this adaptation.
+pub fn mark_cpython_heap_type(type_obj: PyObjectRef, immutable: bool) {
+    unsafe {
+        pyre_object::w_type_set_cpython_type_flags(type_obj, true, false, immutable);
+    }
+}
+
+/// The public `PyType_Ready` legacy-extension shape: neither a CPython core
+/// STATIC_BUILTIN nor a heap allocation, but necessarily immutable in 3.14.
+pub fn mark_cpython_static_extension_type(type_obj: PyObjectRef) {
+    unsafe {
+        pyre_object::w_type_set_cpython_type_flags(type_obj, false, false, true);
+    }
 }
 
 /// int.__new__(cls, *args) — PyPy: intobject.py descr__new__
@@ -10375,6 +10549,18 @@ fn readonly_attribute(descr: pyre_object::PyObjectRef) -> crate::PyError {
     }
 }
 
+/// CPython 3.14 `slotdefs[]`'s single `tp_descr_get` wrapper definition.
+/// Every builtin descriptor type below publishes the same positional-only
+/// surface; keeping it here mirrors the one `TPSLOT(__get__, ...)` row rather
+/// than duplicating its signature at each PyPy TypeDef registration.
+fn make_descr_get_builtin(func: crate::gateway::BuiltinCodeFn) -> PyObjectRef {
+    crate::gateway::make_builtin_function_with_text_signature(
+        "__get__",
+        func,
+        "($self, instance, owner=None, /)",
+    )
+}
+
 /// typedef.py GetSetProperty.typedef = TypeDef("getset_descriptor", ...)
 fn init_getset_descriptor_type(ns: PyObjectRef) {
     // typedef.py GetSetProperty.descr_property_get
@@ -10404,7 +10590,7 @@ fn init_getset_descriptor_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__get__",
-            make_builtin_function("__get__", |args| {
+            make_descr_get_builtin(|args| {
                 crate::type_methods::arity_at_least(args, "__get__", 1)?;
                 crate::type_methods::arity_at_most(args, "__get__", 2)?;
                 let w_self = args[0];
@@ -10937,13 +11123,8 @@ fn make_getset_property_full(
 /// GC ownership instead answers a different question — pyre's nursery owns
 /// `object()` and `b""`, which `object` and `bytes` never declare.
 ///
-/// Nothing consumes it at present. `sys.getsizeof` used to, for the
-/// `PyGC_Head` that `_PyType_PreHeaderSize` charges a tracked instance, but a
-/// build without a global interpreter lock keeps the collector's bits in the
-/// object header and so charges none. The flag itself remains the answer
-/// `type.__flags__` owes for `Py_TPFLAGS_HAVE_GC`, which it does not yet
-/// report.
-#[allow(dead_code)]
+/// `gc.is_tracked` consumes it here, and `type.__flags__` publishes the same
+/// canonical field as `Py_TPFLAGS_HAVE_GC`.
 pub(crate) fn cpython_object_is_gc(w_obj: PyObjectRef) -> bool {
     let Some(tp) = r#type(w_obj) else {
         return false;
@@ -10955,57 +11136,16 @@ pub(crate) fn cpython_object_is_gc(w_obj: PyObjectRef) -> bool {
     // with `Py_TPFLAGS_HEAPTYPE`: a statically allocated type object is never
     // collected, while one built by `type_new` is.
     if unsafe { pyre_object::is_type(w_obj) } {
-        return unsafe { pyre_object::w_type_is_heaptype(w_obj) };
+        return unsafe { pyre_object::w_type_is_cpython_heaptype(w_obj) };
     }
     true
 }
 
-/// Whether `w_type` declares `Py_TPFLAGS_HAVE_GC`.
-///
-/// A type carries the flag when its instances can hold a reference that joins
-/// a cycle, which is nearly all of them, so what is enumerated here is the
-/// complement: the scalars, the buffers and the singletons. `type_new` sets
-/// the flag on every heap type.
-///
-/// Two matches are needed because a builtin only gets its own Layout when it
-/// has a payload of its own. `int` and `bytes` do, so their layout identifies
-/// them; `NoneType` and `code` do not, and share the base instance layout with
-/// `function`, `generator`, the iterators and the dict views — all of which do
-/// declare the flag. Those are matched on the type object instead.
-#[allow(dead_code)]
+/// Whether `w_type` declares `Py_TPFLAGS_HAVE_GC`. Registration initializes
+/// the canonical field once; all readers, including `type.__flags__`, must
+/// consult that field rather than rebuilding a parallel type census.
 fn cpython_type_has_gc_flag(w_type: PyObjectRef) -> bool {
-    if w_type.is_null() || !unsafe { pyre_object::is_type(w_type) } {
-        return false;
-    }
-    if unsafe { pyre_object::w_type_is_heaptype(w_type) } {
-        return true;
-    }
-    let same_type = |tp: &PyType| std::ptr::eq(w_type, gettypeobject(tp));
-    // `object` holds nothing; the singletons are one instance each; a code
-    // object's references are all reachable from the function that owns it;
-    // and both range iterators count, one in machine words and one in ints
-    // that cannot themselves reference anything.
-    if std::ptr::eq(w_type, w_object())
-        || same_type(&pyre_object::NONE_TYPE)
-        || same_type(&pyre_object::NOTIMPLEMENTED_TYPE)
-        || same_type(&pyre_object::ELLIPSIS_TYPE)
-        || same_type(&crate::pycode::CODE_TYPE)
-        || same_type(&pyre_object::functional::RANGE_ITER_TYPE)
-        || same_type(&pyre_object::functional::LONG_RANGE_ITER_TYPE)
-    {
-        return false;
-    }
-    let layout = unsafe { pyre_object::w_type_get_layout(w_type) };
-    let is = |candidate: *const PyType| std::ptr::eq(layout, candidate);
-    !(is(&pyre_object::INT_TYPE)
-        || is(&pyre_object::LONG_TYPE)
-        || is(&pyre_object::BOOL_TYPE)
-        || is(&pyre_object::FLOAT_TYPE)
-        || is(&pyre_object::COMPLEX_TYPE)
-        || is(&pyre_object::STR_TYPE)
-        || is(&pyre_object::bytesobject::BYTES_TYPE)
-        || is(&pyre_object::bytearrayobject::BYTEARRAY_TYPE)
-        || is(&pyre_object::functional::RANGE_TYPE))
+    unsafe { pyre_object::w_type_get_have_gc(w_type) }
 }
 
 /// Logical CPython 3.14 `tp_basicsize` / `tp_itemsize` values ported so far.
@@ -11130,7 +11270,7 @@ fn cpython_type_offsets(w_type: PyObjectRef) -> Option<(i64, i64)> {
     // Without the lock that pre-header is the managed dict pair alone — the
     // collector keeps its bits in the object header instead of a `PyGC_Head`
     // ahead of it — so the weakref word sits two words back, not four.
-    if unsafe { pyre_object::w_type_is_heaptype(w_type) } {
+    if unsafe { pyre_object::w_type_is_cpython_heaptype(w_type) } {
         if dict == 0 && unsafe { pyre_object::w_type_get_hasdict(w_type) } {
             dict = -1;
         }
@@ -11170,6 +11310,14 @@ fn type_weakrefoffset_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 }
 
 fn init_type_type(ns: PyObjectRef) {
+    // `type` carries the weakref capability without publishing a
+    // `__weakref__` descriptor: `PyType_Type` sets `tp_weaklistoffset` but its
+    // getset table has no `__weakref__` entry, so `type.__dict__` has none and
+    // `type.__weakref__` raises AttributeError while `weakref.ref(type)` still
+    // works.  A descriptor here would be a data descriptor on the metatype and
+    // would therefore shadow every class's own `__weakref__` slot descriptor —
+    // `A.__weakref__` for a `@dataclass(slots=True, weakref_slot=True)` class
+    // has to stay that class's own descriptor.
     // type.__new__(metatype, name, bases, dict) — creates new type
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -11187,7 +11335,7 @@ fn init_type_type(ns: PyObjectRef) {
                 |args| {
                     crate::type_methods::arity_no_args(args, "__sizeof__")?;
                     let word = std::mem::size_of::<usize>() as i64;
-                    let size = if pyre_object::w_type_is_heaptype(args[0]) {
+                    let size = if pyre_object::w_type_is_cpython_heaptype(args[0]) {
                         // CPython 3.14 typeobject.c:type___sizeof___impl:
                         // PyHeapTypeObject plus the cached-keys table carried
                         // by a managed instance dictionary. The struct sizes
@@ -11581,7 +11729,7 @@ fn init_type_type(ns: PyObjectRef) {
                     "descriptor '__abstractmethods__' for 'type' objects doesn't apply",
                 ));
             }
-            if !unsafe { pyre_object::w_type_is_heaptype(w_type) } {
+            if unsafe { pyre_object::w_type_is_cpython_immutabletype(w_type) } {
                 return Err(crate::PyError::type_error(format!(
                     "cannot set '__abstractmethods__' attribute of immutable type '{}'",
                     unsafe { pyre_object::w_type_get_name(w_type) },
@@ -11619,7 +11767,7 @@ fn init_type_type(ns: PyObjectRef) {
                     "descriptor '__abstractmethods__' for 'type' objects doesn't apply",
                 ));
             }
-            if !unsafe { pyre_object::w_type_is_heaptype(w_type) } {
+            if unsafe { pyre_object::w_type_is_cpython_immutabletype(w_type) } {
                 return Err(crate::PyError::type_error(format!(
                     "cannot delete '__abstractmethods__' attribute of immutable type '{}'",
                     unsafe { pyre_object::w_type_get_name(w_type) },
@@ -11983,7 +12131,7 @@ fn init_type_type(ns: PyObjectRef) {
             // type derives it from the qualified name.  `lookup_in_type`
             // filters out null entries but preserves `w_none()`, matching
             // PyPy's "value present even if it's None" semantic.
-            if unsafe { pyre_object::w_type_is_heaptype(cls) }
+            if unsafe { pyre_object::w_type_is_cpython_heaptype(cls) }
                 && let Some(v) = crate::type_dict_lookup(cls, "__module__")
                 && !v.is_null()
             {
@@ -12012,7 +12160,7 @@ fn init_type_type(ns: PyObjectRef) {
             check_set_special_type_attr(cls, value, "__module__")?;
             unsafe {
                 if pyre_object::is_type(cls) {
-                    if !pyre_object::w_type_is_heaptype(cls) {
+                    if pyre_object::w_type_is_cpython_immutabletype(cls) {
                         let name = pyre_object::w_type_get_name(cls);
                         return Err(crate::PyError::type_error(format!(
                             "cannot set '__module__' attribute of immutable type '{name}'"
@@ -12314,7 +12462,7 @@ fn check_set_special_type_attr(
     w_value: PyObjectRef,
     name: &str,
 ) -> Result<(), crate::PyError> {
-    let immutable = !unsafe { pyre_object::w_type_is_heaptype(w_type) };
+    let immutable = unsafe { pyre_object::w_type_is_cpython_immutabletype(w_type) };
     if !immutable && !w_value.is_null() {
         return Ok(());
     }
@@ -14785,7 +14933,7 @@ fn init_slot_wrapper_type(ns: PyObjectRef) {
         pyre_object::w_dict_setitem_str_no_proxy(
             ns,
             "__get__",
-            make_builtin_function("__get__", |args| wrap_descr_get(args, bind_slot_wrapper)),
+            make_descr_get_builtin(|args| wrap_descr_get(args, bind_slot_wrapper)),
         );
         pyre_object::w_dict_setitem_str_no_proxy(
             ns,
@@ -15185,9 +15333,7 @@ fn init_method_descriptor_type(ns: PyObjectRef) {
         pyre_object::w_dict_setitem_str_no_proxy(
             ns,
             "__get__",
-            make_builtin_function("__get__", |args| {
-                wrap_descr_get(args, bind_method_descriptor)
-            }),
+            make_descr_get_builtin(|args| wrap_descr_get(args, bind_method_descriptor)),
         );
         pyre_object::w_dict_setitem_str_no_proxy(
             ns,
@@ -15350,9 +15496,7 @@ fn init_classmethod_descriptor_type(ns: PyObjectRef) {
         pyre_object::w_dict_setitem_str_no_proxy(
             ns,
             "__get__",
-            make_builtin_function("__get__", |args| {
-                wrap_descr_get(args, bind_classmethod_descriptor)
-            }),
+            make_descr_get_builtin(|args| wrap_descr_get(args, bind_classmethod_descriptor)),
         );
         pyre_object::w_dict_setitem_str_no_proxy(
             ns,
@@ -15800,7 +15944,7 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__get__",
-            make_builtin_function("__get__", |args| {
+            make_descr_get_builtin(|args| {
                 let descr = args.first().copied().unwrap_or(pyre_object::PY_NULL);
                 if descr.is_null() || !unsafe { pyre_object::typedef::is_member(descr) } {
                     return Ok(pyre_object::w_none());
@@ -18111,9 +18255,11 @@ fn init_int_type(ns: PyObjectRef) {
     // intobject.py descr_repr. CPython 3.14 inherits object.__str__, whose
     // implementation delegates virtually to this repr slot.
     let int_to_text = |args: &[PyObjectRef]| {
-        Ok(pyre_object::w_str_new(&unsafe {
-            crate::builtins::int_to_decimal_string(args[0])?
-        }))
+        let text = unsafe { crate::builtins::int_to_decimal_string(args[0])? };
+        // `args[0]` is fully consumed above.  This terminal `space.newtext`
+        // allocation can therefore use the ordinary movable header PyPy gets
+        // from `StdObjSpace.newutf8`, with no unrooted operand live across it.
+        Ok(unsafe { pyre_object::w_str_new_managed_collecting(&text) })
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -27275,6 +27421,15 @@ fn init_set_iterator_type(ns: PyObjectRef) {
     for (name, value) in entries {
         unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
     }
+    set_iterator_text_signatures(
+        ns,
+        &[
+            ("__iter__", "($self, /)"),
+            ("__next__", "($self, /)"),
+            ("__length_hint__", "($self, /)"),
+            ("__reduce__", "($self, /)"),
+        ],
+    );
 }
 
 fn generator_frame(obj: PyObjectRef) -> *mut crate::pyframe::PyFrame {
@@ -27964,6 +28119,20 @@ fn init_coroutine_wrapper_type(ns: PyObjectRef) {
     }
 }
 
+/// Attach `__text_signature__` to callables an iterator namespace already holds.
+///
+/// The TypeDefs remain the owner of the concrete methods; 3.14's slot wrappers
+/// and Argument Clinic descriptors additionally carry these introspection
+/// strings, so this fills the corresponding Function field without replacing
+/// the carriers.
+fn set_iterator_text_signatures(ns: PyObjectRef, signatures: &[(&'static str, &'static str)]) {
+    for &(name, text_signature) in signatures {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("iterator TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+    }
+}
+
 /// PyPy `iterobject.py W_AbstractSeqIterObject.typedef`.
 fn init_sequence_iterator_type(ns: PyObjectRef) {
     // PyPy carries the `iter()` builtin documentation on the abstract typedef;
@@ -28006,6 +28175,16 @@ fn init_sequence_iterator_type(ns: PyObjectRef) {
     for (name, value) in entries {
         unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
     }
+    set_iterator_text_signatures(
+        ns,
+        &[
+            ("__iter__", "($self, /)"),
+            ("__next__", "($self, /)"),
+            ("__reduce__", "($self, /)"),
+            ("__length_hint__", "($self, /)"),
+            ("__setstate__", "($self, object, /)"),
+        ],
+    );
 }
 
 /// Python 3.14 `PySeqIter_Type` restricted to `memory_iterator`'s surface:
@@ -28028,6 +28207,10 @@ fn init_memory_iterator_type(ns: PyObjectRef) {
     for (name, value) in entries {
         unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
     }
+    set_iterator_text_signatures(
+        ns,
+        &[("__iter__", "($self, /)"), ("__next__", "($self, /)")],
+    );
 }
 
 /// `arrayiterator`'s Python 3.14 surface: the iteration protocol plus the
@@ -28065,12 +28248,22 @@ fn init_array_iterator_type(ns: PyObjectRef) {
     for (name, value) in entries {
         unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
     }
+    set_iterator_text_signatures(
+        ns,
+        &[
+            ("__iter__", "($self, /)"),
+            ("__next__", "($self, /)"),
+            ("__reduce__", "($self, /)"),
+            ("__setstate__", "($self, state, /)"),
+        ],
+    );
 }
 
 /// Python 3.14 `PyCallIter_Type` (`callable_iterator`) surface. PyPy 3.11's
 /// `_CallableIterator` is app-level and has only the iteration methods; 3.14
 /// additionally exposes the native pickle reduction hook.
 fn init_callable_iterator_type(ns: PyObjectRef) {
+    unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", pyre_object::w_none()) };
     for (name, function) in [
         (
             "__iter__",
@@ -28090,6 +28283,14 @@ fn init_callable_iterator_type(ns: PyObjectRef) {
             )
         };
     }
+    set_iterator_text_signatures(
+        ns,
+        &[
+            ("__iter__", "($self, /)"),
+            ("__next__", "($self, /)"),
+            ("__reduce__", "($self, /)"),
+        ],
+    );
 }
 
 fn dict_iterator_receiver(
@@ -28177,6 +28378,15 @@ macro_rules! define_dict_iterator_type {
             for (name, value) in entries {
                 unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
             }
+            set_iterator_text_signatures(
+                ns,
+                &[
+                    ("__iter__", "($self, /)"),
+                    ("__next__", "($self, /)"),
+                    ("__length_hint__", "($self, /)"),
+                    ("__reduce__", "($self, /)"),
+                ],
+            );
         }
     };
 }
@@ -28312,6 +28522,16 @@ fn init_range_iterator_type(ns: PyObjectRef) {
     for (name, value) in entries {
         unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
     }
+    set_iterator_text_signatures(
+        ns,
+        &[
+            ("__iter__", "($self, /)"),
+            ("__length_hint__", "($self, /)"),
+            ("__next__", "($self, /)"),
+            ("__reduce__", "($self, /)"),
+            ("__setstate__", "($self, object, /)"),
+        ],
+    );
 }
 
 /// Python 3.14 exposes the arbitrary-precision implementation as the distinct
@@ -28343,6 +28563,16 @@ fn init_long_range_iterator_type(ns: PyObjectRef) {
     for (name, value) in entries {
         unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
     }
+    set_iterator_text_signatures(
+        ns,
+        &[
+            ("__iter__", "($self, /)"),
+            ("__length_hint__", "($self, /)"),
+            ("__next__", "($self, /)"),
+            ("__reduce__", "($self, /)"),
+            ("__setstate__", "($self, object, /)"),
+        ],
+    );
 }
 
 fn init_list_iterator_type(ns: PyObjectRef) {
@@ -28384,6 +28614,16 @@ fn init_list_iterator_type(ns: PyObjectRef) {
     for (name, value) in entries {
         unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
     }
+    set_iterator_text_signatures(
+        ns,
+        &[
+            ("__iter__", "($self, /)"),
+            ("__next__", "($self, /)"),
+            ("__length_hint__", "($self, /)"),
+            ("__reduce__", "($self, /)"),
+            ("__setstate__", "($self, object, /)"),
+        ],
+    );
 }
 
 fn init_list_reverse_iterator_type(ns: PyObjectRef) {
@@ -28425,6 +28665,16 @@ fn init_list_reverse_iterator_type(ns: PyObjectRef) {
     for (name, value) in entries {
         unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
     }
+    set_iterator_text_signatures(
+        ns,
+        &[
+            ("__iter__", "($self, /)"),
+            ("__next__", "($self, /)"),
+            ("__length_hint__", "($self, /)"),
+            ("__reduce__", "($self, /)"),
+            ("__setstate__", "($self, object, /)"),
+        ],
+    );
 }
 
 fn init_tuple_iterator_type(ns: PyObjectRef) {
@@ -28466,6 +28716,16 @@ fn init_tuple_iterator_type(ns: PyObjectRef) {
     for (name, value) in entries {
         unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
     }
+    set_iterator_text_signatures(
+        ns,
+        &[
+            ("__iter__", "($self, /)"),
+            ("__next__", "($self, /)"),
+            ("__length_hint__", "($self, /)"),
+            ("__reduce__", "($self, /)"),
+            ("__setstate__", "($self, object, /)"),
+        ],
+    );
 }
 
 // ── itertools.count / itertools.repeat TypeDefs ─────────────────────
@@ -30829,6 +31089,540 @@ mod tests {
             crate::module::_weakref::interp__weakref::callable_proxy_type(),
         ] {
             assert_eq!(super::cpython_type_layout(w_type), Some((11 * word, 0)));
+        }
+    }
+
+    #[test]
+    fn type_flags_publish_cpython_314_have_gc_from_the_canonical_field() {
+        crate::typedef::init_typeobjects();
+        const HAVE_GC: i64 = 1 << 14;
+        let cases = [
+            ("object", crate::typedef::w_object(), false),
+            ("type", crate::typedef::w_type(), true),
+            (
+                "int",
+                crate::typedef::gettypeobject(&pyre_object::INT_TYPE),
+                false,
+            ),
+            (
+                "bytearray",
+                crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE),
+                false,
+            ),
+            (
+                "tuple",
+                crate::typedef::gettypeobject(&pyre_object::TUPLE_TYPE),
+                true,
+            ),
+            (
+                "dict",
+                crate::typedef::gettypeobject(&pyre_object::DICT_TYPE),
+                true,
+            ),
+            (
+                "function",
+                crate::typedef::gettypeobject(&crate::function::FUNCTION_TYPE),
+                true,
+            ),
+            (
+                "code",
+                crate::typedef::gettypeobject(&crate::pycode::CODE_TYPE),
+                false,
+            ),
+            (
+                "range_iterator",
+                crate::typedef::gettypeobject(&pyre_object::functional::RANGE_ITER_TYPE),
+                false,
+            ),
+            (
+                "longrange_iterator",
+                crate::typedef::gettypeobject(&pyre_object::functional::LONG_RANGE_ITER_TYPE),
+                false,
+            ),
+        ];
+        for (name, w_type, expected) in cases {
+            let w_flags = crate::baseobjspace::getattr_str(w_type, "__flags__")
+                .unwrap_or_else(|err| panic!("{name}.__flags__ lookup failed: {err:?}"));
+            let flags = unsafe { pyre_object::w_int_get_value(w_flags) };
+            assert_eq!(flags & HAVE_GC != 0, expected, "{name}.__flags__");
+            assert_eq!(
+                unsafe { pyre_object::w_type_get_have_gc(w_type) },
+                expected,
+                "{name}.flag_have_gc"
+            );
+        }
+    }
+
+    #[test]
+    fn type_flags_publish_cpython_314_disallow_instantiation() {
+        crate::typedef::init_typeobjects();
+        const DISALLOW_INSTANTIATION: i64 = 1 << 7;
+        let cases = [
+            ("object", crate::typedef::w_object(), false),
+            ("type", crate::typedef::w_type(), false),
+            (
+                "int",
+                crate::typedef::gettypeobject(&pyre_object::INT_TYPE),
+                false,
+            ),
+            (
+                "function",
+                crate::typedef::gettypeobject(&crate::function::FUNCTION_TYPE),
+                false,
+            ),
+            (
+                "code",
+                crate::typedef::gettypeobject(&crate::pycode::CODE_TYPE),
+                false,
+            ),
+            (
+                "mappingproxy",
+                crate::typedef::gettypeobject(&pyre_object::MAPPING_PROXY_TYPE),
+                false,
+            ),
+            (
+                "range",
+                crate::typedef::gettypeobject(&pyre_object::functional::RANGE_TYPE),
+                false,
+            ),
+            (
+                "memoryview",
+                crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE),
+                false,
+            ),
+            (
+                "builtin_function_or_method",
+                crate::typedef::gettypeobject(&crate::function::BUILTIN_FUNCTION_TYPE),
+                true,
+            ),
+            (
+                "method_descriptor",
+                crate::typedef::gettypeobject(&crate::function::METHOD_DESCRIPTOR_TYPE),
+                true,
+            ),
+            (
+                "wrapper_descriptor",
+                crate::typedef::gettypeobject(&crate::function::SLOT_WRAPPER_TYPE),
+                true,
+            ),
+            (
+                "method-wrapper",
+                crate::typedef::gettypeobject(&crate::function::METHOD_WRAPPER_TYPE),
+                true,
+            ),
+            (
+                "classmethod_descriptor",
+                crate::typedef::gettypeobject(&crate::function::CLASSMETHOD_DESCRIPTOR_TYPE),
+                true,
+            ),
+            ("getset_descriptor", super::getset_descriptor_type(), true),
+            (
+                "member_descriptor",
+                crate::typedef::gettypeobject(&pyre_object::typedef::MEMBER_TYPE),
+                true,
+            ),
+            (
+                "dict_keys",
+                crate::typedef::gettypeobject(&pyre_object::dictmultiobject::DICT_KEYS_TYPE),
+                true,
+            ),
+            (
+                "frame",
+                crate::typedef::gettypeobject(&crate::pyframe::FRAME_TYPE),
+                true,
+            ),
+            (
+                "generator",
+                crate::typedef::gettypeobject(&pyre_object::generator::GENERATOR_TYPE),
+                true,
+            ),
+            (
+                "range_iterator",
+                crate::typedef::gettypeobject(&pyre_object::functional::RANGE_ITER_TYPE),
+                true,
+            ),
+            (
+                "list_iterator",
+                crate::typedef::gettypeobject(&pyre_object::iterobject::LIST_ITER_TYPE),
+                true,
+            ),
+            (
+                "set_iterator",
+                crate::typedef::gettypeobject(&pyre_object::setobject::SET_ITERATOR_TYPE),
+                true,
+            ),
+            (
+                "callable_iterator",
+                crate::typedef::gettypeobject(&pyre_object::operation::CALLABLE_ITERATOR_TYPE),
+                true,
+            ),
+            (
+                "typing.Union",
+                crate::typedef::gettypeobject(&pyre_object::UNION_TYPE),
+                true,
+            ),
+        ];
+        for (name, w_type, expected) in cases {
+            let w_flags = crate::baseobjspace::getattr_str(w_type, "__flags__")
+                .unwrap_or_else(|err| panic!("{name}.__flags__ lookup failed: {err:?}"));
+            let flags = unsafe { pyre_object::w_int_get_value(w_flags) };
+            assert_eq!(
+                flags & DISALLOW_INSTANTIATION != 0,
+                expected,
+                "{name}.__flags__"
+            );
+            assert_eq!(
+                unsafe { pyre_object::w_type_disallows_instantiation(w_type) },
+                expected,
+                "{name}.flag_disallow_instantiation"
+            );
+        }
+    }
+
+    #[test]
+    fn type_flags_publish_cpython_314_basetype_from_the_canonical_field() {
+        crate::typedef::init_typeobjects();
+        const BASETYPE: i64 = 1 << 10;
+        let cases = [
+            ("object", crate::typedef::w_object(), true),
+            ("type", crate::typedef::w_type(), true),
+            (
+                "int",
+                crate::typedef::gettypeobject(&pyre_object::INT_TYPE),
+                true,
+            ),
+            (
+                "str",
+                crate::typedef::gettypeobject(&pyre_object::STR_TYPE),
+                true,
+            ),
+            (
+                "bytes",
+                crate::typedef::gettypeobject(&pyre_object::BYTES_TYPE),
+                true,
+            ),
+            (
+                "bytearray",
+                crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE),
+                true,
+            ),
+            (
+                "tuple",
+                crate::typedef::gettypeobject(&pyre_object::TUPLE_TYPE),
+                true,
+            ),
+            (
+                "list",
+                crate::typedef::gettypeobject(&pyre_object::LIST_TYPE),
+                true,
+            ),
+            (
+                "dict",
+                crate::typedef::gettypeobject(&pyre_object::DICT_TYPE),
+                true,
+            ),
+            (
+                "set",
+                crate::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE),
+                true,
+            ),
+            (
+                "property",
+                crate::typedef::gettypeobject(&pyre_object::descriptor::PROPERTY_TYPE),
+                true,
+            ),
+            (
+                "classmethod",
+                crate::typedef::gettypeobject(&pyre_object::function::CLASSMETHOD_TYPE),
+                true,
+            ),
+            (
+                "staticmethod",
+                crate::typedef::gettypeobject(&pyre_object::function::STATICMETHOD_TYPE),
+                true,
+            ),
+            (
+                "super",
+                crate::typedef::gettypeobject(&pyre_object::descriptor::SUPER_TYPE),
+                true,
+            ),
+            (
+                "types.GenericAlias",
+                crate::typedef::gettypeobject(&pyre_object::GENERIC_ALIAS_TYPE),
+                true,
+            ),
+            (
+                "bool",
+                crate::typedef::gettypeobject(&pyre_object::BOOL_TYPE),
+                false,
+            ),
+            (
+                "mappingproxy",
+                crate::typedef::gettypeobject(&pyre_object::MAPPING_PROXY_TYPE),
+                false,
+            ),
+            (
+                "function",
+                crate::typedef::gettypeobject(&crate::function::FUNCTION_TYPE),
+                false,
+            ),
+            (
+                "code",
+                crate::typedef::gettypeobject(&crate::pycode::CODE_TYPE),
+                false,
+            ),
+            (
+                "dict_keys",
+                crate::typedef::gettypeobject(&pyre_object::dictmultiobject::DICT_KEYS_TYPE),
+                false,
+            ),
+            (
+                "slice",
+                crate::typedef::gettypeobject(&pyre_object::SLICE_TYPE),
+                false,
+            ),
+            (
+                "typing.Union",
+                crate::typedef::gettypeobject(&pyre_object::UNION_TYPE),
+                false,
+            ),
+            (
+                "range",
+                crate::typedef::gettypeobject(&pyre_object::functional::RANGE_TYPE),
+                false,
+            ),
+            (
+                "memoryview",
+                crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE),
+                false,
+            ),
+        ];
+        for (name, w_type, expected) in cases {
+            let w_flags = crate::baseobjspace::getattr_str(w_type, "__flags__")
+                .unwrap_or_else(|err| panic!("{name}.__flags__ lookup failed: {err:?}"));
+            let flags = unsafe { pyre_object::w_int_get_value(w_flags) };
+            assert_eq!(flags & BASETYPE != 0, expected, "{name}.__flags__");
+            assert_eq!(
+                unsafe { pyre_object::w_type_get_acceptable_as_base_class(w_type) },
+                expected,
+                "{name}.acceptable_as_base_class"
+            );
+        }
+    }
+
+    #[test]
+    fn type_flags_publish_cpython_314_fast_subclass_family_from_the_mro() {
+        crate::typedef::init_typeobjects();
+        let _builtins = crate::builtins::new_builtin_module_dict();
+        const LONG_SUBCLASS: i64 = 1 << 24;
+        const LIST_SUBCLASS: i64 = 1 << 25;
+        const TUPLE_SUBCLASS: i64 = 1 << 26;
+        const BYTES_SUBCLASS: i64 = 1 << 27;
+        const UNICODE_SUBCLASS: i64 = 1 << 28;
+        const DICT_SUBCLASS: i64 = 1 << 29;
+        const BASE_EXC_SUBCLASS: i64 = 1 << 30;
+        const TYPE_SUBCLASS: i64 = 1 << 31;
+        const FAMILY_MASK: i64 = LONG_SUBCLASS
+            | LIST_SUBCLASS
+            | TUPLE_SUBCLASS
+            | BYTES_SUBCLASS
+            | UNICODE_SUBCLASS
+            | DICT_SUBCLASS
+            | BASE_EXC_SUBCLASS
+            | TYPE_SUBCLASS;
+        let cases = [
+            ("object", crate::typedef::w_object(), 0),
+            ("type", crate::typedef::w_type(), TYPE_SUBCLASS),
+            (
+                "int",
+                crate::typedef::gettypeobject(&pyre_object::INT_TYPE),
+                LONG_SUBCLASS,
+            ),
+            (
+                "bool",
+                crate::typedef::gettypeobject(&pyre_object::BOOL_TYPE),
+                LONG_SUBCLASS,
+            ),
+            (
+                "list",
+                crate::typedef::gettypeobject(&pyre_object::LIST_TYPE),
+                LIST_SUBCLASS,
+            ),
+            (
+                "tuple",
+                crate::typedef::gettypeobject(&pyre_object::TUPLE_TYPE),
+                TUPLE_SUBCLASS,
+            ),
+            (
+                "bytes",
+                crate::typedef::gettypeobject(&pyre_object::BYTES_TYPE),
+                BYTES_SUBCLASS,
+            ),
+            (
+                "str",
+                crate::typedef::gettypeobject(&pyre_object::STR_TYPE),
+                UNICODE_SUBCLASS,
+            ),
+            (
+                "dict",
+                crate::typedef::gettypeobject(&pyre_object::DICT_TYPE),
+                DICT_SUBCLASS,
+            ),
+            (
+                "BaseException",
+                pyre_object::interp_exceptions::lookup_exc_class_for_kind(
+                    pyre_object::interp_exceptions::ExcKind::BaseException,
+                ),
+                BASE_EXC_SUBCLASS,
+            ),
+            (
+                "Exception",
+                pyre_object::interp_exceptions::lookup_exc_class_for_kind(
+                    pyre_object::interp_exceptions::ExcKind::Exception,
+                ),
+                BASE_EXC_SUBCLASS,
+            ),
+            (
+                "float",
+                crate::typedef::gettypeobject(&pyre_object::FLOAT_TYPE),
+                0,
+            ),
+            (
+                "set",
+                crate::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE),
+                0,
+            ),
+        ];
+        for (name, w_type, expected) in cases {
+            let w_flags = crate::baseobjspace::getattr_str(w_type, "__flags__")
+                .unwrap_or_else(|err| panic!("{name}.__flags__ lookup failed: {err:?}"));
+            let flags = unsafe { pyre_object::w_int_get_value(w_flags) };
+            assert_eq!(flags & FAMILY_MASK, expected, "{name}.__flags__");
+        }
+    }
+
+    #[test]
+    fn type_flags_publish_cpython_314_ready_match_self_and_collection_bits() {
+        crate::typedef::init_typeobjects();
+        const SEQUENCE: i64 = 1 << 5;
+        const MAPPING: i64 = 1 << 6;
+        const READY: i64 = 1 << 12;
+        const MATCH_SELF: i64 = 1 << 22;
+        const MASK: i64 = SEQUENCE | MAPPING | READY | MATCH_SELF;
+        let cases = [
+            ("object", crate::typedef::w_object(), READY),
+            ("type", crate::typedef::w_type(), READY),
+            (
+                "int",
+                crate::typedef::gettypeobject(&pyre_object::INT_TYPE),
+                READY | MATCH_SELF,
+            ),
+            (
+                "float",
+                crate::typedef::gettypeobject(&pyre_object::FLOAT_TYPE),
+                READY | MATCH_SELF,
+            ),
+            (
+                "str",
+                crate::typedef::gettypeobject(&pyre_object::STR_TYPE),
+                READY | MATCH_SELF,
+            ),
+            (
+                "bytes",
+                crate::typedef::gettypeobject(&pyre_object::BYTES_TYPE),
+                READY | MATCH_SELF,
+            ),
+            (
+                "bytearray",
+                crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE),
+                READY | MATCH_SELF,
+            ),
+            (
+                "list",
+                crate::typedef::gettypeobject(&pyre_object::LIST_TYPE),
+                READY | MATCH_SELF | SEQUENCE,
+            ),
+            (
+                "tuple",
+                crate::typedef::gettypeobject(&pyre_object::TUPLE_TYPE),
+                READY | MATCH_SELF | SEQUENCE,
+            ),
+            (
+                "dict",
+                crate::typedef::gettypeobject(&pyre_object::DICT_TYPE),
+                READY | MATCH_SELF | MAPPING,
+            ),
+            (
+                "set",
+                crate::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE),
+                READY | MATCH_SELF,
+            ),
+            (
+                "frozenset",
+                crate::typedef::gettypeobject(&pyre_object::setobject::FROZENSET_TYPE),
+                READY | MATCH_SELF,
+            ),
+            (
+                "range",
+                crate::typedef::gettypeobject(&pyre_object::functional::RANGE_TYPE),
+                READY | SEQUENCE,
+            ),
+            (
+                "memoryview",
+                crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE),
+                READY | SEQUENCE,
+            ),
+            (
+                "mappingproxy",
+                crate::typedef::gettypeobject(&pyre_object::MAPPING_PROXY_TYPE),
+                READY | MAPPING,
+            ),
+        ];
+        for (name, w_type, expected) in cases {
+            let w_flags = crate::baseobjspace::getattr_str(w_type, "__flags__")
+                .unwrap_or_else(|err| panic!("{name}.__flags__ lookup failed: {err:?}"));
+            let flags = unsafe { pyre_object::w_int_get_value(w_flags) };
+            assert_eq!(flags & MASK, expected, "{name}.__flags__");
+        }
+    }
+
+    #[test]
+    fn type_flags_keep_pypy_storage_and_cpython_owner_axes_orthogonal() {
+        crate::typedef::init_typeobjects();
+        const STATIC_BUILTIN: i64 = 1 << 1;
+        const IMMUTABLETYPE: i64 = 1 << 8;
+        const HEAPTYPE: i64 = 1 << 9;
+        const OWNER_MASK: i64 = STATIC_BUILTIN | IMMUTABLETYPE | HEAPTYPE;
+
+        let cases = [
+            (
+                "object",
+                crate::typedef::w_object(),
+                STATIC_BUILTIN | IMMUTABLETYPE,
+            ),
+            (
+                "array.array",
+                crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE),
+                HEAPTYPE | IMMUTABLETYPE,
+            ),
+            (
+                "itertools.count",
+                crate::typedef::gettypeobject(&pyre_object::interp_itertools::COUNT_TYPE),
+                HEAPTYPE | IMMUTABLETYPE,
+            ),
+            (
+                "_random.Random",
+                crate::module::_random::type_object(),
+                HEAPTYPE,
+            ),
+        ];
+        for (name, w_type, expected) in cases {
+            let flags = unsafe { pyre_object::w_type_get_flags(w_type) };
+            assert_eq!(flags & OWNER_MASK, expected, "{name}.__flags__");
+            assert!(
+                !unsafe { pyre_object::w_type_is_heaptype(w_type) },
+                "{name} must remain a PyPy builtin TypeDef internally"
+            );
         }
     }
 

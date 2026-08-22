@@ -2637,17 +2637,46 @@ impl UserDelAction {
             }
             return;
         }
+        if pyre_object::generator::AsyncGenASend::from_obj(current()).is_some()
+            || pyre_object::generator::AsyncGenAThrow::from_obj(current()).is_some()
+        {
+            // executioncontext.py:651-661 — a finalizer that would call a
+            // user-defined app-level function defers under `gc.disable()`.
+            // This one emits a RuntimeWarning, so it reaches the overridable
+            // `warnings` machinery, exactly like the generator branch below.
+            if self.gc_disabled(current()) {
+                return;
+            }
+            crate::baseobjspace::async_gen_awaitable_finalize(current());
+            return;
+        }
         if unsafe { pyre_object::generator::is_generator_or_coroutine(current()) } {
             if self.gc_disabled(current()) {
                 return;
             }
-            if let Err(error) = crate::baseobjspace::generator_finalize(current()) {
-                report_error(
-                    self.base.space,
-                    &error,
-                    rustpython_wtf8::Wtf8::new(""),
-                    current(),
+            if let Err(mut error) = crate::baseobjspace::generator_finalize(current()) {
+                // CPython 3.14 `_PyGen_Finalize` reports close failures with
+                // `PyErr_FormatUnraisable`, whose hook object is None and
+                // whose message names the generator itself.
+                let w_exc = error.to_exc_object();
+                let frame = crate::eval::current_frame();
+                if !frame.is_null() {
+                    unsafe {
+                        crate::pytraceback::record_application_traceback(
+                            w_exc,
+                            frame,
+                            (*frame).last_instr as i64,
+                        )
+                    };
+                }
+                let repr = unsafe { crate::display::py_repr_wtf8(current()) }
+                    .unwrap_or_else(|_| rustpython_wtf8::Wtf8Buf::from_string("<?>".to_owned()));
+                let where_desc = crate::display::wtf8_format!(
+                    "Exception ignored while closing generator ",
+                    repr
                 );
+                report_error(self.base.space, &error, &where_desc, pyre_object::w_none());
+                crate::eval::set_in_flight_exception(pyre_object::PY_NULL);
             }
             // pyframe.py:75-76/276-279 stores this back-reference as
             // `f_generator_wref` in translated PyPy.  The collector has

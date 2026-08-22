@@ -2593,6 +2593,10 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
         "__new__",
         crate::typedef::make_new_descr(memoryview_descr_new),
     );
+    // No `__weakref__` descriptor: `PyMemoryView_Type` sets
+    // `tp_weaklistoffset` and leaves its getset table without the entry, so a
+    // view is weak-referenceable while `view.__weakref__` raises
+    // AttributeError and `memoryview.__dict__` has no such key.
     for (name, f, arity) in [
         ("__getitem__", memoryview_getitem as MvFn, 2u16),
         ("__setitem__", memoryview_setitem, 3),
@@ -2835,6 +2839,14 @@ fn install_builtin_text_signatures(ns: PyObjectRef) {
 }
 
 pub fn install_default_builtins(ns: PyObjectRef) {
+    // The `Module` class docstring at `pypy/module/__builtin__/moduledef.py:9`,
+    // which `MixedModule.get__doc__` publishes as this module's `__doc__`.
+    // Seeded here rather than in the module def because the execution
+    // context builds this namespace directly, and the module `import
+    // builtins` returns wraps that same dict.
+    crate::module_ns_get_or_insert_with(ns, "__doc__", || {
+        pyre_object::w_str_new("Built-in functions, exceptions, and other objects.")
+    });
     crate::module_ns_get_or_insert_with(ns, "print", || {
         make_module_builtin_function("print", builtin_print)
     });
@@ -4404,6 +4416,16 @@ pub fn is_builtin_getattr_function(callable: PyObjectRef) -> bool {
     is_builtin_code_function(callable, builtin_getattr)
 }
 
+/// True iff `callable` is the builtin `hasattr` function object.
+///
+/// The walker uses this to recognize the `hasattr(obj, name)` residual whose
+/// answer an instance-shape guard already settles: [`builtin_hasattr`] reports
+/// False only for the `AttributeError` its lookup raises, so an attribute the
+/// shape carries makes the call a constant True.
+pub fn is_builtin_hasattr_function(callable: PyObjectRef) -> bool {
+    is_builtin_code_function(callable, builtin_hasattr)
+}
+
 /// True iff `callable` is the builtin `locals` function object.
 ///
 /// The JIT walker uses this to recognize the `locals()` residual it can
@@ -4512,7 +4534,28 @@ pub fn is_builtin_ord_function(callable: PyObjectRef) -> bool {
 /// paths through `abstractinst.py`; a rebound global must not inherit that
 /// classification merely because it is still named `isinstance`.
 pub fn is_builtin_isinstance_function(callable: PyObjectRef) -> bool {
-    is_builtin_code_function(callable, __pyre_wrap_builtin_isinstance)
+    unsafe {
+        if callable.is_null() || !crate::is_function(callable) {
+            return false;
+        }
+        let code = crate::function_get_code(callable) as PyObjectRef;
+        if code.is_null() || !crate::gateway::is_builtin_code(code) {
+            return false;
+        }
+        crate::gateway::builtin_code_fn_eq(
+            crate::gateway::builtin_code_get(code),
+            __pyre_wrap_builtin_isinstance as crate::gateway::BuiltinCodeFn,
+        )
+    }
+}
+
+/// True iff `callable` is the canonical builtin `issubclass` function object.
+///
+/// The JIT walker uses this together with abstractinst.py's non-overridable
+/// `type.__subclasscheck__` path; a rebound global named `issubclass` must not
+/// inherit that fold.
+pub fn is_builtin_issubclass_function(callable: PyObjectRef) -> bool {
+    is_builtin_code_function(callable, builtin_issubclass)
 }
 
 /// `len(obj)` — return the length of an object.
@@ -9767,7 +9810,10 @@ pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         }
     }
     let w = unsafe { crate::py_str_wtf8(obj)? };
-    Ok(pyre_object::w_str_from_wtf8_managed(w))
+    // `StdObjSpace.str` returns the ordinary movable `space.newtext` result.
+    // The input is fully consumed above, so only the newly built WTF-8 value
+    // must be rooted across this terminal collecting header allocation.
+    Ok(unsafe { pyre_object::w_str_from_wtf8_managed_collecting(w) })
 }
 
 unsafe fn py_repr_obj(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
@@ -12654,6 +12700,7 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     // bits the codegen honours, and the optimisation level.
     let opts = crate::compile::CompileOpts {
         optimize: optimize as u8,
+        debug_ranges: crate::importing::code_debug_ranges_flag(),
         allow_top_level_await: flags & PYCF_ALLOW_TOP_LEVEL_AWAIT != 0,
         dont_imply_dedent: flags & PYCF_DONT_IMPLY_DEDENT != 0,
         future_features: crate::CodeFlags::from_bits_truncate((flags & COMPILER_FLAGS) as u32),
@@ -15170,6 +15217,10 @@ pub fn file_wrapper_type() -> PyObjectRef {
     static FILE_WRAPPER_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *FILE_WRAPPER_TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("_io.TextIOWrapper", init_file_wrapper_type);
+        // CPython 3.14 Modules/_io/_iomodule.c:ADD_TYPE creates the immutable
+        // TextIOWrapper heap spec.  This legacy wrapper accessor must publish
+        // the same owner as `_io::textio::type_object`.
+        crate::typedef::mark_cpython_heap_type(tp, true);
         unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
         tp as usize
     }) as PyObjectRef
@@ -15951,6 +16002,16 @@ impl Drop for WritableBuffer {
 unsafe fn fileio_writebuf(
     obj: PyObjectRef,
 ) -> Result<(&'static mut [u8], PyObjectRef), crate::PyError> {
+    fn type_error(obj: PyObjectRef) -> crate::PyError {
+        // PyPy `ObjSpace.acquire_writebuf` reports the rejected exporter's
+        // type.  CPython 3.14's readinto gateways keep the same information
+        // but prefix it with the argument name owned by the builtin method.
+        let type_name = unsafe { pyre_object::type_name_of(obj) };
+        crate::PyError::type_error(format!(
+            "readinto() argument must be read-write bytes-like object, not {type_name}"
+        ))
+    }
+
     unsafe {
         if pyre_object::bytearrayobject::is_bytearray(obj) {
             return Ok((pyre_object::bytearrayobject::w_bytearray_data_mut(obj), obj));
@@ -15984,15 +16045,11 @@ unsafe fn fileio_writebuf(
             memoryview_check_released(obj)?;
             if pyre_object::memoryview::w_memoryview_readonly(obj) || !memoryview_contiguity(obj).0
             {
-                return Err(crate::PyError::type_error(
-                    "readinto() argument must be read-write bytes-like object",
-                ));
+                return Err(type_error(obj));
             }
             let view = pyre_object::memoryview::w_memoryview_view(obj);
             let Some(full) = view.backing().as_bytes_mut() else {
-                return Err(crate::PyError::type_error(
-                    "readinto() argument must be read-write bytes-like object",
-                ));
+                return Err(type_error(obj));
             };
             let offset = view.offset() as usize;
             let length = pyre_object::memoryview::w_memoryview_length(obj) as usize;
@@ -16003,9 +16060,7 @@ unsafe fn fileio_writebuf(
             }
             return Ok((&mut full[offset..offset + length], obj));
         }
-        Err(crate::PyError::type_error(
-            "readinto() argument must be read-write bytes-like object",
-        ))
+        Err(type_error(obj))
     }
 }
 
@@ -19230,6 +19285,19 @@ mod tests {
         assert!(is_builtin_isinstance_function(isinstance));
         assert!(!is_builtin_isinstance_function(renamed_isinstance));
         assert!(!is_builtin_isinstance_function(std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn builtin_issubclass_identity_uses_wrapped_code() {
+        crate::typedef::init_typeobjects();
+        let issubclass =
+            make_module_builtin_function_with_arity("issubclass", builtin_issubclass, 2);
+        let renamed_issubclass =
+            make_module_builtin_function_with_arity("issubclass", builtin_repr, 2);
+
+        assert!(is_builtin_issubclass_function(issubclass));
+        assert!(!is_builtin_issubclass_function(renamed_issubclass));
+        assert!(!is_builtin_issubclass_function(std::ptr::null_mut()));
     }
 
     #[test]

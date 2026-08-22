@@ -1,4 +1,11 @@
 # pyre-check: max-pypy-ratio=86
+# pyre-check: jitstats-band=guard_failures=1
+# One tree, three runners, one CI run (`1d212895c6b`): macOS and ubuntu read
+# 1003 dynasm / 1008 cranelift, windows 1004 / 1009. The loop and bridge counts
+# agreed at six and five everywhere, so the split is carried entirely by this
+# counter and is not a function of the tree. The baseline holds the pair the two
+# agreeing runners read; the band is exactly the measured width, so anything
+# wider than the split still gates.
 # The ceiling is a function of N, so raising N refits it. pypy's execution here
 # is almost all fixed cost -- doubling N moved it 0.035s to 0.039s -- while this
 # backend pays roughly 27us per iteration, so the ratio tracks N nearly one for
@@ -29,10 +36,25 @@ from fractions import Fraction
 # and moved between two runs of one binary -- 923/6 loops against 925/7 here,
 # 923/6 against 938/8 on ubuntu and 922 against 923 on windows. Convergence
 # completes by 48000 on both native backends, and past it every gated counter is
-# independent of N: dynasm holds 1004 guard failures and cranelift 1010, with
+# independent of N: dynasm holds 1003 guard failures and cranelift 1008, with
 # six loops and five bridges, unchanged from 48000 through 96000. This sits far
 # enough above that point to keep the fixed point on a host that needs a few
 # more iterations to reach it.
+#
+# The fixed point was seven loops and 1007/1012 guard failures for as long as
+# the blackhole recognized `catch_exception/L`: once jd0's staticdata carries
+# the assembler's real opcode ids instead of the 255 `op_live` sentinel, an
+# exception it used to let escape is caught, and the extra loop plus three
+# guard failures are that arm being compiled. `driver_finish_setup` still
+# installs those ids, but the arm is no longer reached, so the counters sit
+# below that pair on both native backends. Whatever stopped reaching it is
+# unattributed; the wasm backend never reached the arm at all, which is why its
+# baseline never moved off six.
+#
+# At six loops the guard counts have alternated between 1004/1009 and 1003/1008
+# across runs while the loop and bridge counts held. Only the loop count answers
+# whether the arm compiles, so treat a one-count move here as the unattributed
+# remainder rather than as this fixture's subject.
 N = 64000
 
 

@@ -216,7 +216,13 @@ pub fn decode_instruction_for_dispatch(
             decode_instruction_at(code, opcode_pc).ok_or(crate::pycode::BytecodeCorruption)?;
         instruction = decoded.0;
         op_arg = decoded.1;
-        if !matches!(instruction, Instruction::ExtendedArg) && u8::from(instruction) < 44 {
+        // `Reserved` is excluded for the same reason the forward decoder
+        // excludes it: an unknown opcode byte is preserved here so dispatch
+        // reaches it and reports `SystemError: unknown opcode N`.
+        if !matches!(instruction, Instruction::ExtendedArg)
+            && u8::from(instruction) < 44
+            && !matches!(instruction, Instruction::Reserved)
+        {
             return Err(crate::pycode::BytecodeCorruption);
         }
     }
@@ -277,7 +283,10 @@ pub fn decode_instruction_forward(
             opcode_pc += 1;
             continue;
         }
-        if opcode_pc != start && u8::from(instruction) < 44 {
+        if opcode_pc != start
+            && u8::from(instruction) < 44
+            && !matches!(instruction, Instruction::Reserved)
+        {
             return Err(crate::pycode::BytecodeCorruption);
         }
         return Ok((opcode_pc, instruction, op_arg));
@@ -3511,6 +3520,14 @@ where
         + ArithmeticOpcodeHandler,
 {
     match instruction {
+        // CPython 3.14 accepts unknown bytes in `CodeType` / `code.replace`
+        // and reports them only when dispatch reaches the instruction.  The
+        // constructor stores the raw opcode byte in this placeholder's low
+        // arg byte because compiler-core's enum cannot represent it.
+        Instruction::Reserved => Err(PyError::new(
+            crate::PyErrorKind::SystemError,
+            format!("unknown opcode {}", u32::from(op_arg) & 0xff),
+        )),
         Instruction::ExtendedArg
         | Instruction::Resume { .. }
         | Instruction::Nop
@@ -3932,6 +3949,27 @@ mod tests {
             code.instructions.replace_op(1, Instruction::GetIter);
         }
         assert!(decode_instruction_for_dispatch(&code, 0).is_err());
+    }
+
+    /// An opcode byte the enum cannot spell decodes to `Reserved`, and the
+    /// `unknown opcode N` report is raised by dispatch rather than by the
+    /// decoder, so an `ExtendedArg` prefix in front of one must not be
+    /// rejected as a malformed chain.
+    #[test]
+    fn decode_instruction_for_dispatch_keeps_reserved_after_extended_arg() {
+        let code = compile_exec("x = 1").expect("compile failed");
+        assert!(
+            code.instructions.len() >= 2,
+            "expected at least two instructions"
+        );
+        unsafe {
+            code.instructions.replace_op(0, Instruction::ExtendedArg);
+            code.instructions.replace_op(1, Instruction::Reserved);
+        }
+        let (opcode_pc, instruction, _) =
+            decode_instruction_for_dispatch(&code, 0).expect("Reserved stays decodable");
+        assert_eq!(opcode_pc, 1);
+        assert!(matches!(instruction, Instruction::Reserved));
     }
 
     #[test]

@@ -5341,6 +5341,33 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
+    // `isinstance(obj, cls)` exact-type hit: inline the first
+    // `abstractinst.py` `abstract_isinstance_w` check (`type(obj) is cls`) as
+    // callable/class guards plus a constant `True`.  All non-quick cases fall
+    // through to the residual so tuple/union recursion and `__instancecheck__`
+    // lookup stay unchanged.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+        && spec_gate("builtin_isinstance", || {
+            try_walker_specialize_builtin_isinstance(ctx, code, op, &r_args, dst)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+        && spec_gate("builtin_issubclass", || {
+            try_walker_specialize_builtin_issubclass(ctx, code, op, &r_args, dst)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     // BuiltinCode.func is an indirect PBC target exactly like RPython's
     // gateway wrappers.  Enter its generated JitCode before considering the
     // user-function-only full-body walk below.
@@ -5920,6 +5947,34 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
         && spec_gate("builtin_type_getattr", || {
             try_walker_specialize_builtin_type_getattr(ctx, code, op, &r_args, dst)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
+    // The same call on an ordinary instance: `getattr(obj, "name")` reaches the
+    // one `space.getattr` that `obj.name` does, so it folds to the instance
+    // read instead of an opaque MRO-walk residual.  Runs after the type form,
+    // which answers the receiver the instance-shape read declines.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+        && spec_gate("builtin_getattr", || {
+            try_walker_specialize_builtin_getattr(ctx, code, op, &r_args, dst)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
+    // `hasattr(obj, "name")` on the same receiver: the shape guards answer it
+    // outright, so it folds to a constant without reading the attribute.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+        && spec_gate("builtin_hasattr", || {
+            try_walker_specialize_builtin_hasattr(ctx, code, op, &r_args, dst)
         })?
         .is_some()
     {
@@ -6901,18 +6956,20 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 ctx.trace_ctx.box_value(code_opref),
                 ctx.trace_ctx.box_value(namei_opref),
             ) {
-                if spec_gate("load_attr", || {
-                    try_walker_specialize_load_attr(
-                        ctx,
-                        op.pc,
-                        obj_opref,
-                        w_code_ptr,
-                        namei as usize,
-                        dst,
-                        dst_bank,
-                    )
-                })?
-                .is_some()
+                // Resolve the name out of the jitcode's own `co_names` here
+                // rather than inside the fold (mirrors `bh_load_attr_fn`; the
+                // codewriter passes the raw index).  The fold's body is shared
+                // with the `getattr(obj, "name")` builtin, which spells the
+                // same `space.getattr` but carries its name as a constant
+                // operand, so the lookup has to reach it already resolved.
+                let attr_name = walker_load_name_from_code(w_code_ptr, namei as usize);
+                if let Some(attr_name) = attr_name.as_deref()
+                    && spec_gate("load_attr", || {
+                        try_walker_specialize_load_attr(
+                            ctx, op.pc, obj_opref, attr_name, dst, dst_bank,
+                        )
+                    })?
+                    .is_some()
                 {
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }

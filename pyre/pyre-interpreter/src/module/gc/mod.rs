@@ -664,10 +664,108 @@ fn pin_object(object: majit_ir::GcRef) {
     pyre_object::gc_roots::pin_root(object.0 as PyObjectRef);
 }
 
+/// `[3.14-spec]` PyPy's `referents.py:115-122` exposes every app-level
+/// object reached by `rgc.do_get_objects`, while CPython 3.14
+/// `Modules/gcmodule.c:319-342` exposes only objects tracked by its cyclic
+/// collector. Keep the PyPy/RPython traversal in `majit_gc`; filter only at
+/// the public CPython-compatible boundary, using the same tracked-state model
+/// as `gc.is_tracked` below.
+fn pin_cpython_tracked_object(object: majit_ir::GcRef) {
+    let w_obj = object.0 as PyObjectRef;
+    if crate::typedef::cpython_object_is_gc(w_obj) {
+        pyre_object::gc_roots::pin_root(w_obj);
+    }
+}
+
+/// CPython's container traversal sees logical entries even where a PyPy list
+/// strategy, dict strategy, or specialised tuple stores an unboxed scalar.  The
+/// collector walk correctly has no GC edge to report for those fields, so
+/// materialise only the missing logical half at the public API boundary.
+/// Object-strategy entries remain the collector's responsibility: rebuilding
+/// all of them here would both duplicate results and lose the identity of
+/// direct referents.
+fn pin_unboxed_container_referents(source_slot: usize) {
+    let w_obj = pyre_object::gc_roots::shadow_stack_get(source_slot);
+    if w_obj.is_null()
+        || (pyre_object::tagged_int::CAN_BE_TAGGED && tagged_int::is_tagged_int(w_obj))
+    {
+        return;
+    }
+    unsafe {
+        if std::ptr::eq((*w_obj).ob_type, &LIST_TYPE) {
+            let list = &*(w_obj as *const listobject::W_ListObject);
+            if matches!(
+                list.strategy,
+                listobject::ListStrategy::Empty | listobject::ListStrategy::Object
+            ) {
+                return;
+            }
+            let len = listobject::w_list_len(w_obj);
+            for index in 0..len {
+                let list = pyre_object::gc_roots::shadow_stack_get(source_slot);
+                if let Some(item) = listobject::w_list_getitem(list, index as i64) {
+                    pyre_object::gc_roots::pin_root(item);
+                }
+            }
+        } else if std::ptr::eq((*w_obj).ob_type, &DICT_TYPE) {
+            let kind = dictmultiobject::w_dict_get_strategy(w_obj).strategy_kind();
+            if !matches!(
+                kind,
+                dictmultiobject::StrategyKind::Int | dictmultiobject::StrategyKind::Bytes
+            ) {
+                return;
+            }
+            let len = dictmultiobject::w_dict_len(w_obj);
+            for index in 0..len {
+                let dict = pyre_object::gc_roots::shadow_stack_get(source_slot);
+                if let Some((key, _)) = dictmultiobject::w_dict_nth_item(dict, index) {
+                    // The typed strategy's GC walker already reported the
+                    // boxed value; only its native i64/Vec<u8> key was absent.
+                    pyre_object::gc_roots::pin_root(key);
+                }
+            }
+        } else if is_specialised_tuple_ii(w_obj) || is_specialised_tuple_ff(w_obj) {
+            // Both items live in inline i64/f64 fields, so these two variants
+            // carry no GC-pointer slot at all and the walker reports an empty
+            // tuple.  `w_tuple_getitem` re-wraps them the same way
+            // `specialisedtupleobject.py:138-141 wraps[i](self.space, value)`
+            // does.  `Cls_oo` stores both items as GC pointers and stays the
+            // collector's.
+            for index in 0..2 {
+                let tuple = pyre_object::gc_roots::shadow_stack_get(source_slot);
+                if let Some(item) = tupleobject::w_tuple_getitem(tuple, index) {
+                    pyre_object::gc_roots::pin_root(item);
+                }
+            }
+        }
+    }
+}
+
+/// Remove one temporary root while retaining every result appended after it.
+/// Shadow-stack slots, rather than copied addresses, are moved so a collection
+/// during scalar materialisation cannot leave a stale result behind.
+fn remove_root_slot_preserving_tail(slot: usize) {
+    let end = pyre_object::gc_roots::shadow_stack_len();
+    // Every caller pushes the root it names, so `slot < end` holds. Keep it a
+    // runtime check anyway: a release build would otherwise underflow `end - 1`
+    // below and truncate the stack to a nonsense length.
+    if slot >= end {
+        return;
+    }
+    for index in slot + 1..end {
+        let value = pyre_object::gc_roots::shadow_stack_get(index);
+        pyre_object::gc_roots::shadow_stack_set(index - 1, value);
+    }
+    pyre_object::gc_roots::shadow_stack_cell_truncate(
+        pyre_object::gc_roots::shadow_stack_cell(),
+        end - 1,
+    );
+}
+
 /// `referents.py _list_w_obj_referents`: push the app-level objects
-/// `w_obj` refers to directly onto the shadow stack. The walk looks through
-/// the interpreter-internal structs in between, so a list reports its items
-/// and not the array holding them.
+/// `w_obj` refers to directly onto the shadow stack. The collector walk looks
+/// through interpreter-internal structs; the CPython-facing supplement then
+/// restores logical entries hidden by PyPy's unboxed strategies.
 ///
 /// Only managed-heap referents are reported, the same boundary `gc.get_objects`
 /// and `gc.is_tracked` draw. An immortal referent carries a GC header but sits
@@ -675,7 +773,12 @@ fn pin_object(object: majit_ir::GcRef) {
 /// static that has no header at all, so there is no address the walk could
 /// safely widen to.
 fn pin_referents(w_obj: PyObjectRef) {
-    majit_gc::get_referents(majit_ir::GcRef(w_obj as usize), pin_object);
+    let source_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_obj);
+    let source = pyre_object::gc_roots::shadow_stack_get(source_slot);
+    majit_gc::get_referents(majit_ir::GcRef(source as usize), pin_object);
+    pin_unboxed_container_referents(source_slot);
+    remove_root_slot_preserving_tail(source_slot);
 }
 
 /// Wrap every raw collector node rooted in `[first, last)` as
@@ -1209,10 +1312,10 @@ crate::py_module! {
         fn collect(
             #[default(w_int_new(0))] generation: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            // PyPy `interp_gc.py collect` unwraps the optional generation
+            // `interp_gc.py collect` unwraps the optional generation
             // as an int, but deliberately ignores its value.  In particular,
-            // unlike CPython's three-generation frontend, every integer is
-            // accepted and the default is 0.
+            // unlike a three-generation frontend, every integer is accepted
+            // and the default is 0.
             let _generation = crate::baseobjspace::int_w(
                 crate::baseobjspace::space_index(generation)?,
             )?;
@@ -1220,14 +1323,10 @@ crate::py_module! {
             crate::objspace::std::mapdict::clear_map_attr_cache();
             pyre_object::gc_hook::try_gc_collect();
             run_finalizers_now();
-            // The generation is bound and ignored, but the return value is a
-            // spec axis, and there the caller-observable answer is an int
-            // engineered the way upstream would.  `interp_gc.py:48` still
-            // carries the `return space.newint(0)` that closed `collect` until
-            // `_run_finalizers` was split out of it (`b5632df5b6e0`) and
-            // neither caller of the helper reads its result: the constant is
-            // upstream's own answer for a collector that never counts
-            // unreachable objects.
+            // The return value is the caller-observable axis and is an int.
+            // A collector that never counts unreachable objects has no count
+            // to report, so the constant `interp_gc.py:48` carries is what it
+            // answers.  `extra_tests/snippets/stdlib_gc.py` pins the type.
             Ok(w_int_new(0))
         }
 
@@ -1252,8 +1351,11 @@ crate::py_module! {
         fn get_objects(
             #[default(w_none())] generation: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            // PyPy `referents.py:112-123`: the audit event precedes argument
-            // validation and always carries -1, even for a rejected argument.
+            // `referents.py:116-126 get_objects`: "Return a list of all
+            // app-level objects." The audit event always reports -1 and fires
+            // before the argument is examined, so a non-None value is still
+            // audited; only None is then accepted, because the collector has
+            // no generations to select between.
             let _generation_root = pyre_object::gc_roots::push_roots();
             let generation_slot = pyre_object::gc_roots::shadow_stack_len();
             pyre_object::gc_roots::pin_root(generation);
@@ -1266,7 +1368,7 @@ crate::py_module! {
             }
             let _roots = pyre_object::gc_roots::push_roots();
             let first = pyre_object::gc_roots::shadow_stack_len();
-            majit_gc::get_objects(-1, pin_object);
+            majit_gc::get_objects(-1, pin_cpython_tracked_object);
             Ok(list_from_roots(first))
         }
 
@@ -1352,7 +1454,7 @@ crate::py_module! {
             pyre_object::gc_roots::shadow_stack_copy_range(args_base, &mut rooted_args);
             crate::module::sys::vm::audit("gc.get_referrers", &rooted_args)?;
             let all_first = pyre_object::gc_roots::shadow_stack_len();
-            majit_gc::get_objects(-1, pin_object);
+            majit_gc::get_objects(-1, pin_cpython_tracked_object);
             let all_last = pyre_object::gc_roots::shadow_stack_len();
             // Accumulate the matches as slot indices, not as addresses: the
             // entries stay pinned in `all_first..all_last`, but a copy of one
@@ -1470,17 +1572,14 @@ crate::py_module! {
             Ok(w_none())
         },
         "is_tracked"    / 1 = |args| {
-            // CPython 3.14 `gc.is_tracked(obj)`: whether the collector
-            // traverses references out of the object. Asked of the registered
-            // type rather than of the heap the instance landed in, so an int
-            // answers the same under `PYRE_GC_INTERP`, under the JIT and on
-            // wasm as it does on the immortal path.
-            //
-            // `bytes` and `int` answer True where CPython answers False: their
-            // pyre structs carry `w_dict` and `w_weakreflifeline` slots that
-            // the collector really does follow, which the CPython objects have
-            // no equivalent of.
-            Ok(w_bool_from(majit_gc::is_tracked(majit_ir::GcRef(args[0] as usize))))
+            // CPython 3.14 `PyObject_GC_IsTracked` first requires
+            // `_PyObject_IS_GC`. Pyre's collector does not dynamically
+            // untrack eligible tuples/dicts, so that type-level eligibility
+            // is also its tracked state. Some eligible objects (notably
+            // modules) are rooted outside the moving arena, while scalar Rust
+            // structs may live inside it; arena membership therefore cannot
+            // be used as the app-level answer.
+            Ok(w_bool_from(crate::typedef::cpython_object_is_gc(args[0])))
         },
         "get_rpy_memory_usage" / 1 = |args| {
             // referents.py:97-104 / inspector.py:76-77.  The size is just the

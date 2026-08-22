@@ -302,8 +302,71 @@ fn make_sys_namespace_instance() -> PyObjectRef {
 
 /// Fresh `types.SimpleNamespace` instance — `type(sys.implementation)`, the
 /// attribute bag `time.get_clock_info` fills in and returns.
-pub fn new_simple_namespace_instance() -> PyObjectRef {
-    w_instance_new(simple_namespace_type())
+pub fn new_simple_namespace_instance() -> crate::PyResult {
+    simple_namespace_new(&[simple_namespace_type()])
+}
+
+/// CPython 3.14 `namespace_new`: allocate the instance and give it an
+/// independent insertion-ordered dictionary before `namespace_init` sees any
+/// arguments.
+///
+/// PyPy 3.11's app-level SimpleNamespace leaves its `__dict__` on
+/// MapDictStrategy.  A delete on one instance can then reuse a reordered map
+/// transition for a later instance, which is why PyPy sorts namespace reprs.
+/// CPython 3.14 instead stores a fresh exact dict in `ns_dict`, and its repr
+/// follows insertion order.  Use mapdict.py's own
+/// `MapDictStrategy.switch_to_text_strategy` devolution path here: the
+/// dictionary remains the instance's one authoritative `__dict__`, while its
+/// storage becomes private and ordered like CPython's `ns_dict`.
+///
+/// The devolution is load-bearing, and an ordinary attribute-assigning class
+/// does not show why — its instances keep insertion order across the same
+/// delete. The case that needs it is the keyword constructor:
+///
+/// ```text
+/// del SimpleNamespace(x=1, y=2, z=3).y      # reaches a shortened map
+/// list(SimpleNamespace(x=1, y=2, z=3).__dict__)
+/// # ['z', 'x', 'y'] on the map strategy, ['x', 'y', 'z'] devolved
+/// ```
+fn simple_namespace_new(args: &[PyObjectRef]) -> crate::PyResult {
+    let Some(&subtype) = args.first() else {
+        return Err(crate::PyError::type_error(
+            "types.SimpleNamespace.__new__(): not enough arguments",
+        ));
+    };
+    if !unsafe { pyre_object::is_type(subtype) } {
+        return Err(crate::PyError::type_error(format!(
+            "types.SimpleNamespace.__new__(X): X is not a type object ({})",
+            crate::type_methods::arg_type_name(subtype),
+        )));
+    }
+    // `tp_new_wrapper` checks the declared owner before namespace_new reaches
+    // `type->tp_alloc`: calling SimpleNamespace.__new__(int) must not fall
+    // through to object.__new__'s unrelated layout diagnostic.
+    crate::typedef::check_user_subclass(simple_namespace_type(), subtype)?;
+    // namespace_new ignores constructor arguments after the subtype; they
+    // belong to namespace_init.  Passing only the subtype also mirrors
+    // `type->tp_alloc(type, 0)` rather than object.__new__'s excess-args
+    // validation.
+    let object = crate::typedef::object_descr_new(&args[..1])?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let object_slot = pyre_object::gc_roots::pin_roots(&[object]);
+    // `W_Root.getdict`, not the public attribute lookup: `namespace_new`
+    // reaches the instance mapping directly, so a subclass that overrides
+    // `__getattribute__` or shadows `__dict__` neither runs during
+    // construction nor can make `S()` raise.
+    let dict = crate::baseobjspace::getdict(pyre_object::gc_roots::shadow_stack_get(object_slot))?;
+    pyre_object::gc_roots::pin_root(dict);
+    let dict = pyre_object::gc_roots::shadow_stack_get(object_slot + 1);
+    unsafe {
+        use pyre_object::dictmultiobject::DictStrategy;
+        if pyre_object::dictmultiobject::w_dict_get_strategy(dict).strategy_kind()
+            == pyre_object::dictmultiobject::StrategyKind::Map
+        {
+            crate::objspace::std::mapdict::mapdict_switch_to_text_strategy(dict);
+        }
+    }
+    Ok(pyre_object::gc_roots::shadow_stack_get(object_slot))
 }
 
 /// CPython 3.14 `namespace_init`: accept at most one positional mapping or
@@ -381,6 +444,11 @@ pub(crate) fn simple_namespace_type() -> PyObjectRef {
     let raw = *TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("types.SimpleNamespace", |ns| {
             unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__new__",
+                    crate::typedef::make_new_descr(simple_namespace_new),
+                );
                 pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                     ns,
                     "__init__",
@@ -3510,7 +3578,7 @@ fn sys_clear_type_descriptors(args: &[PyObjectRef]) -> crate::PyResult {
             "_clear_type_descriptors() argument must be a type",
         ));
     }
-    if !unsafe { pyre_object::w_type_is_heaptype(w_type) } {
+    if unsafe { pyre_object::w_type_is_cpython_immutabletype(w_type) } {
         return Err(crate::PyError::type_error("argument is immutable"));
     }
 
