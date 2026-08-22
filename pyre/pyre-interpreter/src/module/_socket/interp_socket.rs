@@ -1620,21 +1620,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "if_nameindex",
             crate::make_builtin_function_with_arity(
                 "if_nameindex",
-                |_| {
-                    let entries = rustpython_host_env::socket::if_nameindex()
-                        .map_err(interface_io_error)?;
-                    Ok(pyre_object::w_list_new(
-                        entries
-                            .into_iter()
-                            .map(|(index, name)| {
-                                pyre_object::w_tuple_new(vec![
-                                    pyre_object::w_int_new(index as i64),
-                                    pyre_object::w_str_new(&name),
-                                ])
-                            })
-                            .collect(),
-                    ))
-                },
+                |_| windows_if_nameindex(),
                 0,
             ),
         );
@@ -2681,6 +2667,142 @@ fn socket_get_so_protocol(_fd: rffi::Socket) -> Result<libc::c_int, crate::PyErr
 #[cfg(unix)]
 const SUN_PATH_OFFSET: usize = core::mem::offset_of!(libc::sockaddr_un, sun_path);
 
+/// `NDIS_IF_MAX_STRING_SIZE` (`ifdef.h`) — the room
+/// `ConvertInterfaceLuidToNameW` is given for a name.
+#[cfg(all(windows, feature = "host_env"))]
+const NDIS_IF_MAX_STRING_SIZE: usize = 255;
+
+/// The Windows arm of `socket_if_nameindex`: `GetIfTable2Ex` for the table,
+/// then `ConvertInterfaceLuidToNameW` per row, appended to a list built empty.
+///
+/// `rustpython_host_env::socket::if_nameindex` walks the same table but hands
+/// each name back through `String::from_utf16_lossy`, which spends an unpaired
+/// surrogate on U+FFFD; `Py_BuildValue("Iu", ...)` keeps what the call wrote,
+/// so the wide buffer is read as WTF-8 here instead.
+#[cfg(all(windows, feature = "host_env"))]
+fn windows_if_nameindex() -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    use windows_sys::Win32::Foundation::NO_ERROR;
+    use windows_sys::Win32::NetworkManagement::IpHelper as ip;
+
+    // Both calls answer with a status of their own instead of setting the last
+    // error, and that status is the one reported.
+    let win32 = |status| interface_io_error(std::io::Error::from_raw_os_error(status as i32));
+
+    let mut table: *mut ip::MIB_IF_TABLE2 = core::ptr::null_mut();
+    let status = unsafe { ip::GetIfTable2Ex(ip::MibIfTableRaw, &mut table) };
+    if status != NO_ERROR {
+        return Err(win32(status));
+    }
+    // The list is built empty and appended to, so no freshly boxed row waits
+    // in a plain vector while the next allocation runs.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let list_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(pyre_object::w_list_new_empty());
+    let outcome = (|| {
+        for index in 0..unsafe { (*table).NumEntries } as usize {
+            let row = unsafe { &*(*table).Table.as_ptr().add(index) };
+            let mut name = [0u16; NDIS_IF_MAX_STRING_SIZE + 1];
+            let status = unsafe {
+                ip::ConvertInterfaceLuidToNameW(&row.InterfaceLuid, name.as_mut_ptr(), name.len())
+            };
+            if status != NO_ERROR {
+                return Err(win32(status));
+            }
+            let end = name.iter().position(|&unit| unit == 0).unwrap_or(name.len());
+            let entry = pyre_object::w_tuple_new(vec![
+                pyre_object::w_int_new(i64::from(row.InterfaceIndex)),
+                pyre_object::w_str_from_wtf8(rustpython_wtf8::Wtf8Buf::from_wide(&name[..end])),
+            ]);
+            unsafe {
+                pyre_object::listobject::w_list_append(
+                    pyre_object::gc_roots::shadow_stack_get(list_slot),
+                    entry,
+                )
+            };
+        }
+        Ok(())
+    })();
+    // `FreeMibTable` runs whichever way the walk ended, as it does there.
+    unsafe { ip::FreeMibTable(table.cast()) };
+    outcome?;
+    Ok(pyre_object::gc_roots::shadow_stack_get(list_slot))
+}
+
+/// `PyLong_AsUnsignedLongMask`: `PyNumber_Index` first, so `__index__`
+/// decides the value and `__int__` is never asked for one, and then the low
+/// bits of what it answered.  This is `ioctl`'s `I` code, the `k` code behind
+/// its `PyIndex_Check`, and the `unsigned_long(bitwise=True)` converter
+/// `share` reads its process id through — one width on a host where
+/// `unsigned int`, `unsigned long` and `DWORD` are all 32 bits.  Carrying no
+/// `PyIndex_Check` of its own, it names an object answering neither the way
+/// `PyNumber_Index` does rather than by giving the argument's position.
+#[cfg(windows)]
+fn masked_ulong_w(obj: pyre_object::PyObjectRef) -> Result<u32, crate::PyError> {
+    Ok(crate::baseobjspace::truncatedint_w(crate::baseobjspace::space_index(obj)?)? as u32)
+}
+
+/// `k` — [`masked_ulong_w`] behind a `PyIndex_Check` that reports the
+/// argument it was reading.  `converttuple` nests the position, so an item of
+/// the `(kkk)` group names itself as `argument 2, item 0`.
+#[cfg(windows)]
+fn ioctl_command_w(
+    obj: pyre_object::PyObjectRef,
+    argument: &str,
+) -> Result<u32, crate::PyError> {
+    if !unsafe { pyre_object::pyobject::is_int_or_long(obj) }
+        && unsafe { crate::baseobjspace::lookup(obj, "__index__") }.is_none()
+    {
+        return Err(crate::PyError::type_error(format!(
+            "ioctl() {argument} must be int, not {}",
+            crate::type_methods::clinic_arg_type_name(obj)
+        )));
+    }
+    masked_ulong_w(obj)
+}
+
+/// `(kkk)` — the three fields `tcp_keepalive` carries.  A parenthesised group
+/// reads its argument through `PySequence_Check` and `PySequence_GetItem`, so
+/// a list or a range serves as well as a tuple, and it reports the two
+/// failures differently: a wrong length names the length, anything that is
+/// not a sequence names the type.
+#[cfg(windows)]
+fn ioctl_keepalive_w(obj: pyre_object::PyObjectRef) -> Result<[u32; 3], crate::PyError> {
+    // `PySequence_Check` guards the group, with `str` turned away beside the
+    // objects that answer no subscript at all: a three-character string is a
+    // sequence of length three and would otherwise be read as one.
+    let is_sequence = !unsafe { pyre_object::is_dict(obj) }
+        && !unsafe { pyre_object::is_str(obj) }
+        && unsafe { crate::baseobjspace::lookup(obj, "__getitem__") }.is_some();
+    if !is_sequence {
+        return Err(crate::PyError::type_error(format!(
+            "ioctl() argument 2 must be 3-item tuple, not {}",
+            crate::type_methods::clinic_arg_type_name(obj)
+        )));
+    }
+    let items = crate::baseobjspace::unpackiterable(obj, -1)?;
+    if items.len() != 3 {
+        return Err(crate::PyError::type_error(format!(
+            "ioctl() argument 2 must be tuple of length 3, not {}",
+            items.len()
+        )));
+    }
+    // Reading one item can run `__index__`, so all three are published before
+    // the first conversion rather than held as a plain vector across it.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    for &item in &items {
+        pyre_object::gc_roots::pin_root(item);
+    }
+    let mut values = [0u32; 3];
+    for (index, value) in values.iter_mut().enumerate() {
+        *value = ioctl_command_w(
+            pyre_object::gc_roots::shadow_stack_get(base + index),
+            &format!("argument 2, item {index}"),
+        )?;
+    }
+    Ok(values)
+}
+
 /// One `%X` conversion of the scan `setbdaddr` runs: blanks, an optional sign,
 /// an optional `0x` prefix, then hex digits accumulated into the `unsigned
 /// int` the C code declares.  Answers the value and what is left to read.
@@ -3366,10 +3488,41 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 socket_init_state(obj, fd, family, ty, proto);
                 return Ok(pyre_object::w_none());
             }
+            let fileno_obj = fileno_obj.unwrap();
+            // A socket handed over by `share` arrives as the bytes of the
+            // `WSAPROTOCOL_INFOW` that wrote it, and re-opening it is what
+            // `WSASocketW` under `FROM_PROTOCOL_INFO` does.  The three
+            // arguments the caller gave are not read at all: the structure
+            // names the family, type and protocol itself, so `fromshare`
+            // reaches this with `socket(0, 0, 0, info)`.
+            #[cfg(all(windows, feature = "host_env"))]
+            if unsafe { pyre_object::is_bytes(fileno_obj) } {
+                // Copied out before the interpreter is released: the borrow
+                // would not survive a collection running in another thread.
+                let data = unsafe { pyre_object::bytesobject::w_bytes_data(fileno_obj) }.to_vec();
+                let size = rustpython_host_env::socket::protocol_info_size();
+                if data.len() != size {
+                    return Err(crate::PyError::value_error(format!(
+                        "socket descriptor string has wrong size, should be {size} bytes."
+                    )));
+                }
+                let shared = {
+                    let _blocked = crate::module::thread::before_external_block();
+                    rustpython_host_env::socket::socket_from_share_data(&data)
+                }
+                .map_err(socket_io_err)?;
+                socket_init_state(
+                    obj,
+                    shared.raw,
+                    shared.family,
+                    shared.socket_type,
+                    shared.protocol,
+                );
+                return Ok(pyre_object::w_none());
+            }
             // `interp_socket.py:253-265` — wrap an existing fd.  A float
             // fileno is a TypeError, a negative fd a ValueError, and any
             // -1 family/type/proto is derived from the descriptor itself.
-            let fileno_obj = fileno_obj.unwrap();
             if unsafe { pyre_object::is_float(fileno_obj) } {
                 return Err(crate::PyError::type_error(
                     "integer argument expected, got float",
@@ -4865,6 +5018,94 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 buf.truncate(sz as usize);
                 Ok(pyre_object::bytesobject::w_bytes_from_bytes(&buf))
             }
+        }),
+    ) };
+
+    // `sock_ioctl` is published where `SIO_RCVALL` is defined, which is
+    // Windows.  It is `WSAIoctl` under a socket method, and the three commands
+    // it names are the ones whose input is a value rather than a buffer.
+    #[cfg(windows)]
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+        ns,
+        "ioctl",
+        crate::make_builtin_function("ioctl", |args| {
+            use windows_sys::Win32::Networking::WinSock as ws;
+
+            if args.len() != 3 {
+                return Err(crate::PyError::type_error(format!(
+                    "ioctl() takes exactly 2 arguments ({} given)",
+                    args.len().saturating_sub(1)
+                )));
+            }
+            let fd = socket_fd(args[0])?;
+            let cmd = ioctl_command_w(args[1], "argument 1")?;
+            let returned = match cmd {
+                ws::SIO_RCVALL | ws::SIO_LOOPBACK_FAST_PATH => {
+                    let value = masked_ulong_w(args[2])?;
+                    unsafe {
+                        rffi::wsa_ioctl(
+                            fd,
+                            cmd,
+                            (&raw const value).cast(),
+                            core::mem::size_of::<u32>() as u32,
+                        )
+                    }
+                }
+                ws::SIO_KEEPALIVE_VALS => {
+                    let [onoff, keepalivetime, keepaliveinterval] = ioctl_keepalive_w(args[2])?;
+                    let keepalive = ws::tcp_keepalive {
+                        onoff,
+                        keepalivetime,
+                        keepaliveinterval,
+                    };
+                    unsafe {
+                        rffi::wsa_ioctl(
+                            fd,
+                            cmd,
+                            (&raw const keepalive).cast(),
+                            core::mem::size_of::<ws::tcp_keepalive>() as u32,
+                        )
+                    }
+                }
+                _ => {
+                    return Err(crate::PyError::value_error(format!(
+                        "invalid ioctl command {cmd}"
+                    )));
+                }
+            };
+            match returned {
+                Some(returned) => Ok(pyre_object::w_int_new(i64::from(returned))),
+                None => Err(socket_last_error()),
+            }
+        }),
+    ) };
+
+    // `sock_share` sits beside `ioctl`, published on the same Windows-only
+    // footing: `WSADuplicateSocketW` writes a `WSAPROTOCOL_INFOW` describing
+    // the socket for the process named, and the bytes of that structure are
+    // the whole answer.  `socket.py` grows `fromshare` as soon as the method
+    // exists, and hands the blob straight back to the constructor.
+    #[cfg(all(windows, feature = "host_env"))]
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+        ns,
+        "share",
+        crate::make_builtin_function("share", |args| {
+            // `METH_O`, so a wrong count is reported by the call machinery
+            // rather than by a converter naming the method.
+            if args.len() != 2 {
+                return Err(crate::PyError::type_error(format!(
+                    "function takes exactly 1 argument ({} given)",
+                    args.len().saturating_sub(1)
+                )));
+            }
+            let fd = socket_fd(args[0])?;
+            let process_id = masked_ulong_w(args[1])?;
+            let info = {
+                let _blocked = crate::module::thread::before_external_block();
+                rustpython_host_env::socket::share_socket(fd, process_id)
+            }
+            .map_err(socket_io_err)?;
+            Ok(pyre_object::w_bytes_from_bytes(&info))
         }),
     ) };
 

@@ -878,12 +878,15 @@ mod win_nt {
         Ok((path, as_bytes, resolved))
     }
 
+    /// The wide name these helpers read, answered as the caller spelled the
+    /// path it asked about: `PyUnicode_FromWideChar`, and
+    /// `PyUnicode_EncodeFSDefault` over that when the argument was `bytes`.
     fn wrap_path(s: &std::ffi::OsStr, as_bytes: bool) -> PyObjectRef {
         // One decode feeds both arms: the bytes form is the filesystem
         // encoding of the same text, not the UTF-8 of a lossy rendering of it.
         let text = crate::gateway::fsdecode_os_str_wtf8(s);
         if as_bytes {
-            pyre_object::w_bytes_from_bytes(text.as_bytes())
+            pyre_object::w_bytes_from_bytes(&crate::gateway::fs_result_bytes(text.as_bytes()))
         } else {
             pyre_object::w_str_from_wtf8(text)
         }
@@ -903,7 +906,14 @@ mod win_nt {
     /// backup-semantics handle so directories open too.
     pub fn _getfinalpathname(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let (path, as_bytes, resolved) = arg_path(args, "_getfinalpathname")?;
-        match host_nt::getfinalpathname(&path) {
+        // `os__getfinalpathname_impl` leaves the interpreter for the handle it
+        // opens and for `GetFinalPathNameByHandleW`, either of which blocks
+        // while a network path answers.
+        let final_path = {
+            let _blocked = crate::module::thread::before_external_block();
+            host_nt::getfinalpathname(&path)
+        };
+        match final_path {
             Ok(result) => Ok(wrap_path(&result, as_bytes)),
             Err(error) => Err(io_err_with_filename(&error, resolved.w_path())),
         }
@@ -917,9 +927,15 @@ mod win_nt {
     /// (`ntpath.py:648-655`). Only the leaf is returned; the caller splits the
     /// parent off itself.
     pub fn _findfirstfile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let (path, as_bytes, resolved) = arg_path(args, "_findfirstfile")?;
+        let (path, _as_bytes, resolved) = arg_path(args, "_findfirstfile")?;
         match host_nt::find_first_file_name(&path) {
-            Ok(name) => Ok(wrap_path(&name, as_bytes)),
+            // The one name here that is answered as `str` whatever the
+            // argument was: `os__findfirstfile_impl` reports `cFileName`
+            // through `PyUnicode_FromWideChar` and asks no codec for a
+            // `bytes` spelling of it.
+            Ok(name) => Ok(pyre_object::w_str_from_wtf8(
+                crate::gateway::fsdecode_os_str_wtf8(&name),
+            )),
             Err(error) => Err(io_err_with_filename(&error, resolved.w_path())),
         }
     }
@@ -954,7 +970,13 @@ mod win_nt {
     /// (ERROR_DIRECTORY).
     pub fn _getdiskusage(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let (path, _, resolved) = arg_path(args, "_getdiskusage")?;
-        match host_nt::getdiskusage(&path) {
+        // `os__getdiskusage_impl` leaves the interpreter for
+        // `GetDiskFreeSpaceExW`, which reaches the volume itself.
+        let usage = {
+            let _blocked = crate::module::thread::before_external_block();
+            host_nt::getdiskusage(&path)
+        };
+        match usage {
             Ok((total, free)) => Ok(pyre_object::w_tuple_new(vec![
                 pyre_object::w_int_new(total as i64),
                 pyre_object::w_int_new(free as i64),
@@ -2305,7 +2327,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     /// `b"bad_\xff"` still names the file on disk instead of carrying U+FFFD.
     fn fs_name_obj(bytes_mode: bool, name: &[u8]) -> PyObjectRef {
         if bytes_mode {
-            pyre_object::bytesobject::w_bytes_from_bytes(name)
+            pyre_object::bytesobject::w_bytes_from_bytes(&crate::gateway::fs_result_bytes(name))
         } else {
             crate::gateway::fsdecode_filename_bytes(name)
         }
@@ -5672,7 +5694,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     {
                         if let Ok(cwd) = host_os::current_dir() {
                             return Ok(pyre_object::w_bytes_from_bytes(
-                                cwd.as_os_str().as_encoded_bytes(),
+                                &crate::gateway::fs_result_bytes(
+                                    cwd.as_os_str().as_encoded_bytes(),
+                                ),
                             ));
                         }
                     }
@@ -10271,7 +10295,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         return Err(crate::PyError::type_error("dup() requires 1 argument"));
                     }
                     let fd = crate::baseobjspace::c_int_w(args[0])?;
-                    match host_nt::dup(fd) {
+                    // `_Py_dup` leaves the interpreter for the duplication.
+                    let duplicated = {
+                        let _blocked = crate::module::thread::before_external_block();
+                        host_nt::dup(fd)
+                    };
+                    match duplicated {
                         Ok(n) => Ok(pyre_object::w_int_new(n as i64)),
                         Err(e) => Err(errno_err(crt_errno_of(&e), "")),
                     }
@@ -10295,7 +10324,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 Some(w) => crate::baseobjspace::is_true(w)?,
                 None => true,
             };
-            match host_nt::dup2(fd, fd2, inheritable) {
+            // `_Py_dup2`, like `_Py_dup`, runs outside the interpreter.
+            let duplicated = {
+                let _blocked = crate::module::thread::before_external_block();
+                host_nt::dup2(fd, fd2, inheritable)
+            };
+            match duplicated {
                 Ok(n) => Ok(pyre_object::w_int_new(n as i64)),
                 Err(e) => Err(errno_err(crt_errno_of(&e), "")),
             }
@@ -10451,10 +10485,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 {
                     return Err(argument_unavailable("access", "follow_symlinks"));
                 }
-                Ok(pyre_object::w_bool_from(host_nt::access(
-                    path_from_bytes(&path.as_bytes).as_ref(),
-                    mode,
-                )))
+                // `os_access_impl` leaves the interpreter for
+                // `GetFileAttributesW`, which blocks on a network path.
+                let allowed = {
+                    let _blocked = crate::module::thread::before_external_block();
+                    host_nt::access(path_from_bytes(&path.as_bytes).as_ref(), mode)
+                };
+                Ok(pyre_object::w_bool_from(allowed))
             }),
         );
 
@@ -10653,7 +10690,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // modifier applies to it and it dispatches straight to
                 // `os.fchmod` (`interp_posix.py`).
                 if path.as_fd != -1 {
-                    return match host_nt::fchmod(path.as_fd, mode, S_IWRITE) {
+                    let changed = {
+                        let _blocked = crate::module::thread::before_external_block();
+                        host_nt::fchmod(path.as_fd, mode, S_IWRITE)
+                    };
+                    return match changed {
                         Ok(()) => Ok(pyre_object::w_none()),
                         Err(e) => Err(handle_err(&e)),
                     };
@@ -10663,13 +10704,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     None => true,
                 };
                 let wide = wide_path(&path.as_bytes)?;
-                let result = if follow_symlinks {
-                    host_nt::chmod_follow(&wide, mode, S_IWRITE)
-                } else {
-                    // `SetFileAttributesW` on the name itself, which is what
-                    // "modify the link rather than its target" means where the
-                    // mode is one attribute bit.
-                    host_nt::win32_lchmod(&wide, mode, S_IWRITE)
+                // `os_chmod_impl` holds one `Py_BEGIN_ALLOW_THREADS` region
+                // around the whole attribute read-modify-write, whichever of
+                // the three forms the path selected.
+                let result = {
+                    let _blocked = crate::module::thread::before_external_block();
+                    if follow_symlinks {
+                        host_nt::chmod_follow(&wide, mode, S_IWRITE)
+                    } else {
+                        // `SetFileAttributesW` on the name itself, which is
+                        // what "modify the link rather than its target" means
+                        // where the mode is one attribute bit.
+                        host_nt::win32_lchmod(&wide, mode, S_IWRITE)
+                    }
                 };
                 result.map_err(|e| fs_err_with_filename(e, path.w_path()))?;
                 Ok(pyre_object::w_none())
@@ -10692,8 +10739,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     )?;
                     let mode = crate::baseobjspace::c_int_w(args[1])? as u32;
                     let wide = wide_path(&path.as_bytes)?;
-                    host_nt::win32_lchmod(&wide, mode, S_IWRITE)
-                        .map_err(|error| fs_err_with_filename(error, path.w_path()))?;
+                    // `os_lchmod_impl` runs the same call outside the
+                    // interpreter that `os_chmod_impl` does.
+                    let changed = {
+                        let _blocked = crate::module::thread::before_external_block();
+                        host_nt::win32_lchmod(&wide, mode, S_IWRITE)
+                    };
+                    changed.map_err(|error| fs_err_with_filename(error, path.w_path()))?;
                     Ok(pyre_object::w_none())
                 },
                 2,
@@ -10713,8 +10765,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let fd = crate::baseobjspace::c_int_w(args[0])?;
                     let mode = crate::baseobjspace::c_int_w(args[1])? as u32;
                     // Every failure here is the handle call's, reported the
-                    // Win32 way (`os_fchmod_impl`).
-                    match host_nt::fchmod(fd, mode, S_IWRITE) {
+                    // Win32 way (`os_fchmod_impl`), which also leaves the
+                    // interpreter for it.
+                    let changed = {
+                        let _blocked = crate::module::thread::before_external_block();
+                        host_nt::fchmod(fd, mode, S_IWRITE)
+                    };
+                    match changed {
                         Ok(()) => Ok(pyre_object::w_none()),
                         Err(e) => Err(handle_err(&e)),
                     }
@@ -11060,7 +11117,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     }
                     let pid = crate::baseobjspace::int_w(args[0])? as isize;
                     let options = crate::baseobjspace::c_int_w(args[1])?;
-                    match host_nt::cwait(pid, options) {
+                    // `os_waitpid_impl` waits outside the interpreter, which is
+                    // what lets another thread run while a child is still up.
+                    let waited = {
+                        let _blocked = crate::module::thread::before_external_block();
+                        host_nt::cwait(pid, options)
+                    };
+                    match waited {
                         Ok((pid, status)) => Ok(pyre_object::w_tuple_new(vec![
                             pyre_object::w_int_new(pid as i64),
                             pyre_object::w_int_new((status as i64) << 8),
@@ -11123,7 +11186,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "listdrives",
             crate::make_builtin_function_with_arity(
                 "listdrives",
-                |_| name_list(host_nt::listdrives()),
+                // `os_listdrives_impl` leaves the interpreter for
+                // `GetLogicalDriveStringsW`, as the two volume calls below do
+                // for theirs.
+                |_| {
+                    name_list({
+                        let _blocked = crate::module::thread::before_external_block();
+                        host_nt::listdrives()
+                    })
+                },
                 0,
             ),
         );
@@ -11132,7 +11203,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "listvolumes",
             crate::make_builtin_function_with_arity(
                 "listvolumes",
-                |_| name_list(host_nt::listvolumes()),
+                |_| {
+                    name_list({
+                        let _blocked = crate::module::thread::before_external_block();
+                        host_nt::listvolumes()
+                    })
+                },
                 0,
             ),
         );
@@ -11151,7 +11227,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         ));
                     }
                     let volume = crate::gateway::fsencode_path_w(args[0])?;
-                    name_list(host_nt::listmounts(&wide_path(&volume.as_bytes)?))
+                    let wide = wide_path(&volume.as_bytes)?;
+                    name_list({
+                        let _blocked = crate::module::thread::before_external_block();
+                        host_nt::listmounts(&wide)
+                    })
                 },
                 1,
             ),
