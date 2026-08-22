@@ -743,7 +743,7 @@ fn field_descr_from_group(group: &dyn FieldDescrGroup, index: usize) -> DescrRef
 /// alias for the future analyzer use-import resolver (B-5 follow-up):
 /// when that lands, analyzer's `owner_root` switches to qualified
 /// form and the SAME `Arc<PyreSizeDescr>` is reachable via the
-/// qualified hash. `register_keyed_size` keeps one `_cache_size_order`
+/// qualified hash. `register_keyed_size` keeps one `_cache_size`
 /// entry per logical SizeDescr while allowing fuller-layout upgrades.
 ///
 /// `def_path` empty (or equal to `simple_name`) → single publish.
@@ -879,7 +879,7 @@ fn build_object_descr_group_with_extra_gc_edges(
     // analyzer use-import resolver (B-5 follow-up): when that lands,
     // analyzer's `owner_root` switches to qualified form and the
     // SAME `Arc<PyreSizeDescr>` is reachable via the qualified
-    // hash. `register_keyed_size` keeps one `_cache_size_order` entry
+    // hash. `register_keyed_size` keeps one `_cache_size` entry
     // per logical SizeDescr while allowing fuller-layout upgrades.
     if !simple_name.is_empty() {
         let key = majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash(simple_name));
@@ -5660,7 +5660,7 @@ mod tests {
             is_immutable: true,
             is_quasi_immutable: false,
             index_in_parent: Some(1),
-            parent: Some(parent),
+            parent: Some(std::sync::Arc::new(parent)),
             name: "value".into(),
             owner: "Cell".into(),
         });
@@ -5718,7 +5718,7 @@ mod tests {
             is_immutable: capacity.is_immutable,
             is_quasi_immutable: capacity.is_quasi_immutable,
             index_in_parent: Some(capacity.index_in_parent),
-            parent: Some(parent),
+            parent: Some(std::sync::Arc::new(parent)),
             name: "capacity".into(),
             owner: "ItemsBlock".into(),
         });
@@ -6215,6 +6215,12 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     }),
     ("function::Method", || {
         LazyLock::force(&W_METHOD_DESCR_GROUP);
+    }),
+    ("function::StaticMethod", || {
+        LazyLock::force(&W_STATICMETHOD_DESCR_GROUP);
+    }),
+    ("function::ClassMethod", || {
+        LazyLock::force(&W_CLASSMETHOD_DESCR_GROUP);
     }),
     ("dictmultiobject::W_DictObject", || {
         LazyLock::force(&W_DICT_DESCR_GROUP);
@@ -7019,7 +7025,11 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                 is_class_word: None,
             };
             // The claim itself goes beside the spec, unflattened.
-            field_descr_from_bh_field(&field, parent.as_ref(), *index_in_parent)
+            field_descr_from_bh_field(
+                &field,
+                parent.as_ref().map(std::sync::Arc::as_ref),
+                *index_in_parent,
+            )
         }
         BhDescr::Array {
             base_size,
@@ -7349,13 +7359,12 @@ enum SetMemberLookup {
     /// (`descr_set_absent` on the `[jit-stats]` line) — pyre's form of the bare
     /// `assert`s upstream states this class of condition with.
     ///
-    /// Two publishes are what hold it at zero, both inside the `Once` in
-    /// `jitcode_runtime::rehydrate_build_descr_raw_sets` and both ahead of the
-    /// first lookup: `publish_runtime_descr_groups` for the module-scope
-    /// groups (`W_IntObject.intval` was landing here until it did), and
-    /// `publish_effect_info_descr_mints` for the slots no opcode names, which
-    /// `descrs.bin` — upstream's `opcode_descrs`, not its `all_descrs` — does
-    /// not carry.
+    /// Two exact-key publishes hold it at zero inside the `Once` in
+    /// `jitcode_runtime::rehydrate_build_descr_raw_sets`: `make_descr_from_bh`
+    /// forces the matching module-scope group before each opcode layout, and
+    /// `publish_effect_info_descr_mints` does the same for slots only a raw set
+    /// names. `descrs.bin` — upstream's `opcode_descrs`, not its `all_descrs`
+    /// — does not carry the latter.
     ///
     /// The arm stays because the answer is still reachable in principle, and a
     /// dropped member is a real hazard when it is: "absent" is evaluated once,
@@ -7405,55 +7414,6 @@ enum SetMemberLookup {
 /// to mint, so deleting a call site greens it without joining anything,
 /// whereas the members here are fixed by `descrs.bin` and stay `Ambiguous`
 /// until the two spellings actually collapse onto one key.
-/// Force every module-scope runtime descr group into the gccache.
-///
-/// `descr.py setup_descrs` publishes the whole descr universe before
-/// anything consumes it, and upstream gets that for free: `cpu.*descrof` runs
-/// during codewriting, so by the time `compute_bitstrings`
-/// (`effectinfo.py:484-489`) walks the raw sets, every `STRUCT` the program
-/// mentions already has its slot.  Pyre splits those two phases across a
-/// build-time analyzer and a runtime process, and the runtime groups are
-/// `LazyLock`s that publish only when a trace first touches the type — so the
-/// raw-set members were being resolved against a universe that was still
-/// mostly empty, and answered [`SetMemberLookup::AbsentContainer`] for
-/// containers this process does register, just later.
-///
-/// Publishing here restores the upstream order.  It must run *before* the
-/// build-time `make_descr_from_bh` loop: those specs carry `vtable: 0` and the
-/// inherited header fields, so on a shared key they would otherwise displace
-/// the runtime publish that owns the only copy of the vtable (see the
-/// authority rule in `majit-ir` `register_keyed_size`).
-pub(crate) fn publish_runtime_descr_groups() {
-    // `PyreObjectDescrGroup`'s constructor is what registers into the
-    // gccache, so dereferencing the `LazyLock` is the publish.
-    let _published = [
-        &*W_INT_DESCR_GROUP,
-        &*W_FLOAT_DESCR_GROUP,
-        &*W_LONG_DESCR_GROUP,
-        &*W_BOOL_DESCR_GROUP,
-        &*W_UNICODE_DESCR_GROUP,
-        &*RANGE_ITER_DESCR_GROUP,
-        &*SEQ_ITER_DESCR_GROUP,
-        &*TUPLE_ITER_DESCR_GROUP,
-        &*W_ZIP_DESCR_GROUP,
-        &*RANGE_DESCR_GROUP,
-        &*W_METHOD_DESCR_GROUP,
-        &*W_STATICMETHOD_DESCR_GROUP,
-        &*W_CLASSMETHOD_DESCR_GROUP,
-        &*W_OBJECT_MUTABLE_CELL_DESCR_GROUP,
-        &*W_LIST_DESCR_GROUP,
-        &*W_TUPLE_DESCR_GROUP,
-        &*SPECIALISED_TUPLE_II_DESCR_GROUP,
-        &*SPECIALISED_TUPLE_FF_DESCR_GROUP,
-        &*SPECIALISED_TUPLE_OO_DESCR_GROUP,
-        &*ITEMS_BLOCK_DESCR_GROUP,
-        &*W_SLICE_DESCR_GROUP,
-        &*PYFRAME_DESCR_GROUP,
-        &*W_OBJECT_OBJECT_DESCR_GROUP,
-        &*PYTRACEBACK_DESCR_GROUP,
-    ];
-}
-
 /// Fill the gccache slots that only an `EffectInfo` raw set names, from the
 /// mint arguments the analyzer recorded at its own `get_*_descr` call.
 ///
@@ -7574,6 +7534,15 @@ fn mint_field(
     else {
         return None;
     };
+    // PyPy's single GcCache sees the runtime declaration at the same
+    // `cpu.fielddescrof` request that creates this slot. At pyre's AOT
+    // boundary, restore that order for this exact STRUCT only: its declaration
+    // carries the vtable and immutable-field ranks that the analyzer mint
+    // cannot reconstruct. This is deliberately per-key, matching
+    // `descr.py:get_field_descr`, rather than forcing unrelated LazyLocks.
+    if let majit_ir::descr::LLType::Struct(cache_key) = &struct_key {
+        force_declared_group(*cache_key);
+    }
     let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
     // Only an empty slot is this function's business: an unresolvable member is
     // by definition one nothing has filled, and a filled slot already belongs
@@ -7780,6 +7749,26 @@ fn descr_from_set_member(m: &majit_ir::effectinfo::DescrSetMember) -> SetMemberL
                 }
                 None => SetMemberLookup::Ambiguous,
             }
+        }
+    }
+}
+
+/// Replay `EffectInfo.compute_bitstrings`'s `descr.ei_index = ...` mutation
+/// for a member whose descriptor was already published through
+/// `Assembler.descrs`. The caller deliberately carries no mint spec: reaching
+/// a cache miss here means the build-time opcode/member join was wrong, and
+/// minting a replacement would hide an identity split PyPy cannot represent.
+pub(crate) fn stamp_effect_info_descr(
+    member: &majit_ir::effectinfo::DescrSetMember,
+    ei_index: u32,
+) {
+    match descr_from_set_member(member) {
+        SetMemberLookup::Resolved(descr) => descr.set_ei_index(ei_index),
+        SetMemberLookup::AbsentContainer => {
+            panic!("opcode-published EffectInfo member has no runtime container: {member:?}")
+        }
+        SetMemberLookup::Ambiguous => {
+            panic!("opcode-published EffectInfo member is ambiguous at runtime: {member:?}")
         }
     }
 }

@@ -577,15 +577,21 @@ pub fn insns_byte_to_opname() -> &'static HashMap<u8, String> {
 /// sub-JitCodes, and switch dicts.
 struct DescrIndex {
     offsets: Box<[u32]>,
-    /// `0` for structural/dispatch descriptors, `1` for Call/JitCode.
-    /// Mirrors the two groups consumed by `rehydrate_build_descr_raw_sets`.
+    /// `0` for descriptors owned by `GcCache`, `1` for Call/JitCode, and
+    /// `2` for opcode-only descriptors such as `SwitchDictDescr`.
+    /// Mirrors the groups consumed by `rehydrate_build_descr_raw_sets`.
     kinds: Box<[u8]>,
+    /// Dense reference into `descr_layouts.bin`, or `u32::MAX` for a
+    /// descriptor without a parent.  This is the frozen-image spelling of
+    /// PyPy's `FieldDescr.parent_descr` reference to the one SizeDescr owned
+    /// by `GcCache`; it is not a runtime semantic side table.
+    parent_layouts: Box<[u32]>,
 }
 
 fn load_descr_index() -> DescrIndex {
     const INDEX_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descrs_index.bin"));
     const BODY_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descrs.bin"));
-    let (offsets, kinds): (Vec<u32>, Vec<u8>) =
+    let (offsets, kinds, parent_layouts): (Vec<u32>, Vec<u8>, Vec<u32>) =
         bincode::deserialize(INDEX_BYTES).unwrap_or_else(|e| {
             panic!(
                 "pyre-jit-trace: failed to deserialize descrs_index.bin \
@@ -598,10 +604,12 @@ fn load_descr_index() -> DescrIndex {
     assert_eq!(offsets.last().copied(), Some(BODY_BYTES.len() as u32));
     assert!(offsets.windows(2).all(|pair| pair[0] <= pair[1]));
     assert_eq!(kinds.len() + 1, offsets.len());
-    assert!(kinds.iter().all(|kind| matches!(kind, 0 | 1)));
+    assert_eq!(parent_layouts.len(), kinds.len());
+    assert!(kinds.iter().all(|kind| matches!(kind, 0 | 1 | 2)));
     DescrIndex {
         offsets: offsets.into_boxed_slice(),
         kinds: kinds.into_boxed_slice(),
+        parent_layouts: parent_layouts.into_boxed_slice(),
     }
 }
 
@@ -614,18 +622,71 @@ fn descr_count() -> usize {
     descrs_index().kinds.len()
 }
 
+fn descr_layout_offsets() -> &'static [u32] {
+    static OFFSETS: OnceLock<Box<[u32]>> = OnceLock::new();
+    OFFSETS.get_or_init(|| {
+        const INDEX_BYTES: &[u8] =
+            include_bytes!(concat!(env!("OUT_DIR"), "/descr_layouts_index.bin"));
+        const BODY_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descr_layouts.bin"));
+        let offsets: Vec<u32> = bincode::deserialize(INDEX_BYTES).unwrap_or_else(|e| {
+            panic!(
+                "pyre-jit-trace: failed to deserialize descr_layouts_index.bin \
+                 ({} bytes): {e}",
+                INDEX_BYTES.len(),
+            )
+        });
+        assert!(!offsets.is_empty());
+        assert_eq!(offsets.first().copied(), Some(0));
+        assert_eq!(offsets.last().copied(), Some(BODY_BYTES.len() as u32));
+        assert!(offsets.windows(2).all(|pair| pair[0] <= pair[1]));
+        offsets.into_boxed_slice()
+    })
+}
+
+fn descr_layout_at(index: usize) -> std::sync::Arc<majit_translate::jitcode::BhSizeSpec> {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descr_layouts.bin"));
+    let offsets = descr_layout_offsets();
+    let start = offsets[index] as usize;
+    let end = offsets[index + 1] as usize;
+    // PyPy retains the canonical `SizeDescr` in `GcCache._cache_size`, not
+    // the codewriter-to-runtime transport object that described it. Keep a
+    // layout only when the lazy opcode `BhDescr::Field` itself keeps the Arc;
+    // the eager GcCache replay drops this wire value after publication.
+    std::sync::Arc::new(
+        bincode::deserialize(&BYTES[start..end]).unwrap_or_else(|e| {
+            panic!(
+                "pyre-jit-trace: failed to deserialize descr_layouts.bin entry \
+             {index} ({start}..{end} of {} bytes): {e}",
+                BYTES.len(),
+            )
+        }),
+    )
+}
+
 fn load_descr_uncached(index: usize) -> BhDescr {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descrs.bin"));
     let offsets = &descrs_index().offsets;
     let start = offsets[index] as usize;
     let end = offsets[index + 1] as usize;
-    bincode::deserialize(&BYTES[start..end]).unwrap_or_else(|e| {
+    let mut descr: BhDescr = bincode::deserialize(&BYTES[start..end]).unwrap_or_else(|e| {
         panic!(
             "pyre-jit-trace: failed to deserialize descrs.bin entry {index} \
              ({start}..{end} of {} bytes): {e}",
             BYTES.len(),
         )
-    })
+    });
+    let parent_layout = descrs_index().parent_layouts[index];
+    if parent_layout != u32::MAX {
+        let BhDescr::Field { parent, .. } = &mut descr else {
+            panic!("descriptor slot {index} carries a parent layout but is not a Field");
+        };
+        assert!(
+            parent.is_none(),
+            "wire Field unexpectedly embeds its parent layout"
+        );
+        *parent = Some(descr_layout_at(parent_layout as usize));
+    }
+    descr
 }
 
 fn descr_cells() -> &'static [OnceLock<&'static BhDescr>] {
@@ -775,6 +836,45 @@ fn load_ei_descr_mint(index: usize) -> majit_ir::effectinfo::DescrMintEntry {
     })
 }
 
+fn ei_descr_stamp_offsets() -> &'static [u32] {
+    static OFFSETS: OnceLock<Box<[u32]>> = OnceLock::new();
+    OFFSETS.get_or_init(|| {
+        const INDEX_BYTES: &[u8] =
+            include_bytes!(concat!(env!("OUT_DIR"), "/ei_descr_stamps_index.bin"));
+        const BODY_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ei_descr_stamps.bin"));
+        let offsets: Vec<u32> = bincode::deserialize(INDEX_BYTES).unwrap_or_else(|e| {
+            panic!(
+                "pyre-jit-trace: failed to deserialize ei_descr_stamps_index.bin \
+                 ({} bytes): {e}",
+                INDEX_BYTES.len(),
+            )
+        });
+        assert!(!offsets.is_empty());
+        assert_eq!(offsets.first().copied(), Some(0));
+        assert_eq!(offsets.last().copied(), Some(BODY_BYTES.len() as u32));
+        assert!(offsets.windows(2).all(|pair| pair[0] <= pair[1]));
+        offsets.into_boxed_slice()
+    })
+}
+
+fn ei_descr_stamp_count() -> usize {
+    ei_descr_stamp_offsets().len() - 1
+}
+
+fn load_ei_descr_stamp(index: usize) -> (majit_ir::effectinfo::DescrSetMember, u32) {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ei_descr_stamps.bin"));
+    let offsets = ei_descr_stamp_offsets();
+    let start = offsets[index] as usize;
+    let end = offsets[index + 1] as usize;
+    bincode::deserialize(&BYTES[start..end]).unwrap_or_else(|e| {
+        panic!(
+            "pyre-jit-trace: failed to deserialize ei_descr_stamps.bin entry {index} \
+             ({start}..{end} of {} bytes): {e}",
+            BYTES.len(),
+        )
+    })
+}
+
 /// Analyzer-side release census captured at the end of the build-script
 /// translation. The live process adds its own counters before formatting the
 /// existing field-position stats line.
@@ -860,16 +960,55 @@ fn rehydrated_call_descr_ref(bh: majit_translate::jitcode::BhCallDescr) -> majit
 /// `finish_setup_descrs`. `finish_setup_done` is per-thread, but the
 /// rehydrated raw sets live in the process-global `GcCache`, so this guard is
 /// process-global.
+///
+/// # Why this stays eager, and what is actually known about its cost
+///
+/// It is the obvious candidate for "make the first JIT stop rebuilding the
+/// whole descriptor universe", and it decodes a lot: 2,364 non-call slots,
+/// 6,884 mint specs, 185 EffectInfos and 2,534 call slots — 11,967 bincode
+/// decodes off 2.6 MB of embedded records.  Two things to know before taking
+/// that on.
+///
+/// **It is a first-JIT cost, not a startup one.**  This function is reachable
+/// only through `ensure_finish_setup`, and every caller of that sits on a JIT
+/// path — [`crate::state::intern_liveness`],
+/// [`crate::state::liveness_info_snapshot`], [`crate::state::op_live`],
+/// [`crate::state::blackhole_control_opcodes`],
+/// [`crate::state::setup_indirectcalltargets`],
+/// [`crate::state::bytecode_for_address`].  An interpreter that never traces
+/// never runs it.  (Descriptor *minting* does happen at startup, which is easy
+/// to mistake for this pass when reading an allocation census.)
+///
+/// **Its size is not currently measured, and two obvious instruments cannot
+/// measure it.**  Allocation here is mmap-backed, so `malloc_history` / `heap`
+/// attribution does not see the object heap at all; and subtracting two peak
+/// RSS readings does not isolate it either, because the JIT changes what the
+/// workload itself allocates.  Measured on darwin arm64 against a 63.9 MB
+/// never-traced baseline, a 200,000-iteration integer loop grows peak RSS by
+/// 5.8 MB with the JIT on and 23.8 MB with `PYRE_JIT=off` — the JIT arm nets
+/// activation against the boxing the interpreter avoided.  Sizing this needs
+/// an instrument that attributes the arena.
+///
+/// What settles the question is soundness rather than size, and the dense-index
+/// halves of the lazy plan already ship: `descrs_index.bin` /
+/// `ei_descr_mints_index.bin` / `effect_infos_index.bin` give per-index
+/// locatability, [`descr_cells`] / [`descr_ref_cells`] are the `OnceLock`
+/// arrays, and `descr::force_declared_group` is the exact-key, on-demand
+/// container-group publish.
+///
+/// What is left eager here is eager because it must be.
+/// `descr::descr_from_set_member` is lookup-only by construction, and
+/// `descr::prepare_frozen_effect_info` resolves each EffectInfo's six raw sets
+/// exactly once and degrades the whole EffectInfo to `RandomEffects` when any
+/// member is unresolvable — a container published afterwards cannot repair it.
+/// Deferring pass 2 or pass 3 therefore buys an unmeasured amount of memory
+/// against a silent optimizer downgrade that surfaces only as
+/// `descr_set_absent` rising off zero.
 pub fn rehydrate_build_descr_raw_sets() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        // The runtime's own groups first: `descr_from_set_member` is
-        // lookup-only, so a container that has not been published yet reads
-        // as `AbsentContainer` and its member is dropped from the raw set for
-        // the life of the process.
-        crate::descr::publish_runtime_descr_groups();
-        // `descr.py setup_descrs` group order — every non-call slot
-        // first.  Each `Size` / `Field` entry publishes its parent's FULL
+        // `descr.py::GcCache.setup_descrs` group order — every non-call slot
+        // first. Each `Size` / `Field` entry publishes its parent's FULL
         // `heaptracker.all_fielddescrs(STRUCT)` list into the gccache, and
         // `descr_from_set_member` is lookup-only, so the raw-set members
         // below can only land on slots that already carry their complete
@@ -886,6 +1025,14 @@ pub fn rehydrate_build_descr_raw_sets() {
                 BhDescr::Call { .. } | BhDescr::JitCode { .. }
             ));
             crate::descr::make_descr_from_bh(&bh);
+        }
+        // Members already published by the opcode-descr pass need only the
+        // `compute_bitstrings` partition stamp. PyPy mutates that one cached
+        // descriptor object in place; replaying the complete mint spec would
+        // re-run a cache-miss recipe against a slot that is already full.
+        for i in 0..ei_descr_stamp_count() {
+            let (member, ei_index) = load_ei_descr_stamp(i);
+            crate::descr::stamp_effect_info_descr(&member, ei_index);
         }
         // Last, and only into what is still empty: the slots no opcode names,
         // which `descrs.bin` — RPython's `opcode_descrs`, not its `all_descrs`
@@ -2095,12 +2242,66 @@ mod tests {
         let index = descrs_index();
         assert_eq!(index.kinds.len(), descr_count());
         for (i, kind) in index.kinds.iter().copied().enumerate() {
-            let call_like = matches!(
-                load_descr_uncached(i),
-                BhDescr::Call { .. } | BhDescr::JitCode { .. }
-            );
-            assert_eq!(kind, u8::from(call_like), "descriptor index {i}");
+            let expected = match load_descr_uncached(i) {
+                BhDescr::Call { .. } | BhDescr::JitCode { .. } => 1,
+                BhDescr::Field { .. }
+                | BhDescr::Array { .. }
+                | BhDescr::InteriorField { .. }
+                | BhDescr::Size { .. } => 0,
+                BhDescr::Switch { .. }
+                | BhDescr::VableField { .. }
+                | BhDescr::VableArray { .. }
+                | BhDescr::VtableMethod { .. } => 2,
+            };
+            assert_eq!(kind, expected, "descriptor index {i}");
         }
+    }
+
+    #[test]
+    fn frozen_field_parents_decode_the_canonical_layout_value() {
+        let index = descrs_index();
+        let layout_count = descr_layout_offsets().len() - 1;
+        assert_eq!(index.parent_layouts.len(), descr_count());
+
+        let mut first_parent_by_layout: std::collections::BTreeMap<
+            u32,
+            std::sync::Arc<majit_translate::jitcode::BhSizeSpec>,
+        > = std::collections::BTreeMap::new();
+        let mut parent_references = 0usize;
+        for (slot, &layout_index) in index.parent_layouts.iter().enumerate() {
+            let descr = load_descr_uncached(slot);
+            if layout_index == u32::MAX {
+                if let BhDescr::Field { parent, .. } = descr {
+                    assert!(parent.is_none(), "parentless Field slot {slot}");
+                }
+                continue;
+            }
+
+            assert!((layout_index as usize) < layout_count);
+            let BhDescr::Field {
+                parent: Some(parent),
+                ..
+            } = descr
+            else {
+                panic!("layout-bearing descriptor slot {slot} is not a parented Field");
+            };
+            parent_references += 1;
+            if let Some(first) = first_parent_by_layout.get(&layout_index) {
+                assert_eq!(
+                    first.as_ref(),
+                    parent.as_ref(),
+                    "layout {layout_index} decoded to different transport values"
+                );
+            } else {
+                first_parent_by_layout.insert(layout_index, parent);
+            }
+        }
+
+        assert_eq!(first_parent_by_layout.len(), layout_count);
+        assert!(
+            parent_references > layout_count,
+            "fixture must exercise shared parent layouts"
+        );
     }
 
     #[test]
@@ -2108,8 +2309,24 @@ mod tests {
         let offsets = ei_descr_mint_offsets();
         assert_eq!(offsets.len(), ei_descr_mint_count() + 1);
         for i in 0..ei_descr_mint_count() {
-            let _entry = load_ei_descr_mint(i);
+            let entry = load_ei_descr_mint(i);
+            assert_ne!(
+                entry.ei_index,
+                u32::MAX,
+                "mint entry {i} is absent from every frozen raw set"
+            );
             assert!(offsets[i] < offsets[i + 1], "mint entry {i} is empty");
+        }
+    }
+
+    #[test]
+    fn effect_info_stamp_index_bounds_each_serialized_entry() {
+        let offsets = ei_descr_stamp_offsets();
+        assert_eq!(offsets.len(), ei_descr_stamp_count() + 1);
+        for i in 0..ei_descr_stamp_count() {
+            let (_member, ei_index) = load_ei_descr_stamp(i);
+            assert_ne!(ei_index, u32::MAX, "stamp entry {i} has no partition");
+            assert!(offsets[i] < offsets[i + 1], "stamp entry {i} is empty");
         }
     }
 
@@ -2286,6 +2503,171 @@ mod tests {
                 distinct_layouts.len(),
             );
         }
+    }
+
+    #[test]
+    #[ignore = "measurement; run alone with --exact --nocapture"]
+    fn descr_rehydrate_phase_rss_decomposition() {
+        fn rss_kb() -> i64 {
+            let out = std::process::Command::new("ps")
+                .args(["-o", "rss=", "-p"])
+                .arg(std::process::id().to_string())
+                .output()
+                .expect("ps");
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse()
+                .unwrap_or(-1)
+        }
+
+        let _ = rss_kb();
+        let _: Vec<u32> = bincode::deserialize(&[0_u8; 8]).unwrap();
+        let base = rss_kb();
+        let heap_base = crate::allocation_counter::live_bytes();
+        let index = descrs_index();
+        let after_index = rss_kb();
+        let heap_after_index = crate::allocation_counter::live_bytes();
+
+        let layout_count = descr_layout_offsets().len() - 1;
+        for i in 0..layout_count {
+            drop(descr_layout_at(i));
+        }
+        let after_layouts = rss_kb();
+        let heap_after_layouts = crate::allocation_counter::live_bytes();
+
+        for (i, kind) in index.kinds.iter().copied().enumerate() {
+            if kind == 0 {
+                let bh = load_descr_uncached(i);
+                crate::descr::make_descr_from_bh(&bh);
+            }
+        }
+        let after_noncall = rss_kb();
+        let heap_after_noncall = crate::allocation_counter::live_bytes();
+        let (category_counts, cache_lens, cache_caps, field_inner_cap, field_key_bytes) = {
+            let gc = majit_ir::descr::gc_cache().lock().unwrap();
+            (
+                gc.category_counts(),
+                (
+                    gc._cache_size.len(),
+                    gc._cache_field
+                        .values()
+                        .map(|inner| inner.len())
+                        .sum::<usize>(),
+                    gc._cache_array.len(),
+                    gc._cache_arraylen.len(),
+                    gc._cache_call.len(),
+                    gc._cache_interiorfield.len(),
+                ),
+                (
+                    gc._cache_size.capacity(),
+                    gc._cache_field.capacity(),
+                    gc._cache_array.capacity(),
+                    gc._cache_arraylen.capacity(),
+                    gc._cache_call.capacity(),
+                    gc._cache_interiorfield.capacity(),
+                ),
+                gc._cache_field
+                    .values()
+                    .map(|inner| inner.capacity())
+                    .sum::<usize>(),
+                gc._cache_field
+                    .values()
+                    .flat_map(|inner| inner.keys())
+                    .map(String::len)
+                    .sum::<usize>(),
+            )
+        };
+
+        for i in 0..ei_descr_stamp_count() {
+            let (member, ei_index) = load_ei_descr_stamp(i);
+            crate::descr::stamp_effect_info_descr(&member, ei_index);
+        }
+        let after_stamps = rss_kb();
+        let heap_after_stamps = crate::allocation_counter::live_bytes();
+
+        for i in 0..ei_descr_mint_count() {
+            let entry = load_ei_descr_mint(i);
+            crate::descr::publish_effect_info_descr_mints(std::slice::from_ref(&entry));
+        }
+        let after_mints = rss_kb();
+        let heap_after_mints = crate::allocation_counter::live_bytes();
+
+        for i in 0..effect_info_count() {
+            let (translated_id, mut effect_info) = load_effect_info(i);
+            crate::descr::prepare_frozen_effect_info(&mut effect_info);
+            majit_ir::effectinfo::intern_translated_effect_info(translated_id, effect_info);
+        }
+        let after_effect_infos = rss_kb();
+        let heap_after_effect_infos = crate::allocation_counter::live_bytes();
+        let frozen_effect_info_count = effect_info_count();
+
+        for (i, kind) in index.kinds.iter().copied().enumerate() {
+            if kind == 1 {
+                let bh = load_descr_uncached(i);
+                let calldescr = match bh {
+                    BhDescr::Call { calldescr } | BhDescr::JitCode { calldescr, .. } => calldescr,
+                    _ => unreachable!(),
+                };
+                rehydrated_call_descr_ref(calldescr);
+            }
+        }
+        let after_calls = rss_kb();
+        let heap_after_calls = crate::allocation_counter::live_bytes();
+
+        eprintln!("[rss-phases] base={base} KB");
+        eprintln!(
+            "[rss-phases] index          rss={} KB heap={} B",
+            after_index - base,
+            heap_after_index - heap_base,
+        );
+        eprintln!(
+            "[rss-phases] wire_layouts   rss={} KB heap={} B",
+            after_layouts - after_index,
+            heap_after_layouts - heap_after_index,
+        );
+        eprintln!(
+            "[rss-phases] noncall_descrs rss={} KB heap={} B",
+            after_noncall - after_layouts,
+            heap_after_noncall - heap_after_layouts,
+        );
+        eprintln!(
+            "[rss-phases] gccache counts={category_counts:?} lens={cache_lens:?} \
+             caps={cache_caps:?} \
+             field_inner_cap={field_inner_cap} field_key_bytes={field_key_bytes} \
+             sizeof(field,size,array)=({},{},{})",
+            std::mem::size_of::<majit_ir::descr::SimpleFieldDescr>(),
+            std::mem::size_of::<majit_ir::descr::SimpleSizeDescr>(),
+            std::mem::size_of::<majit_ir::descr::SimpleArrayDescr>(),
+        );
+        eprintln!(
+            "[rss-phases] compact_stamps rss={} KB heap={} B",
+            after_stamps - after_noncall,
+            heap_after_stamps - heap_after_noncall,
+        );
+        eprintln!(
+            "[rss-phases] raw_set_mints  rss={} KB heap={} B",
+            after_mints - after_stamps,
+            heap_after_mints - heap_after_stamps,
+        );
+        eprintln!(
+            "[rss-phases] effect_infos   rss={} KB heap={} B",
+            after_effect_infos - after_mints,
+            heap_after_effect_infos - heap_after_mints,
+        );
+        eprintln!(
+            "[rss-phases] effect_info_count={frozen_effect_info_count} sizeof(EffectInfo)={} B",
+            std::mem::size_of::<majit_ir::EffectInfo>(),
+        );
+        eprintln!(
+            "[rss-phases] call_descrs    rss={} KB heap={} B",
+            after_calls - after_effect_infos,
+            heap_after_calls - heap_after_effect_infos,
+        );
+        eprintln!(
+            "[rss-phases] TOTAL={} KB heap={} B",
+            after_calls - base,
+            heap_after_calls - heap_base,
+        );
     }
 
     /// The build-time descr pool must name the same bytes `offset_of!` does.

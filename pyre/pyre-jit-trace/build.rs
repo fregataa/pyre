@@ -15,7 +15,7 @@ use walkdir::WalkDir;
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v11";
+const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v16";
 /// Retained cache entries. Each is ~6 MB, and a handful covers the
 /// configurations one checkout switches between (native/wasm × release/dev).
 const CODEGEN_CACHE_MAX_ENTRIES: usize = 8;
@@ -31,10 +31,14 @@ const CODEGEN_OUTPUTS: &[&str] = &[
     "insns.bin",
     "descrs.bin",
     "descrs_index.bin",
+    "descr_layouts.bin",
+    "descr_layouts_index.bin",
     "effect_infos.bin",
     "effect_infos_index.bin",
     "ei_descr_mints.bin",
     "ei_descr_mints_index.bin",
+    "ei_descr_stamps.bin",
+    "ei_descr_stamps_index.bin",
     "field_mint_census.bin",
     "liveness.bin",
     "fnaddr_bindings.bin",
@@ -51,7 +55,7 @@ const CODEGEN_OUTPUTS: &[&str] = &[
 /// captured so `runtime_fnaddr_patch` can re-pair them with the runtime's
 /// addresses (see the comments at their write sites).
 ///
-/// The other four carry the values those tables exist to repair — the
+/// The other five carry the values those tables exist to repair — the
 /// codewriter bakes `pyre_interpreter::jit_trace_fnaddrs()` addresses into
 /// `JitCode.fnaddr` and funcptr/static-data entries of `JitCode.constants_i`,
 /// which `runtime_fnaddr_patch::patch_constants_i_fnaddrs` and
@@ -60,6 +64,7 @@ const CODEGEN_OUTPUTS: &[&str] = &[
 /// (`codewriter/assembler.rs`, `fnaddr: jitcode.fnaddr`),
 /// `indirectcalltargets.bin` through its `(index, jitcode.fnaddr)` pairs, and
 /// `jit_metadata.json` through the same pipeline serialized as JSON.
+/// `descr_layouts.bin` carries the parent `BhSizeSpec.vtable` word.
 ///
 /// Excluded from the cross-process verdict only. Within one process the
 /// addresses are the same, so `DeterminismCheck::InProcess` still judges every
@@ -69,8 +74,9 @@ const CODEGEN_OUTPUTS: &[&str] = &[
 ///
 /// What decides the cross-process verdict after these exclusions:
 /// `jit_trace_gen.rs`, `jitcodes_index.bin`, `jit_drivers.bin`, `insns.bin`,
-/// `descrs_index.bin`, `effect_infos_index.bin`, `ei_descr_mints.bin`,
-/// `ei_descr_mints_index.bin`,
+/// `descrs_index.bin`, `descr_layouts_index.bin`, `effect_infos_index.bin`,
+/// `ei_descr_mints.bin`, `ei_descr_mints_index.bin`, `ei_descr_stamps.bin`,
+/// `ei_descr_stamps_index.bin`,
 /// `liveness.bin`.
 /// `jitcodes_index.bin` is the load-bearing one — it holds each jitcode's name
 /// and its byte boundaries in `jitcodes.bin`, and an address is a fixed-width
@@ -89,6 +95,7 @@ const HOST_ADDRESSED_OUTPUTS: &[&str] = &[
     "jitcodes.bin",
     "indirectcalltargets.bin",
     "descrs.bin",
+    "descr_layouts.bin",
     "effect_infos.bin",
     "fnaddr_bindings.bin",
     "static_pytype_bindings.bin",
@@ -259,7 +266,13 @@ fn emit_llbc_extraction_placeholders() {
     std::fs::write(format!("{out_dir}/descrs.bin"), b"").unwrap();
     std::fs::write(
         format!("{out_dir}/descrs_index.bin"),
-        bincode::serialize(&(vec![0_u32], Vec::<u8>::new())).unwrap(),
+        bincode::serialize(&(vec![0_u32], Vec::<u8>::new(), Vec::<u32>::new())).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(format!("{out_dir}/descr_layouts.bin"), b"").unwrap();
+    std::fs::write(
+        format!("{out_dir}/descr_layouts_index.bin"),
+        bincode::serialize(&vec![0_u32]).unwrap(),
     )
     .unwrap();
     std::fs::write(format!("{out_dir}/effect_infos.bin"), b"").unwrap();
@@ -271,6 +284,12 @@ fn emit_llbc_extraction_placeholders() {
     std::fs::write(format!("{out_dir}/ei_descr_mints.bin"), b"").unwrap();
     std::fs::write(
         format!("{out_dir}/ei_descr_mints_index.bin"),
+        bincode::serialize(&vec![0_u32]).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(format!("{out_dir}/ei_descr_stamps.bin"), b"").unwrap();
+    std::fs::write(
+        format!("{out_dir}/ei_descr_stamps_index.bin"),
         bincode::serialize(&vec![0_u32]).unwrap(),
     )
     .unwrap();
@@ -761,6 +780,104 @@ fn run_worker() {
         .expect("build-script worker panicked");
 }
 
+fn opcode_published_descr_members(
+    descrs: &[majit_translate::jitcode::BhDescr],
+) -> std::collections::BTreeSet<majit_ir::effectinfo::DescrSetMember> {
+    use majit_ir::effectinfo::DescrSetMember;
+    use majit_translate::jitcode::{BhDescr, BhSizeSpec};
+
+    fn field_key(owner: &str, name: &str) -> String {
+        if owner.is_empty() {
+            return name.to_string();
+        }
+        name.strip_prefix(&format!("{owner}."))
+            .unwrap_or(name)
+            .to_string()
+    }
+
+    fn add_layout(members: &mut std::collections::BTreeSet<DescrSetMember>, layout: &BhSizeSpec) {
+        if layout.type_id == 0 {
+            return;
+        }
+        for field in &layout.all_fielddescrs {
+            members.insert(DescrSetMember::Field {
+                struct_id: layout.type_id,
+                field_name: field.field_key().to_string(),
+            });
+        }
+    }
+
+    fn add_descr(members: &mut std::collections::BTreeSet<DescrSetMember>, descr: &BhDescr) {
+        match descr {
+            BhDescr::Field {
+                parent: Some(parent),
+                owner,
+                name,
+                ..
+            } => {
+                add_layout(members, parent);
+                if parent.type_id != 0 {
+                    members.insert(DescrSetMember::Field {
+                        struct_id: parent.type_id,
+                        field_name: field_key(owner, name),
+                    });
+                }
+            }
+            BhDescr::Array {
+                type_id,
+                interior_fields,
+                ..
+            } if *type_id != 0 => {
+                members.insert(DescrSetMember::Array { array_id: *type_id });
+                for field in interior_fields {
+                    members.insert(DescrSetMember::InteriorField {
+                        array_id: *type_id,
+                        name: field.field.field_key().to_string(),
+                    });
+                }
+            }
+            BhDescr::InteriorField { array, field } => {
+                add_descr(members, array);
+                add_descr(members, field);
+                if let (BhDescr::Array { type_id, .. }, BhDescr::Field { owner, name, .. }) =
+                    (array.as_ref(), field.as_ref())
+                    && *type_id != 0
+                {
+                    members.insert(DescrSetMember::InteriorField {
+                        array_id: *type_id,
+                        name: field_key(owner, name),
+                    });
+                }
+            }
+            BhDescr::Size {
+                size,
+                type_id,
+                vtable,
+                owner,
+                all_fielddescrs,
+                is_gc_managed,
+            } => add_layout(
+                members,
+                &BhSizeSpec {
+                    size: *size,
+                    type_id: *type_id,
+                    vtable: *vtable,
+                    is_gc_managed: *is_gc_managed,
+                    headerless: owner == majit_translate::jitcode::HEADERLESS_SIZE_OWNER_MARKER,
+                    all_fielddescrs: all_fielddescrs.clone(),
+                },
+            ),
+            _ => {}
+        }
+    }
+
+    let mut members = std::collections::BTreeSet::new();
+    for descr in descrs {
+        add_descr(&mut members, descr);
+    }
+    members
+}
+
 fn real_main() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let pyre_base = format!("{manifest_dir}/..");
@@ -1155,6 +1272,32 @@ fn real_main() {
         let json = serde_json::to_string_pretty(&frozen_pipeline).unwrap();
         std::fs::write(format!("{out_dir}/jit_metadata.json"), &json).unwrap();
 
+        // `pipeline.ei_descr_mints` is the whole analyzer GcCache mint log.
+        // Runtime has already replayed every member reachable through
+        // `Assembler.descrs` before it consumes this table, just as PyPy's
+        // one process has already populated those cache slots. Carry only an
+        // `(object key, ei_index)` stamp for such members. An unset index
+        // means `compute_bitstrings` found the descriptor in none of the six
+        // final raw sets (`effectinfo.py::compute_bitstrings`); if no opcode
+        // names it either, it is analyzer-only dead state and has no runtime
+        // consumer.
+        // The remaining full specs are therefore precisely the cache misses
+        // that a frozen EffectInfo will look up and runtime must mint.
+        let opcode_members = opcode_published_descr_members(&frozen_descrs);
+        let mut frozen_stamps = Vec::new();
+        frozen_mints.retain(|entry| {
+            if opcode_members.contains(&entry.member) {
+                if entry.ei_index != u32::MAX {
+                    frozen_stamps.push((entry.member.clone(), entry.ei_index));
+                }
+                return false;
+            }
+            if entry.ei_index != u32::MAX {
+                return true;
+            }
+            false
+        });
+
         // Persist `pipeline.jitcodes` (RPython `all_jitcodes` from
         // codewriter.py:89) as individually encoded entries plus a name/offset
         // index. Runtime materializes entries lazily into the shared
@@ -1241,20 +1384,80 @@ fn real_main() {
         let mut descrs_bin = Vec::new();
         let mut descr_offsets = Vec::with_capacity(frozen_descrs.len() + 1);
         let mut descr_kinds = Vec::with_capacity(frozen_descrs.len());
+        let mut descr_parent_layouts = Vec::with_capacity(frozen_descrs.len());
+        let mut canonical_layouts: Vec<std::sync::Arc<majit_translate::jitcode::BhSizeSpec>> =
+            Vec::new();
+        let mut conflicting_layouts: Vec<(u64, String)> = Vec::new();
         descr_offsets.push(0_u32);
         for descr in &frozen_descrs {
-            // `GcCache.setup_descrs` publishes structural descriptors before
-            // call descriptors.  Persist that two-pass classification beside
-            // the dense offsets so runtime can preserve the ordering without
-            // deserializing every entry once merely to discover its variant.
-            // One byte per dense slot retains upstream's list shape and avoids
-            // introducing a second keyed registry.
+            // `GcCache.setup_descrs` publishes its structural descriptors
+            // before call descriptors. `SwitchDictDescr` and the pyre opcode
+            // adapters do not belong to any of GcCache's six dictionaries;
+            // they remain solely in `Assembler.descrs` and are decoded lazily
+            // by the opcode reader. Persist that three-way classification so
+            // runtime setup does not materialize and immediately drop them.
             descr_kinds.push(match descr {
                 majit_translate::jitcode::BhDescr::Call { .. }
                 | majit_translate::jitcode::BhDescr::JitCode { .. } => 1_u8,
-                _ => 0_u8,
+                majit_translate::jitcode::BhDescr::Field { .. }
+                | majit_translate::jitcode::BhDescr::Array { .. }
+                | majit_translate::jitcode::BhDescr::InteriorField { .. }
+                | majit_translate::jitcode::BhDescr::Size { .. } => 0_u8,
+                majit_translate::jitcode::BhDescr::Switch { .. }
+                | majit_translate::jitcode::BhDescr::VableField { .. }
+                | majit_translate::jitcode::BhDescr::VableArray { .. }
+                | majit_translate::jitcode::BhDescr::VtableMethod { .. } => 2_u8,
             });
-            descrs_bin.extend(bincode::serialize(descr).unwrap());
+            // `GcCache.get_field_descr` attaches every FieldDescr to the
+            // one SizeDescr in `GcCache._cache_size[STRUCT]`; the parent and
+            // its `all_fielddescrs` are not copied into each field.  Preserve
+            // that object graph across pyre's process boundary: serialize
+            // each parent layout once, and put only its dense reference next
+            // to the opcode-descr slot.  A linear ordered table is deliberate
+            // here — it is the translated constant list, not a second
+            // semantic cache beside GcCache.
+            let mut wire_descr = descr.clone();
+            let parent_layout = match descr {
+                majit_translate::jitcode::BhDescr::Field {
+                    parent: Some(parent),
+                    ..
+                } => {
+                    let index = canonical_layouts
+                        .iter()
+                        .position(|known| {
+                            if parent.type_id != 0 {
+                                known.type_id == parent.type_id
+                            } else {
+                                known.same_descr_layout(parent)
+                            }
+                        })
+                        .unwrap_or_else(|| {
+                            canonical_layouts.push(parent.clone());
+                            canonical_layouts.len() - 1
+                        });
+                    if !canonical_layouts[index].same_descr_layout(parent) {
+                        if !conflicting_layouts
+                            .iter()
+                            .any(|(type_id, _)| *type_id == parent.type_id)
+                        {
+                            conflicting_layouts.push((
+                                parent.type_id,
+                                format!(
+                                    "type_id={:#x}\n  first={:?}\n  later={:?}",
+                                    parent.type_id, canonical_layouts[index], parent,
+                                ),
+                            ));
+                        }
+                    }
+                    Some(u32::try_from(index).expect("too many canonical descriptor layouts"))
+                }
+                _ => None,
+            };
+            if let majit_translate::jitcode::BhDescr::Field { parent, .. } = &mut wire_descr {
+                *parent = None;
+            }
+            descr_parent_layouts.push(parent_layout.unwrap_or(u32::MAX));
+            descrs_bin.extend(bincode::serialize(&wire_descr).unwrap());
             descr_offsets.push(
                 u32::try_from(descrs_bin.len())
                     .expect("serialized descrs.bin exceeds the u32 offset range"),
@@ -1262,12 +1465,41 @@ fn real_main() {
         }
         assert_eq!(descr_offsets.len(), frozen_descrs.len() + 1);
         assert_eq!(descr_kinds.len(), frozen_descrs.len());
+        assert_eq!(descr_parent_layouts.len(), frozen_descrs.len());
+        assert!(
+            conflicting_layouts.is_empty(),
+            "one STRUCT identity produced conflicting SizeDescr layouts:\n{}",
+            conflicting_layouts
+                .iter()
+                .map(|(_, message)| message.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
         assert_eq!(descr_offsets.first().copied(), Some(0));
         assert_eq!(descr_offsets.last().copied(), Some(descrs_bin.len() as u32));
         assert!(descr_offsets.windows(2).all(|pair| pair[0] <= pair[1]));
-        let descrs_index_bin = bincode::serialize(&(descr_offsets, descr_kinds)).unwrap();
+        let descrs_index_bin =
+            bincode::serialize(&(descr_offsets, descr_kinds, descr_parent_layouts)).unwrap();
         std::fs::write(format!("{out_dir}/descrs.bin"), &descrs_bin).unwrap();
         std::fs::write(format!("{out_dir}/descrs_index.bin"), &descrs_index_bin).unwrap();
+
+        let mut descr_layouts_bin = Vec::new();
+        let mut descr_layout_offsets = Vec::with_capacity(canonical_layouts.len() + 1);
+        descr_layout_offsets.push(0_u32);
+        for layout in &canonical_layouts {
+            descr_layouts_bin.extend(bincode::serialize(layout).unwrap());
+            descr_layout_offsets.push(
+                u32::try_from(descr_layouts_bin.len())
+                    .expect("serialized descr_layouts.bin exceeds the u32 offset range"),
+            );
+        }
+        let descr_layouts_index_bin = bincode::serialize(&descr_layout_offsets).unwrap();
+        std::fs::write(format!("{out_dir}/descr_layouts.bin"), &descr_layouts_bin).unwrap();
+        std::fs::write(
+            format!("{out_dir}/descr_layouts_index.bin"),
+            &descr_layouts_index_bin,
+        )
+        .unwrap();
 
         // RPython's translated constants preserve EffectInfo object identity:
         // thousands of CallDescrs point at a small canonical object table.
@@ -1339,6 +1571,28 @@ fn real_main() {
         std::fs::write(
             format!("{out_dir}/ei_descr_mints_index.bin"),
             &ei_descr_mints_index_bin,
+        )
+        .unwrap();
+
+        let mut ei_descr_stamps_bin = Vec::new();
+        let mut ei_descr_stamp_offsets = Vec::with_capacity(frozen_stamps.len() + 1);
+        ei_descr_stamp_offsets.push(0_u32);
+        for stamp in &frozen_stamps {
+            ei_descr_stamps_bin.extend(bincode::serialize(stamp).unwrap());
+            ei_descr_stamp_offsets.push(
+                u32::try_from(ei_descr_stamps_bin.len())
+                    .expect("serialized ei_descr_stamps.bin exceeds the u32 offset range"),
+            );
+        }
+        let ei_descr_stamps_index_bin = bincode::serialize(&ei_descr_stamp_offsets).unwrap();
+        std::fs::write(
+            format!("{out_dir}/ei_descr_stamps.bin"),
+            &ei_descr_stamps_bin,
+        )
+        .unwrap();
+        std::fs::write(
+            format!("{out_dir}/ei_descr_stamps_index.bin"),
+            &ei_descr_stamps_index_bin,
         )
         .unwrap();
 

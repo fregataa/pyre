@@ -4182,7 +4182,7 @@ fn fielddescrof(
         // here is what made the split underivable at the reader, and this is
         // the last place that still knows the difference.
         index_in_parent,
-        parent,
+        parent: parent.map(std::sync::Arc::new),
         name: field_key,
         owner: canonical_owner.unwrap_or_default(),
     }
@@ -5121,7 +5121,7 @@ impl EffectInfoStructuralKey {
         Self {
             extraeffect: effect.extraeffect,
             oopspecindex: effect.oopspecindex,
-            descr_set_keys: effect.descr_set_keys.clone(),
+            descr_set_keys: effect.descr_set_keys.as_deref().cloned(),
             can_invalidate: effect.can_invalidate,
             can_collect: effect.can_collect,
             call_release_gil_target: effect.call_release_gil_target,
@@ -5275,7 +5275,7 @@ enum AssemblerDescrKey {
         /// descr, and collapsing them here would hand the runtime whichever
         /// provenance happened to be minted first.
         index_in_parent: Option<usize>,
-        parent: Option<crate::jitcode::BhSizeSpec>,
+        parent: Option<std::sync::Arc<crate::jitcode::BhSizeSpec>>,
         name: String,
         owner: String,
     },
