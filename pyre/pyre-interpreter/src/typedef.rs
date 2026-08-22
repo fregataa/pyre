@@ -5372,8 +5372,16 @@ fn init_list_type(ns: PyObjectRef) {
                     // reports "expected 1 argument, got M" rather than the
                     // `extend` message surfaced by the shared implementation.
                     crate::type_methods::arity_slot(args, 1)?;
+                    // `extend` drains a user iterator, so the receiver handed
+                    // back has to come off its root slot: `args` is the stack
+                    // copy the gateway built, and a minor rewrites the shadow
+                    // slots rather than that copy.  Returning the pre-move word
+                    // stores it into the assignment target, where the next
+                    // minor finds a root pointing at a stale header.
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let base = pyre_object::gc_roots::pin_roots(args);
                     crate::type_methods::list_method_extend(args)?;
-                    Ok(args[0])
+                    Ok(pyre_object::gc_roots::shadow_stack_get(base))
                 },
                 2,
             ),
@@ -7026,11 +7034,17 @@ fn init_dict_type(ns: PyObjectRef) {
                     // `dictmultiobject.py descr_ior`: in-place update via
                     // `update1`, returns self.
                     crate::type_methods::arity_slot(args, 1)?;
+                    // The update runs the operand's `keys`/`__getitem__` and
+                    // the keys' `__hash__`, so the receiver handed back is read
+                    // off its root slot rather than out of the gateway's stack
+                    // copy, as `list.__iadd__` does.
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let base = pyre_object::gc_roots::pin_roots(args);
                     let self_ = crate::type_methods::resolve_dict_backing(args[0]);
                     if !self_.is_null() {
                         crate::type_methods::dict_update1(self_, args[1])?;
                     }
-                    Ok(args[0])
+                    Ok(pyre_object::gc_roots::shadow_stack_get(base))
                 },
                 2,
             ),
@@ -26404,10 +26418,19 @@ pub(crate) fn set_method_symmetric_difference(
     // in a set of self's class.  Each set below is freshly minted with no
     // referrer and outlives a further allocation, so each takes the
     // lifetime pin the intersection path takes; sets never move.
+    // The receiver needs the pin too, not just the minted sets: unlike
+    // `set_method_union` and `set_method_difference`, which copy it before any
+    // Python runs, this one drains the operand first and only then walks the
+    // receiver — and `COMPARE_OP` popped it off the value stack.
     let _roots = pyre_object::gc_roots::push_roots();
+    let receiver_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(args[0]);
     let w_other_as_set = set_operand_as_set(args[1])?;
     pyre_object::gc_roots::pin_root(w_other_as_set);
-    let w_new = set_symmetric_difference_storage(args[0], w_other_as_set)?;
+    let w_new = set_symmetric_difference_storage(
+        pyre_object::gc_roots::shadow_stack_get(receiver_slot),
+        w_other_as_set,
+    )?;
     pyre_object::gc_roots::pin_root(w_new);
     unsafe {
         if pyre_object::is_frozenset(args[0]) {
