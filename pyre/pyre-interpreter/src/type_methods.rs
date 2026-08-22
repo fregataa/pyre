@@ -709,8 +709,19 @@ pub fn list_method_insert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // `@unwrap_spec(index='index')` → getindex_w(index, OverflowError): coerce
     // through `__index__`; `get_positive_index` then clamps to `[0, len]`
     // inside `w_list_insert`.
+    // `args` is the copy the gateway built on the stack; a minor rewrites the
+    // shadow slots and not that copy, so the receiver and the item read out of
+    // it after `__index__` has run are pre-move addresses.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
     let index = unsafe { crate::baseobjspace::getindex_w_index(args[1])? };
-    unsafe { pyre_object::listobject::w_list_insert(args[0], index, args[2]) };
+    unsafe {
+        pyre_object::listobject::w_list_insert(
+            pyre_object::gc_roots::shadow_stack_get(base),
+            index,
+            pyre_object::gc_roots::shadow_stack_get(base + 2),
+        )
+    };
     Ok(w_none())
 }
 
@@ -724,12 +735,17 @@ pub fn list_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     arity_at_most(args, "pop", 1)?;
     // `@unwrap_spec(index='index')` → getindex_w(index, OverflowError): coerce
     // through `__index__`.
+    // Rooted as `list_method_insert`: the receiver read out of `args` after
+    // `__index__` has run is a pre-move address.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
     let index = if args.len() > 1 {
         unsafe { crate::baseobjspace::getindex_w_index(args[1])? }
     } else {
         -1
     };
-    let length = unsafe { pyre_object::w_list_len(args[0]) } as i64;
+    let list = pyre_object::gc_roots::shadow_stack_get(base);
+    let length = unsafe { pyre_object::w_list_len(list) } as i64;
     if length == 0 {
         return Err(crate::PyError::new(
             crate::PyErrorKind::IndexError,
@@ -739,7 +755,7 @@ pub fn list_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     // listobject.py — clearly distinguish list.pop() from the
     // general list.pop(index) path.
     if index == -1 {
-        return match unsafe { pyre_object::listobject::w_list_pop_end(args[0]) } {
+        return match unsafe { pyre_object::listobject::w_list_pop_end(list) } {
             Some(v) => Ok(v),
             None => Err(crate::PyError::new(
                 crate::PyErrorKind::IndexError,
@@ -747,7 +763,7 @@ pub fn list_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             )),
         };
     }
-    match unsafe { pyre_object::listobject::w_list_pop(args[0], index) } {
+    match unsafe { pyre_object::listobject::w_list_pop(list, index) } {
         Some(v) => Ok(v),
         None => Err(crate::PyError::new(
             crate::PyErrorKind::IndexError,
@@ -838,9 +854,10 @@ pub fn list_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     let list = args[0];
     let value = args[1];
     // listobject.py:799 unwrap_spec defaults: w_start=0 / w_stop=sys.maxint.
-    // listobject.py:803 unwrap_start_stop handles negative normalization,
-    // __index__ coercion and TypeError for non-index arguments.
-    let size = unsafe { pyre_object::w_list_len(list) } as i64;
+    // `W_ListObject.descr_index` hands `unwrap_start_stop` the length it read
+    // first, and that call is what folds the negative bounds; the two halves
+    // are called separately below so the length can be read after the
+    // coercion instead.
     let w_start = if args.len() >= 3 {
         args[2]
     } else {
@@ -860,9 +877,13 @@ pub fn list_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     let sp = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(list);
     pyre_object::gc_roots::pin_root(value);
-    let (start, stop) = crate::sliceobject::unwrap_start_stop_not_none(size, w_start, w_stop)?;
+    let (raw_start, raw_stop) = crate::sliceobject::index_bounds_not_none(w_start, w_stop)?;
     let list = pyre_object::gc_roots::shadow_stack_get(sp);
     let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+    // The length that folds a negative bound is read after the bounds have
+    // been converted: their `__index__` may have resized this very list.
+    let size = unsafe { pyre_object::w_list_len(list) } as i64;
+    let (start, stop) = crate::sliceobject::adapt_start_stop(size, raw_start, raw_stop);
     match crate::listobject::w_list_find_or_count(list, value, start, stop, false)? {
         crate::listobject::FindOrCountResult::Index(i) => Ok(w_int_new(i)),
         crate::listobject::FindOrCountResult::NotFound => {
@@ -6388,8 +6409,13 @@ pub(crate) fn dict_store_checked(
 /// pointer, so hashing inside the key build (`object_key_for_checked`) captures
 /// the pre-move pointer — the reason `object_key_hashed` exists. The element is
 /// rooted across the hash and reloaded, matching the add path
-/// (`builtin_set_add_items`); the set needs no rooting, being an old-gen
-/// allocation that keeps its address across a collection.
+/// (`builtin_set_add_items`).
+///
+/// The set is rooted too, but only pinned: an old-gen allocation keeps its
+/// address across a collection, so there is nothing to reload — what it needs
+/// is to stay reachable.  `CONTAINS_OP` pops the container off the operand
+/// stack before dispatching here, so on `x in {...}` the hash below runs with
+/// nothing else referring to the set at all.
 unsafe fn set_lookup_checked(
     set: PyObjectRef,
     item: PyObjectRef,
@@ -6401,6 +6427,7 @@ unsafe fn set_lookup_checked(
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(item);
+    pyre_object::gc_roots::pin_root(set);
     let hash = crate::builtins::try_hash_value(pyre_object::gc_roots::shadow_stack_get(sp))
         .map_err(|err| {
             crate::baseobjspace::wrap_set_element_hash_error(
@@ -6442,11 +6469,22 @@ pub fn dict_method_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     arity_at_most(args, "get", 2)?;
     let dict = resolve_dict_backing(args[0]);
     let key = args[1];
-    let default = args.get(2).copied().unwrap_or_else(w_none);
     if dict.is_null() {
-        return Ok(default);
+        return Ok(args.get(2).copied().unwrap_or_else(w_none));
     }
-    Ok(dict_lookup_checked(dict, key)?.unwrap_or(default))
+    // The lookup hashes and compares the key, which is user code. `args` is
+    // the stack copy the gateway built, so a default read out of it after that
+    // is a pre-move address whenever the caller passed a list or a dict.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let found = dict_lookup_checked(dict, key)?;
+    Ok(found.unwrap_or_else(|| {
+        if args.len() >= 3 {
+            pyre_object::gc_roots::shadow_stack_get(base + 2)
+        } else {
+            w_none()
+        }
+    }))
 }
 
 /// `pypy/objspace/std/dictmultiobject.py:descr_keys` parity — returns
@@ -6910,7 +6948,10 @@ pub fn dict_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     arity_at_most(args, "pop", 2)?;
     let dict = resolve_dict_backing(args[0]);
     let key = args[1];
-    let default = args.get(2).copied();
+    // Rooted as `dict_method_get`: the removal hashes the key, and the default
+    // is only consumed once that has run.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
     if !dict.is_null() {
         unsafe {
             match pyre_object::dictmultiobject::w_dict_pop_checked(dict, key) {
@@ -6920,7 +6961,10 @@ pub fn dict_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             }
         }
     }
-    default.ok_or_else(|| crate::PyError::key_error_with_key(key))
+    if args.len() >= 3 {
+        return Ok(pyre_object::gc_roots::shadow_stack_get(base + 2));
+    }
+    Err(crate::PyError::key_error_with_key(key))
 }
 
 /// `dictmultiobject.py` `W_DictMultiObject.descr_popitem`:

@@ -5392,11 +5392,17 @@ fn init_list_type(ns: PyObjectRef) {
                     // runs, so a non-index operand raises here rather than
                     // reporting NotImplemented.
                     crate::type_methods::arity_slot(args, 1)?;
+                    // `args` is the gateway's stack copy: a minor rewrites the
+                    // shadow slots and not that copy, so the list read out of
+                    // it after `__index__` is a pre-move address.
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let base = pyre_object::gc_roots::pin_roots(args);
                     let w_count = crate::baseobjspace::getindex_repeat(args[1])?;
+                    let w_list = pyre_object::gc_roots::shadow_stack_get(base);
                     unsafe {
-                        crate::objspace::descroperation::list_inplace_repeat(args[0], w_count)?
+                        crate::objspace::descroperation::list_inplace_repeat(w_list, w_count)?
                     };
-                    Ok(args[0])
+                    Ok(pyre_object::gc_roots::shadow_stack_get(base))
                 },
                 2,
             ),
@@ -5484,8 +5490,14 @@ fn list_descr_mul_impl(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, 
     crate::type_methods::arity_slot(args, 1)?;
     // `wrap_indexargfunc` reduces the count through `__index__` before
     // `sq_repeat` runs, so a non-index operand raises here.
+    // `args` is the gateway's stack copy: a minor rewrites the shadow slots
+    // and not that copy, so the list read out of it after `__index__` is a
+    // pre-move address.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
     let w_count = crate::baseobjspace::getindex_repeat(args[1])?;
-    unsafe { crate::objspace::descroperation::list_repeat(args[0], w_count) }
+    let w_list = pyre_object::gc_roots::shadow_stack_get(base);
+    unsafe { crate::objspace::descroperation::list_repeat(w_list, w_count) }
 }
 
 // ── Str TypeDef ──────────────────────────────────────────────────────
@@ -7159,9 +7171,10 @@ fn init_dict_type(ns: PyObjectRef) {
         // each key; for a dict subclass, construct an instance via `cls()`
         // and route through `space.setitem` so the result is an instance
         // of the subclass.
+        let mut value = value;
         let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
         if cls.is_null() || crate::baseobjspace::is_w(cls, w_dict_type) {
-            let d = pyre_object::w_dict_new();
+            let mut d = pyre_object::w_dict_new();
             // Python 3.14's exact-set/frozenset fast path carries each
             // entry's cached hash into the new exact dict.  This is the
             // reverse of `set_update_dict_lock_held` and avoids a
@@ -7192,7 +7205,18 @@ fn init_dict_type(ns: PyObjectRef) {
                 }
                 return Ok(pyre_object::gc_roots::shadow_stack_get(sp));
             }
-            let items = crate::builtins::collect_iterable(iterable)?;
+            let items = {
+                // Draining the iterable runs Python. `d` is a fresh dict with
+                // no heap edge yet and dicts are nursery-allocated, so it is
+                // rooted and read back here — the loop below re-roots what it
+                // is handed, which cannot cover this window.
+                let _roots = pyre_object::gc_roots::push_roots();
+                let base = pyre_object::gc_roots::pin_roots(&[d, value]);
+                let items = crate::builtins::collect_iterable(iterable)?;
+                d = pyre_object::gc_roots::shadow_stack_get(base);
+                value = pyre_object::gc_roots::shadow_stack_get(base + 1);
+                items
+            };
             // `try_hash_value` may run a user `__hash__` that allocates
             // and triggers a moving minor collection; `d`, the shared
             // `value` (reused across every key), and every not-yet-added
@@ -21948,18 +21972,32 @@ pub(crate) fn require_contiguous_buffer(obj: PyObjectRef) -> Result<(), crate::P
     Ok(())
 }
 
-/// Require `obj` to be a bytes-like object, returning its bytes; raises
-/// the CPython `a bytes-like object is required, not '<type>'` TypeError
-/// otherwise.  A memoryview is accepted through its backing buffer.
-fn require_bytes_like(obj: PyObjectRef) -> Result<&'static [u8], crate::PyError> {
+/// Resolve `obj` to the bytes-like object backing it; raises the
+/// `a bytes-like object is required, not '<type>'` TypeError otherwise.
+/// A memoryview is accepted through its backing buffer.
+///
+/// Separate from `require_bytes_like` so a caller that must reject a bad
+/// operand *before* running a later argument's `__index__` can do the type
+/// check here and take the payload slice afterwards.  The array, mmap and
+/// ctypes arms mint a fresh `bytes` snapshot, so a result held across a
+/// Python hop needs a root of its own.
+fn require_bytes_like_source(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     require_contiguous_buffer(obj)?;
     match buffer_as_bytes_like(obj)? {
-        Some(src) => Ok(unsafe { pyre_object::bytesobject::bytes_like_data(src) }),
+        Some(src) => Ok(src),
         None => Err(crate::PyError::type_error(format!(
             "a bytes-like object is required, not '{}'",
             type_name_of(obj)
         ))),
     }
+}
+
+/// Require `obj` to be a bytes-like object, returning its bytes; raises
+/// the CPython `a bytes-like object is required, not '<type>'` TypeError
+/// otherwise.  A memoryview is accepted through its backing buffer.
+fn require_bytes_like(obj: PyObjectRef) -> Result<&'static [u8], crate::PyError> {
+    let src = require_bytes_like_source(obj)?;
+    Ok(unsafe { pyre_object::bytesobject::bytes_like_data(src) })
 }
 
 /// The Python-visible class name of `obj` (its `w_class`/type name), used in
@@ -22220,15 +22258,33 @@ fn bytes_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     }
     crate::type_methods::arity_at_least(pos, "replace", 2)?;
     crate::type_methods::arity_at_most(pos, "replace", 3)?;
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
-    let old = require_bytes_like(pos[1])?;
-    let new = require_bytes_like(pos[2])?;
+    // `old` and `new` are rejected before `count` is coerced: the clinic
+    // signature converts the two buffers ahead of the integer, so
+    // `b"".replace(1, b"y", idx)` raises the TypeError without running
+    // `idx.__index__`.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let src_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(require_bytes_like_source(pos[1])?);
+    pyre_object::gc_roots::pin_root(require_bytes_like_source(pos[2])?);
     let limit = match pos.get(3) {
         Some(&w_count) if !w_count.is_null() => {
             let c = crate::builtins::space_index_w(w_count)?;
             if c < 0 { usize::MAX } else { c as usize }
         }
         _ => usize::MAX,
+    };
+    // Borrowed after the coercion, as `bytes_method_ljust`: all three
+    // operands may be bytearrays, and the `__index__` above can resize any of
+    // them.  The two sources come back off their root slots, since a snapshot
+    // minted by `require_bytes_like_source` had nothing else holding it.
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
+    let old = unsafe {
+        pyre_object::bytesobject::bytes_like_data(pyre_object::gc_roots::shadow_stack_get(src_base))
+    };
+    let new = unsafe {
+        pyre_object::bytesobject::bytes_like_data(pyre_object::gc_roots::shadow_stack_get(
+            src_base + 1,
+        ))
     };
     let (out, replacements) = replace_bytes(data, old, new, limit);
     // `descr_replace` returns `self` when nothing was replaced
@@ -22496,9 +22552,12 @@ fn bytes_fill_char(args: &[PyObjectRef], idx: usize, method: &str) -> Result<u8,
 /// `stringmethods.py:descr_ljust` — left-justify within `width`.
 fn bytes_method_ljust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_between(args, "ljust", 1, 2)?;
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let width = crate::builtins::space_index_w(args[1])?;
     let fill = bytes_fill_char(args, 2, "ljust")?;
+    // Borrowed after the coercions, not before: `__index__` on `width` runs
+    // Python, and a `bytearray` receiver resized there reallocates the buffer
+    // this slice points into.
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let len = data.len() as i64;
     if width <= len {
         return Ok(new_bytes_like(args[0], data));
@@ -22512,9 +22571,10 @@ fn bytes_method_ljust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 /// `stringmethods.py:descr_rjust` — right-justify within `width`.
 fn bytes_method_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_between(args, "rjust", 1, 2)?;
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let width = crate::builtins::space_index_w(args[1])?;
     let fill = bytes_fill_char(args, 2, "rjust")?;
+    // Borrowed after the coercions, as `bytes_method_ljust`.
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let len = data.len() as i64;
     if width <= len {
         return Ok(new_bytes_like(args[0], data));
@@ -22530,9 +22590,10 @@ fn bytes_method_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 /// left-offset.
 fn bytes_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_between(args, "center", 1, 2)?;
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let width = crate::builtins::space_index_w(args[1])?;
     let fill = bytes_fill_char(args, 2, "center")?;
+    // Borrowed after the coercions, as `bytes_method_ljust`.
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let len = data.len() as i64;
     if width <= len {
         return Ok(new_bytes_like(args[0], data));
@@ -22550,8 +22611,9 @@ fn bytes_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// keeping a leading `+`/`-` sign ahead of the zeros.
 fn bytes_method_zfill(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_exact(args, "zfill", 1)?;
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let width = crate::builtins::space_index_w(args[1])?;
+    // Borrowed after the coercions, as `bytes_method_ljust`.
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let len = data.len() as i64;
     if width <= len {
         return Ok(new_bytes_like(args[0], data));
@@ -26084,13 +26146,16 @@ pub(crate) fn set_method_union(
     // crosses two full drains. `set_init_from_iterable_impl` pins for the same
     // reason: the set body is non-moving old-gen storage, but it still has to
     // be marked live instead of swept while Rust holds the only reference.
+    // The operands go on in one phase for a second reason: `args` is the stack
+    // copy the gateway built, and a minor rewrites the shadow slots rather
+    // than that copy, so reading operand two out of it after operand one has
+    // run a user `__hash__` answers a pre-move address.
     let _roots = pyre_object::gc_roots::push_roots();
-    let result_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(result);
-    for other in &args[1..] {
-        let _operand_root = pyre_object::gc_roots::push_roots();
-        let operand_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(*other);
+    let operand_base = pyre_object::gc_roots::publish_roots(&args[1..]);
+    let result_slot = pyre_object::gc_roots::publish_roots(&[result]);
+    pyre_object::gc_roots::normalize_roots(operand_base, args.len());
+    for index in 0..args.len() - 1 {
+        let operand_slot = operand_base + index;
         if unsafe {
             pyre_object::is_set_or_frozenset(pyre_object::gc_roots::shadow_stack_get(operand_slot))
         } {
@@ -26501,6 +26566,16 @@ pub(crate) fn set_is_subset_of(
     w_set: pyre_object::PyObjectRef,
     w_other: pyre_object::PyObjectRef,
 ) -> Result<bool, crate::PyError> {
+    // The probe compares with the digest each element was stored under, so the
+    // walk hashes nothing — but a bucket match still runs the elements'
+    // `__eq__`, which is a collection point.  Both operands are pinned here
+    // because a caller cannot be relied on to hold them: `COMPARE_OP` pops
+    // them, and `set_operand_as_set` hands over a set it has just minted.  A
+    // set is old-gen and never moves, so this is liveness only and neither
+    // local is reloaded; `key` stays reachable through the pinned `w_set`.
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_set);
+    pyre_object::gc_roots::pin_root(w_other);
     unsafe {
         let mut i = 0;
         while let Some(key) = pyre_object::w_set_key_at(w_set, i) {
@@ -26561,15 +26636,13 @@ fn set_method_update(
     // Rooted as `set_method_union`, except that the operands merge into
     // `args[0]` itself: a raw Rust slice the collector cannot see either.
     let _roots = pyre_object::gc_roots::push_roots();
-    let set_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(args[0]);
+    let set_slot = pyre_object::gc_roots::pin_roots(args);
+    let operand_base = set_slot + 1;
     // `setobject.py _descr_update` — a set operand's storage merges in
     // as it stands; only another iterable is walked and hashed element by
     // element.
-    for other in &args[1..] {
-        let _operand_root = pyre_object::gc_roots::push_roots();
-        let operand_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(*other);
+    for index in 0..args.len() - 1 {
+        let operand_slot = operand_base + index;
         if unsafe {
             pyre_object::is_set_or_frozenset(pyre_object::gc_roots::shadow_stack_get(operand_slot))
         } {
@@ -26603,10 +26676,21 @@ fn set_method_difference_update(
     if args.is_empty() {
         return Ok(pyre_object::w_none());
     }
-    for other in &args[1..] {
-        let w_other_as_set = set_operand_as_set(*other)?;
-        unsafe { pyre_object::w_set_difference_update_from_set(args[0], w_other_as_set) }
-            .map_err(crate::baseobjspace::map_set_update_error)?;
+    // Rooted as `set_method_update`: turning an operand into a set hashes its
+    // elements, so `args` is read once here and every later use comes off the
+    // root stack.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let set_slot = pyre_object::gc_roots::pin_roots(args);
+    for index in 1..args.len() {
+        let w_other_as_set =
+            set_operand_as_set(pyre_object::gc_roots::shadow_stack_get(set_slot + index))?;
+        unsafe {
+            pyre_object::w_set_difference_update_from_set(
+                pyre_object::gc_roots::shadow_stack_get(set_slot),
+                w_other_as_set,
+            )
+        }
+        .map_err(crate::baseobjspace::map_set_update_error)?;
     }
     Ok(pyre_object::w_none())
 }

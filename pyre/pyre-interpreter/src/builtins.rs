@@ -6450,8 +6450,16 @@ fn os_error_build(
     args: &[PyObjectRef],
 ) -> PyObjectRef {
     use pyre_object::interp_exceptions;
-    let exc = if args.len() == 1 && unsafe { pyre_object::is_str(args[0]) } {
-        let w = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
+    // Published before the first `__repr__` runs.  `args` is the stack copy
+    // the gateway built, and a minor rewrites the shadow slots rather than
+    // that copy, so an element formatted early is a pre-move address by the
+    // time the run below is stored — every element of it, since the store
+    // reads the whole slice after the last dispatch.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let args_base = pyre_object::gc_roots::pin_roots(args);
+    let arg = |index: usize| pyre_object::gc_roots::shadow_stack_get(args_base + index);
+    let exc = if args.len() == 1 && unsafe { pyre_object::is_str(arg(0)) } {
+        let w = unsafe { pyre_object::w_str_get_wtf8(arg(0)) };
         interp_exceptions::w_exception_new_wtf8(kind, w)
     } else {
         let msg: rustpython_wtf8::Wtf8Buf = if args.is_empty() {
@@ -6460,14 +6468,16 @@ fn os_error_build(
             // exception construction is non-raising machinery, per the F7
             // display policy; a raising __str__/__repr__ on the args degrades
             // to the empty string rather than propagating.
-            unsafe { crate::display::py_str_wtf8(args[0]) }.unwrap_or_default()
+            unsafe { crate::display::py_str_wtf8(arg(0)) }.unwrap_or_default()
         } else {
             let mut parts = rustpython_wtf8::Wtf8Buf::from_string("(".to_string());
-            for (index, &a) in args.iter().enumerate() {
+            for index in 0..args.len() {
                 if index > 0 {
                     parts.push_str(", ");
                 }
-                parts.push_wtf8(&unsafe { crate::display::py_repr_wtf8(a) }.unwrap_or_default());
+                parts.push_wtf8(
+                    &unsafe { crate::display::py_repr_wtf8(arg(index)) }.unwrap_or_default(),
+                );
             }
             parts.push_str(")");
             parts
@@ -6475,8 +6485,13 @@ fn os_error_build(
         interp_exceptions::w_exception_new_wtf8(kind, &msg)
     };
     // Seed `args_w` so a deferred-init instance (`_use_init`, no `__new__`
-    // slot fill) still reports the empty tuple until `__init__` runs.
-    let args_list = pyre_object::interp_exceptions::w_exception_args_new(args.to_vec());
+    // slot fill) still reports the empty tuple until `__init__` runs.  `exc`
+    // is pinned over the tuple mint: it holds no heap edge yet, and building
+    // a tuple instantiates the type's lazy map.  An instance is old-gen, so
+    // the pin is for liveness and the value is used as it is.
+    pyre_object::gc_roots::pin_root(exc);
+    let args_list =
+        pyre_object::interp_exceptions::w_exception_args_new((0..args.len()).map(arg).collect());
     unsafe { interp_exceptions::w_exception_set_args(exc, args_list) };
     exc
 }
@@ -6643,25 +6658,33 @@ fn os_error_parsed_errno(args: &[PyObjectRef]) -> Option<PyObjectRef> {
 /// see the resolved class.
 fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) {
     use pyre_object::interp_exceptions;
+    // Both the errno parse and the `BlockingIOError` test below run `int_w`,
+    // which is a user `__index__`, so the arguments are read off the root
+    // stack rather than out of the caller's slice once either has run.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let args_base = pyre_object::gc_roots::pin_roots(args);
+    pyre_object::gc_roots::pin_root(exc);
+    let arg = |index: usize| pyre_object::gc_roots::shadow_stack_get(args_base + index);
+    let arg_opt = |index: usize| (index < args.len()).then(|| arg(index));
     // `_parse_init_args`: only a 2..=5 argument call carries errno/strerror
     // (and optionally filename/filename2); outside that range every argument
     // stays in `args_w` and no slot is filled.
-    let mut args_w = args.to_vec();
-    if let Some(w_errno) = os_error_parsed_errno(args) {
+    let parsed = os_error_parsed_errno(args);
+    let mut trimmed = false;
+    if let Some(w_errno) = parsed {
         // The parse also decides the errno the args tuple carries, so
         // `e.args[0]` and `e.errno` agree even where a Windows error code in
         // the fourth argument replaced the one that was passed.
-        args_w[0] = w_errno;
         unsafe {
             interp_exceptions::w_exception_set_errno(exc, w_errno);
-            interp_exceptions::w_exception_set_strerror(exc, args[1]);
+            interp_exceptions::w_exception_set_strerror(exc, arg(1));
             #[cfg(windows)]
-            if let Some(w_winerror) = args.get(3).copied() {
+            if let Some(w_winerror) = arg_opt(3) {
                 interp_exceptions::w_exception_set_winerror(exc, w_winerror);
             }
             // idx 2 = filename, idx 3 = winerror (unread off Windows),
             // idx 4 = filename2.
-            let w_filename = args.get(2).copied().filter(|&f| !pyre_object::is_none(f));
+            let w_filename = arg_opt(2).filter(|&f| !pyre_object::is_none(f));
             // `_init_error` line 636-643: for an exact `BlockingIOError`, a
             // numeric third argument is `characters_written`, not a filename —
             // it stays in `args_w` and the tuple is not trimmed.
@@ -6675,14 +6698,23 @@ fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) {
                 interp_exceptions::w_exception_set_blocking_written_arg(exc);
             } else if let Some(fname) = w_filename {
                 interp_exceptions::w_exception_set_filename(exc, fname);
-                if let Some(f2) = args.get(4).copied().filter(|&f| !pyre_object::is_none(f)) {
+                if let Some(f2) = arg_opt(4).filter(|&f| !pyre_object::is_none(f)) {
                     interp_exceptions::w_exception_set_filename2(exc, f2);
                 }
                 // `_init_error`: filename is removed from the args tuple.
-                args_w = vec![w_errno, args[1]];
+                trimmed = true;
             }
         }
     }
+    // Assembled from the root stack, after the last `int_w`: the caller's
+    // slice is a pre-move view of the operands by then.
+    let args_w: Vec<PyObjectRef> = match (parsed, trimmed) {
+        (Some(w_errno), true) => vec![w_errno, arg(1)],
+        (Some(w_errno), false) => std::iter::once(w_errno)
+            .chain((1..args.len()).map(&arg))
+            .collect(),
+        (None, _) => (0..args.len()).map(&arg).collect(),
+    };
     let args_list = interp_exceptions::w_exception_args_new(args_w);
     unsafe { interp_exceptions::w_exception_set_args(exc, args_list) };
 }
@@ -7490,11 +7522,23 @@ fn os_error_family_new(
     // When `_use_init`, `__new__` allocates without parsing the args — the
     // errno/strerror/filename slots and `args_w` stay unset for `__init__` to
     // fill (line 608-611).  Otherwise `__new__` parses them itself.
+    // `ctor` formats the message, which runs every argument's `__repr__`, and
+    // both readers below consult the arguments again afterwards.  `positional`
+    // borrows the stack copy the gateway built, and a minor rewrites the
+    // shadow slots rather than that copy, so the operands are taken off the
+    // root stack once the Python is done.  `exc` joins them because
+    // `os_error_fill_slots` runs `int_w`, which is Python of its own.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let positional_base = pyre_object::gc_roots::pin_roots(positional);
     let exc = ctor(if use_init { &[] } else { positional })?;
+    pyre_object::gc_roots::pin_root(exc);
+    let positional: Vec<PyObjectRef> = (0..positional.len())
+        .map(|index| pyre_object::gc_roots::shadow_stack_get(positional_base + index))
+        .collect();
     // Only the exact OSError type remaps the errno to a subclass; resolve the
     // retag target (subclass on a recognised errno, else the called class).
     let w_target = if is_exact_os_error {
-        os_error_errno_subclass_for(positional)
+        os_error_errno_subclass_for(&positional)
             .and_then(lookup_exc_class)
             .or(cls)
     } else {
@@ -7506,7 +7550,7 @@ fn os_error_family_new(
     // Fill the slots after the retag so `os_error_fill_slots` can see the
     // resolved class (the `BlockingIOError` numeric-filename special-case).
     if !use_init {
-        os_error_fill_slots(exc, positional);
+        os_error_fill_slots(exc, &positional);
     }
     Ok(exc)
 }
@@ -14774,6 +14818,14 @@ pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     kwarg_reject_unknown(kwargs, &["key", "reverse"], "sort")?;
     let iterable = positional[0];
     let key_fn = kwarg_get(kwargs, "key").filter(|k| unsafe { !pyre_object::is_none(*k) });
+    // `reverse=` runs a user `__bool__`, and building the list drains the
+    // iterable's own Python, so the iterable and the key callable are pinned
+    // before either and reloaded after, exactly as `list_method_sort` does.
+    // `PY_NULL` stands in when no key was given, keeping the two roots
+    // adjacent so one base covers both.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base =
+        pyre_object::gc_roots::pin_roots(&[iterable, key_fn.unwrap_or(pyre_object::PY_NULL)]);
     let reverse = kwarg_get(kwargs, "reverse")
         .map(crate::baseobjspace::is_true)
         .transpose()?
@@ -14782,10 +14834,10 @@ pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     // `sorted_lst.sort(key=key, reverse=reverse)`, so the built list picks its
     // storage strategy first and the sort runs through the same body
     // `list.sort` uses.
-    let w_list = builtin_list_ctor(&[iterable])?;
-    let _roots = pyre_object::gc_roots::push_roots();
+    let w_list = builtin_list_ctor(&[pyre_object::gc_roots::shadow_stack_get(base)])?;
     let list_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(w_list);
+    let key_fn = key_fn.map(|_| pyre_object::gc_roots::shadow_stack_get(base + 1));
     sort_list_in_place(list_slot, key_fn, reverse)?;
     Ok(pyre_object::gc_roots::shadow_stack_get(list_slot))
 }

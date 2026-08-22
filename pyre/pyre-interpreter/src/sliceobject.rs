@@ -65,9 +65,31 @@ pub fn unwrap_start_stop_not_none(
     w_start: PyObjectRef,
     w_end: PyObjectRef,
 ) -> Result<(i64, i64), crate::PyError> {
-    let start = adapt_bound(size, eval_slice_index_not_none(w_start)?);
-    let end = adapt_bound(size, eval_slice_index_not_none(w_end)?);
+    let (start, end) = index_bounds_not_none(w_start, w_end)?;
+    Ok(adapt_start_stop(size, start, end))
+}
+
+/// The conversion half of [`unwrap_start_stop_not_none`], for a receiver whose
+/// length a bound's own `__index__` can change: convert both bounds here, read
+/// the length afterwards, and normalize with [`adapt_start_stop`].
+pub fn index_bounds_not_none(
+    w_start: PyObjectRef,
+    w_end: PyObjectRef,
+) -> Result<(i64, i64), crate::PyError> {
+    // Converted one at a time, as `slice_unpack`: the first bound's
+    // `__index__` is user code that can collect, so the second is read back
+    // from the shadow stack rather than carried in the argument it arrived
+    // in. A caller that roots the container does not root these two.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[w_start, w_end]);
+    let start = eval_slice_index_not_none(pyre_object::gc_roots::shadow_stack_get(base))?;
+    let end = eval_slice_index_not_none(pyre_object::gc_roots::shadow_stack_get(base + 1))?;
     Ok((start, end))
+}
+
+/// The normalization half: fold negative bounds by `size` and floor at 0.
+pub fn adapt_start_stop(size: i64, start: i64, end: i64) -> (i64, i64) {
+    (adapt_bound(size, start), adapt_bound(size, end))
 }
 
 /// The negative-index normalization `adapt_lower_bound` applies once the
@@ -90,11 +112,17 @@ pub fn unwrap_start_stop(
     w_start: PyObjectRef,
     w_end: PyObjectRef,
 ) -> Result<(i64, i64), crate::PyError> {
+    // Rooted and read back for the same reason as
+    // `unwrap_start_stop_not_none`.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[w_start, w_end]);
+    let w_start = pyre_object::gc_roots::shadow_stack_get(base);
     let start = if unsafe { is_none(w_start) } {
         0
     } else {
         adapt_lower_bound(size, w_start)?
     };
+    let w_end = pyre_object::gc_roots::shadow_stack_get(base + 1);
     let end = if unsafe { is_none(w_end) } {
         debug_assert!(size >= 0);
         size
