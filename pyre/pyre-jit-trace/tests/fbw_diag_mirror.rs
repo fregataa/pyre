@@ -247,6 +247,17 @@ fn each_label_sits_at_its_own_slot_constant() {
             d::BLACKHOLE_ADOPTED_MULTI_FRAME,
             "fbw_blackhole_adopted_multi_frame",
         ),
+        (d::GATE_DECLINED_SHAPE, "gate_declined_shape"),
+        (
+            d::GATE_DECLINED_FOR_ITER_REGION,
+            "gate_declined_for_iter_region",
+        ),
+        (
+            d::GATE_DECLINED_FUNCTION_ENTRY,
+            "gate_declined_function_entry",
+        ),
+        (d::BRIDGE_EC_FROM_PORTAL_RED, "bridge_ec_from_portal_red"),
+        (d::BRIDGE_EC_MISSING, "bridge_ec_missing"),
     ];
 
     // Exhaustiveness: a slot added to `fbw_diag` grows `LABELS` (rustc enforces

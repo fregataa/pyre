@@ -7733,6 +7733,39 @@ fn for_iter_body_is_jit_safe_at(code: &pyre_interpreter::CodeObject, pc: usize) 
                     | I::ListExtend { .. }
                     | I::SetAdd { .. }
                     | I::MapAdd { .. }
+                    // The other three container-update opcodes lower the same
+                    // way as `LIST_EXTEND`: pop the source, peek the container,
+                    // emit one void accumulate residual, and the codewriter and
+                    // `liveness` already treat all four as one class. Each also
+                    // targets a container built in the same expression -- a set
+                    // or dict display, or a call's `**kwargs` dict -- so a walk
+                    // abort drops an incomplete fresh object rather than
+                    // replaying a mutation of a pre-existing one. A set display
+                    // that must yield a mutable set compiles to `BUILD_SET 0` +
+                    // `SET_UPDATE 1` even when every element is constant, so
+                    // declining these took every loop that builds one out of
+                    // the JIT.
+                    | I::SetUpdate { .. }
+                    | I::DictUpdate { .. }
+                    | I::DictMerge { .. }
+                    // `LOAD_BUILD_CLASS` pushes `frame.get_builtin()` and
+                    // touches nothing else. `codewriter.rs` lowers it as a
+                    // frame-only Ref read under a compile-time assert that
+                    // `HONOR_BUILTINS` is false, so which frame asks does not
+                    // change the answer. A loop body that defines a class
+                    // holds one.
+                    //
+                    // `DELETE_NAME` and `DELETE_GLOBAL` deliberately stay out,
+                    // even though they reach the same
+                    // `try_walker_force_quasi_immut_namespace_write` as the
+                    // two stores above. A repeated store settles: after the
+                    // first write `store_would_bump_version` stops bumping and
+                    // the loop compiles. A delete removes the cell, so it
+                    // bumps every iteration and forces every iteration --
+                    // `x = i * 2; total += x` compiles with 0 aborts, and the
+                    // same loop with `del x` appended traces 5 times and
+                    // aborts all 5 on the force, compiling nothing.
+                    | I::LoadBuildClass
             )
             || ((!body_has_call || for_iter_call_body_admitted())
                 && matches!(body_instr, I::ListAppend { .. }));
@@ -8264,6 +8297,7 @@ fn eval_with_jit_inner(
         UnsupportedJitShape::CurrentFrameOnly
         | UnsupportedJitShape::NestedBreakBridgeResume
         | UnsupportedJitShape::ConstEncodingOverflow => {
+            pyre_jit_trace::trace::fbw_diag::record_gate_declined_shape();
             pyre_jit_trace::jitcode_dispatch::census_record_frame_shape_decline(
                 code as *const _ as usize,
                 unsupported_jit_shape(code).1,
@@ -9160,9 +9194,11 @@ fn maybe_compile_and_run(
     // whole-bytecode walk that used to run on every back-edge.
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
     if cached_unsupported_jit_shape(code) != UnsupportedJitShape::None {
+        pyre_jit_trace::trace::fbw_diag::record_gate_declined_shape();
         return None;
     }
     if !cached_loop_region_for_iter_bodies_all_jit_safe(code, loop_header_pc) {
+        pyre_jit_trace::trace::fbw_diag::record_gate_declined_for_iter_region();
         const DENIAL: &str = "BackedgeGate::ForIter/UnsafeLoopRegion";
         let first_decline = pyre_jit_trace::jitcode_dispatch::census_record_for_iter_gate_decline(
             code as *const _ as usize,
@@ -10573,6 +10609,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     // object in `CallControl.graph_jit_shapes`, so this is a pointer-keyed
     // lookup, not the whole-frame scan that charged every Python call.
     if cached_unsupported_jit_shape(code) != UnsupportedJitShape::None {
+        pyre_jit_trace::trace::fbw_diag::record_gate_declined_shape();
         return None;
     }
     if dump_bytecode_enabled() {
@@ -10852,6 +10889,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     // continues in `eval_loop_jit`, where its back-edges tick independently
     // and consult their own natural loop regions.
     if !cached_function_entry_trace_is_jit_safe(code) {
+        pyre_jit_trace::trace::fbw_diag::record_gate_declined_function_entry();
         return None;
     }
 
@@ -13729,6 +13767,73 @@ mod tests {
             assert!(!function_entry_trace_is_jit_safe(&code));
             assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
         }
+    }
+
+    #[test]
+    fn for_iter_body_updating_a_fresh_container_is_jit_safe() {
+        // `SET_UPDATE`, `DICT_UPDATE` and `DICT_MERGE` lower like `LIST_EXTEND`
+        // -- one void accumulate residual over a container the same expression
+        // just built. A set display that must yield a mutable set emits
+        // `BUILD_SET 0` + `SET_UPDATE 1` even with constant elements, so
+        // declining it took the whole loop out of the JIT.
+        use pyre_interpreter::compile_exec;
+        for source in [
+            "def f(n):\n    c = 0\n    for i in range(n):\n        s = {0, 1, 2, 3}\n        c += len(s)\n    return c\n",
+            "def f(n):\n    c = 0\n    for i in range(n):\n        d = {**{'a': 1}, 'b': i}\n        c += len(d)\n    return c\n",
+            "def f(n, g):\n    c = 0\n    for i in range(n):\n        c += g(**{'a': i})\n    return c\n",
+        ] {
+            let module = compile_exec(source).expect("test code should compile");
+            let code = function_code_from_module(&module, "f");
+            assert!(function_entry_trace_is_jit_safe(&code));
+            assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
+        }
+    }
+
+    #[test]
+    fn for_iter_body_defining_a_class_is_jit_safe() {
+        use pyre_interpreter::compile_exec;
+        let module = compile_exec(
+            "def f(n):\n    c = 0\n    for i in range(n):\n        class C:\n            v = i\n        c += C.v\n    return c\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&module, "f");
+        assert!(function_entry_trace_is_jit_safe(&code));
+        assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
+    }
+
+    #[test]
+    fn for_iter_body_deleting_a_namespace_name_is_refused() {
+        // The counterpart to the `STORE_NAME` and `STORE_GLOBAL` admission: a
+        // store settles after its first version bump, a delete bumps on every
+        // iteration and forces the trace every time, so the loop it would
+        // admit never compiles. Only a module or class frame spells
+        // `DELETE_NAME` -- a function's `del x` is `DELETE_FAST`, which stays
+        // admitted, so the store-only loop below has to keep passing.
+        use pyre_interpreter::compile_exec;
+        let stores =
+            compile_exec("total = 0\nfor i in range(10):\n    x = i * 2\n    total += x\n")
+                .expect("test code should compile");
+        assert!(function_entry_trace_is_jit_safe(&stores));
+
+        let deletes = compile_exec(
+            "total = 0\nfor i in range(10):\n    x = i * 2\n    total += x\n    del x\n",
+        )
+        .expect("test code should compile");
+        assert!(!function_entry_trace_is_jit_safe(&deletes));
+
+        let del_global = compile_exec(
+            "g = 0\ndef f(n):\n    global g\n    c = 0\n    for i in range(n):\n        g = i\n        c += g\n        del g\n    return c\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&del_global, "f");
+        assert!(!function_entry_trace_is_jit_safe(&code));
+
+        let del_fast = compile_exec(
+            "def f(n):\n    c = 0\n    for i in range(n):\n        x = i * 2\n        c += x\n        del x\n    return c\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&del_fast, "f");
+        assert!(function_entry_trace_is_jit_safe(&code));
     }
 
     #[test]
