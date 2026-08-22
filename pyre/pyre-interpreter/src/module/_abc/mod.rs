@@ -30,6 +30,52 @@ fn simple_weak_set_type() -> PyObjectRef {
         .expect("_abc.SimpleWeakSet must be installed at module init") as PyObjectRef
 }
 
+/// The `__contains__` `app_abc.py` defines, stashed beside its type as the
+/// three words a caller can move independently: the method itself, the code
+/// object it holds, and the one global its body reads.  The class is an
+/// ordinary heap type, so the method is rebindable and the function it holds is
+/// mutable in place; answering natively is only sound while the body a
+/// membership test would reach is still the one written in `app_abc.py`.
+///
+/// The body is `try: wr = ref(item) / except TypeError: return False / return
+/// wr in self.data`, so `ref` is its whole free-variable surface and pinning it
+/// is what makes rebinding `__globals__["ref"]` decline.  Defaults are not
+/// pinned because the body takes none.
+static SIMPLE_WEAK_SET_CONTAINS: std::sync::OnceLock<(usize, usize, usize)> =
+    std::sync::OnceLock::new();
+
+/// The installed `__contains__`, the code object it currently holds and its
+/// `ref` global, as the triple [`SIMPLE_WEAK_SET_CONTAINS`] stores.  Anything
+/// that is not a function reads as `(0, 0, 0)`, which no stash can equal:
+/// [`crate::function_get_code`] reads the `code` field without checking the
+/// type, so a `__contains__` rebound to a non-function must be rejected before
+/// the read rather than by comparing what the read returned.
+fn simple_weak_set_contains_identity() -> (usize, usize, usize) {
+    const NONE: (usize, usize, usize) = (0, 0, 0);
+    let Some(method) =
+        (unsafe { crate::baseobjspace::lookup_in_type(simple_weak_set_type(), "__contains__") })
+    else {
+        return NONE;
+    };
+    if !unsafe { crate::is_function(method) } {
+        return NONE;
+    }
+    let globals = unsafe { crate::function_get_globals_obj(method) };
+    if globals.is_null() {
+        return NONE;
+    }
+    let Some(ref_global) =
+        (unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(globals, "ref") })
+    else {
+        return NONE;
+    };
+    (
+        method as usize,
+        unsafe { crate::function_get_code(method) as usize },
+        ref_global as usize,
+    )
+}
+
 /// `SimpleWeakSet()` — the empty collection `_abc_init` installs and the
 /// invalidation in `subclass_of` rebinds to.
 fn new_simple_weak_set() -> Result<PyObjectRef, crate::PyError> {
@@ -50,7 +96,89 @@ fn weak_cache_contains(
     let item_slot = roots.publish(&[item]);
     let cache = cache_attr(roots.get(cls_slot), name)?;
     let cache_slot = roots.publish(&[cache]);
+    if let Some(found) = simple_weak_set_contains(roots.get(cache_slot), roots.get(item_slot))? {
+        return Ok(found);
+    }
     crate::baseobjspace::contains(roots.get(cache_slot), roots.get(item_slot))
+}
+
+/// `app_abc.py SimpleWeakSet.__contains__` without the app-level frame,
+/// for the collection `_abc_init` installed and nothing has replaced.
+///
+/// `None` means the receiver is not that collection — a rebound `_abc_cache`, or
+/// one whose `data` is no longer a set — so the caller takes the membership
+/// protocol and whatever the replacement spells.
+///
+/// `_abc_instancecheck` runs this once on a hit and twice on a miss, and the
+/// frame it replaces is most of what the check costs: the body is three
+/// operations, and entering Python to run them is the rest.
+fn simple_weak_set_contains(
+    cache: PyObjectRef,
+    item: PyObjectRef,
+) -> Result<Option<bool>, crate::PyError> {
+    if !crate::typedef::r#type(cache)
+        .is_some_and(|actual| std::ptr::eq(actual.as_ptr(), simple_weak_set_type()))
+    {
+        return Ok(None);
+    }
+    // The receiver being that class is not enough: rebinding the class's own
+    // `__contains__`, assigning that function a different `__code__`, or
+    // rebinding the `ref` its body calls, each leaves every instance an exact
+    // `SimpleWeakSet` while changing what a membership test answers.
+    let Some(&installed) = SIMPLE_WEAK_SET_CONTAINS.get() else {
+        return Ok(None);
+    };
+    if simple_weak_set_contains_identity() != installed {
+        return Ok(None);
+    }
+    let roots = pyre_object::gc_roots::push_roots();
+    let cache_slot = roots.publish(&[cache]);
+    let item_slot = roots.publish(&[item]);
+    let data = crate::baseobjspace::getattr_str(roots.get(cache_slot), "data")?;
+    // Exactly a `set`, not merely one by layout: a subclass keeps the base
+    // layout in `ob_type` and retags `w_class`, and `contains` dispatches such
+    // a subclass's `__contains__` override through `subclass_special_override`.
+    // Reading the table directly would answer past the override.
+    if !unsafe { pyre_object::is_exact_type(data, &pyre_object::setobject::SET_TYPE) } {
+        return Ok(None);
+    }
+    let data_slot = roots.publish(&[data]);
+    // An empty collection holds no entry to match, and building the probe has
+    // no other effect, so the two answers agree.  `_in_weak_set` takes the same
+    // shortcut on `PySet_GET_SIZE(set) == 0`.
+    if unsafe { pyre_object::w_set_len(roots.get(data_slot)) } == 0 {
+        return Ok(Some(false));
+    }
+    // `wr = ref(item)`.  The app-level spelling answers False for an item that
+    // cannot carry a weakref and lets every other error out, so match both.
+    let probe = match crate::module::_weakref::interp__weakref::descr__new__weakref(
+        crate::module::_weakref::interp__weakref::weakref_type(),
+        &[roots.get(item_slot)],
+    ) {
+        Ok(probe) => probe,
+        Err(err) if matches!(err.kind, crate::error::PyErrorKind::TypeError) => {
+            return Ok(Some(false));
+        }
+        Err(err) => return Err(err),
+    };
+    let probe_slot = roots.publish(&[probe]);
+    // `wr in self.data`.  The probe carries no callback, and a weakref hashes
+    // and compares by its referent, so it finds the callback-carrying entry
+    // `add` stored.
+    match unsafe {
+        pyre_object::w_set_contains_checked(roots.get(data_slot), roots.get(probe_slot))
+    } {
+        Ok(found) => Ok(Some(found)),
+        // The probe hashes by its referent, so a metaclass `__hash__` that
+        // raises arrives here.  Recover that exception rather than declining:
+        // the protocol would build a second probe and run the same observable
+        // `__hash__` again before raising, and the expression it stands in for
+        // runs it once.  `wr in self.data` is a set membership test, so the
+        // recovered error names a set element.
+        Err(_) => Err(crate::baseobjspace::take_pending_set_element_error(
+            roots.get(probe_slot),
+        )),
+    }
 }
 
 /// `app_abc.py SimpleWeakSet.add` — `self.data.add(ref(item, self._remove))`.
@@ -595,5 +723,9 @@ crate::py_module! {
         let simple_weak_set = crate::module_ns_get(ns, "SimpleWeakSet")
             .expect("_abc.SimpleWeakSet must be installed by appleveldefs");
         let _ = SIMPLE_WEAK_SET_TYPE.set(simple_weak_set as usize);
+        let installed = simple_weak_set_contains_identity();
+        if installed != (0, 0, 0) {
+            let _ = SIMPLE_WEAK_SET_CONTAINS.set(installed);
+        }
     },
 }
