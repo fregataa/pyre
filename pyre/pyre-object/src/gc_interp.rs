@@ -156,9 +156,10 @@ static COLLECT_STATE: AtomicU8 = AtomicU8::new(0);
 const POLL_INTERVAL: u32 = 1024;
 
 thread_local! {
-    /// Eligible dispatches since this thread last asked the collector; see
-    /// [`POLL_INTERVAL`]. Advanced only once the cheaper gates have passed, so
-    /// it paces the queries actually made rather than the dispatches seen.
+    /// Enabled dispatches since this thread last asked the collector; see
+    /// [`POLL_INTERVAL`]. The cached feature gates are the only work allowed
+    /// ahead of this counter, so it paces dispatches without first paying for
+    /// the collector query it exists to avoid.
     /// Thread-local rather than atomic because the query it paces is itself
     /// per-thread, and a `fetch_add` on every dispatch would cost about what it
     /// is here to avoid.
@@ -297,9 +298,11 @@ pub fn would_collect() -> bool {
 /// Dispatches to the installed threshold and collection hooks, neither a
 /// build-time constant, so the JIT residualizes the call instead of tracing
 /// into it (`@dont_look_inside`, the [`enabled`] sibling). A `()` return has no
-/// discriminant to erase and it cannot raise. On the cold interpreter dispatch
-/// loop its first act is already the non-inlined `enabled()` early-return; the
-/// residual adds no hot-path cost the un-residualized form did not already pay.
+/// discriminant to erase and it cannot raise. A dispatch with nothing pending
+/// reaches only the two request flags and the two cached feature switches
+/// before returning. The flags are read ahead of the switches on purpose — an
+/// explicit request has to be serviced even with the routing feature off,
+/// which is why [`note_eval_activation_exit`] tracks nesting unconditionally.
 #[majit_macros::dont_look_inside]
 pub fn safepoint() {
     // Take any request the old-gen allocator armed, and take it before the
@@ -320,14 +323,32 @@ pub fn safepoint() {
             return;
         }
     }
-    if !would_collect() {
+    // The request already carries the collector's threshold answer — it was
+    // armed by `external_malloc`'s equivalent in the allocator — so it does
+    // not wait for the poll interval. Recheck the semantic gates because
+    // `gc.disable()` or a callback activation may have appeared since the
+    // allocator armed it.
+    if requested {
+        if would_collect() {
+            crate::gc_hook::try_gc_collect_oldgen();
+        }
         return;
     }
-    // The request already carries the collector's answer — it was armed by
-    // `threshold_reached` in the allocator — so it does not wait for the poll
-    // interval. The poll remains for the allocations that reach the collector
-    // without passing the born-old path.
-    if requested || (poll_due() && crate::gc_hook::try_gc_major_threshold_reached()) {
+
+    // incminimark asks the comparatively expensive `gcflag_extra` / heap
+    // threshold questions from allocation, not from every interpreter
+    // dispatch. Pyre's dispatch safepoint is the safe stepping stone until
+    // the translated shadow-stack pass lets the allocator collect directly,
+    // but its polling interval must retain that shape: check the two cached
+    // feature switches, then spend the GC hook and activation queries only on
+    // the one dispatch that actually polls.
+    if !enabled() || !collect_enabled() || !poll_due() {
+        return;
+    }
+    if crate::gc_hook::try_gc_isenabled()
+        && at_outermost_activation()
+        && crate::gc_hook::try_gc_major_threshold_reached()
+    {
         crate::gc_hook::try_gc_collect_oldgen();
     }
 }

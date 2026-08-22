@@ -37,15 +37,46 @@ fn call_method(obj: PyObjectRef, name: &str, args: &[PyObjectRef]) -> PyResult {
     }
 }
 
-fn bytes_like(obj: PyObjectRef, function: &str) -> Result<Vec<u8>, PyError> {
+enum MarshalBytes {
+    Borrowed(&'static [u8]),
+    Owned(Vec<u8>),
+}
+
+impl MarshalBytes {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(bytes) => bytes,
+            Self::Owned(bytes) => bytes,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+}
+
+fn bytes_like(obj: PyObjectRef, function: &str) -> Result<MarshalBytes, PyError> {
     if unsafe { bytesobject::is_bytes_like(obj) } {
-        return Ok(unsafe { bytesobject::bytes_like_data(obj) }.to_vec());
+        return Ok(MarshalBytes::Borrowed(unsafe {
+            bytesobject::bytes_like_data(obj)
+        }));
+    }
+    if unsafe { memoryview::is_w_memoryview(obj) } {
+        unsafe { crate::builtins::memoryview_check_released(obj) }?;
+        crate::typedef::require_contiguous_buffer(obj)?;
+        let view = unsafe { memoryview::w_memoryview_view(obj) };
+        return Ok(match unsafe { view.as_contiguous_bytes() } {
+            Some(bytes) => MarshalBytes::Borrowed(bytes),
+            None => MarshalBytes::Owned(unsafe { view.gather() }),
+        });
     }
     // Any readable buffer is accepted (`interp_marshal` unwraps via
     // `space.readbuf_w`): `SourcelessFileLoader.get_code` hands `loads` a
     // sliced memoryview of the pyc payload.
     if let Some(src) = crate::typedef::buffer_as_bytes_like(obj)? {
-        return Ok(unsafe { bytesobject::bytes_like_data(src) }.to_vec());
+        return Ok(MarshalBytes::Owned(
+            unsafe { bytesobject::bytes_like_data(src) }.to_vec(),
+        ));
     }
     Err(PyError::type_error(format!(
         "{function}() argument must be a bytes-like object"
@@ -528,7 +559,7 @@ impl FileReader {
                 bytes.len()
             )));
         }
-        self.scratch.extend_from_slice(&bytes);
+        self.scratch.extend_from_slice(bytes.as_slice());
         Ok(())
     }
 
@@ -647,8 +678,13 @@ impl wire::MarshalBag for PyreMarshalBag {
     }
 
     fn make_interned_str(&self, value: &Wtf8) -> Rooted {
-        let value = Rooted::new(w_str_from_wtf8(value.to_owned()));
-        Rooted::new(unsafe { unicodeobject::intern_exact_str(value.get()) })
+        // The reader holds only the characters, so ask the intern table with
+        // them.  Building a `str` first and handing it to `intern_exact_str`
+        // would allocate a `malloc_typed`-immortal object per occurrence and
+        // abandon it whenever the value is already interned, retaining it for
+        // the process lifetime; interned names repeat heavily across a
+        // module's code objects, so nearly every occurrence is such a hit.
+        Rooted::new(unicodeobject::intern_wtf8_value(value))
     }
 
     fn make_bytes(&self, value: &[u8]) -> Rooted {
@@ -824,6 +860,15 @@ impl wire::MarshalBag for PyreMarshalBag {
     /// `make_code_with_constants`, which is what `read_code_consts` does for
     /// `code.replace(co_consts=...)`.
     fn code_constant_from_value(&self, value: &Rooted) -> Result<ConstantData, wire::MarshalError> {
+        // `unmarshal_pycode` hands its decoded constants straight to
+        // `PyCode.__init__`, whose `co_consts_w` is the only constants table
+        // upstream keeps. Serializing the child back into pyre's second,
+        // compiler-level table copies its whole body into a second permanent
+        // owner; `None` is the arm `is_wrapped_constant` always stores, so the
+        // already-decoded wrapper stays this slot's authority instead.
+        if unsafe { crate::pycode::is_code(value.get()) } {
+            return Ok(ConstantData::None);
+        }
         Ok(unsafe { crate::pycode::obj_to_constant_data(value.get()) }
             .unwrap_or(ConstantData::None))
     }
@@ -858,10 +903,18 @@ impl wire::MarshalBag for PyreMarshalBag {
 
     fn str_from_value(&self, value: &Rooted) -> Option<String> {
         let obj = value.get();
-        unsafe { unicodeobject::is_str(obj) }.then(|| {
-            unsafe { unicodeobject::w_str_get_wtf8(obj) }
+        if !unsafe { unicodeobject::is_str(obj) } {
+            return None;
+        }
+        // A code object's names are overwhelmingly ascii, and an ascii payload
+        // is one byte per code point, so the cached counts behind this
+        // accessor decide it carries no surrogate without reading the bytes.
+        // `to_string_lossy` has no such shortcut and rescans every name.
+        Some(match unsafe { unicodeobject::w_str_get_value_opt(obj) } {
+            Some(value) => value.to_owned(),
+            None => unsafe { unicodeobject::w_str_get_wtf8(obj) }
                 .to_string_lossy()
-                .into_owned()
+                .into_owned(),
         })
     }
 
@@ -1031,7 +1084,7 @@ crate::py_module! {
         ) -> Result<PyObjectRef, crate::PyError> {
             let allow_code = resolve_allow_code(allow_code)?;
             let data = bytes_like(data, "loads")?;
-            unmarshal_bytes(&data, allow_code)
+            unmarshal_bytes(data.as_slice(), allow_code)
         }
         // interp_marshal.py `dump(w_data, w_f, version=Py_MARSHAL_VERSION)`
         // — writes the stream `dumps` would return to `f.write`
@@ -1081,4 +1134,30 @@ crate::py_module! {
             Ok(result)
         }
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_bytes_are_borrowed_for_unmarshal() {
+        let input = bytesobject::w_bytes_from_bytes(b"payload");
+        let bytes = bytes_like(input, "loads").expect("bytes input");
+
+        assert!(matches!(bytes, MarshalBytes::Borrowed(b"payload")));
+    }
+
+    #[test]
+    fn decoded_code_constant_uses_the_wrapped_pycode_as_authority() {
+        let w_code = crate::pycode::w_code_new(std::ptr::null());
+        let rooted = Rooted::new(w_code);
+        let mut pending_error = None;
+        let bag = PyreMarshalBag::new(&mut pending_error);
+
+        let placeholder = wire::MarshalBag::code_constant_from_value(&bag, &rooted)
+            .expect("PyCode constant must be accepted");
+
+        assert!(matches!(placeholder, ConstantData::None));
+    }
 }

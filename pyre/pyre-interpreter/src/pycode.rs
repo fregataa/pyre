@@ -177,12 +177,15 @@ pub static CODE_TYPE: PyType = pyre_object::pyobject::new_pytype("code");
 
 /// Python code object wrapper.
 ///
-/// Stores an opaque pointer to the bytecode CodeObject. The pointer is
-/// `Box::into_raw`'d from a cloned CodeObject, so we own the allocation.
+/// Stores an opaque pointer to the bytecode CodeObject. A top-level body is
+/// `Box::into_raw`'d; a nested body points into that permanently-live owner,
+/// matching PyPy's one recursively-owned `co_consts_w` code graph without
+/// cloning the child graph at each wrapping boundary.
 #[repr(C)]
 pub struct PyCode {
     pub ob_header: PyObject,
-    /// Opaque pointer to a `CodeObject` (owned via Box::into_raw).
+    /// Opaque pointer to a permanently-live `CodeObject`. Top-level bodies are
+    /// owned via `Box::into_raw`; nested bodies borrow from one of those boxes.
     pub code_ptr: *const (),
     /// `pycode.py self.co_firstlineno = firstlineno`. RustPython's
     /// `CodeObject.first_line_number: Option<OneIndexed>` cannot represent
@@ -477,8 +480,9 @@ fn unregister_prebuilt_code_root(code: PyObjectRef) {
 }
 
 /// Trace every bootstrap/prebuilt code wrapper exactly as PyPy traces every
-/// live GC-managed `PyCode`. Nested code constants are handled by the raw
-/// walker's own mark-state analogue.
+/// live GC-managed `PyCode`. Every bootstrap wrapper is registered here, so
+/// the raw walker reports direct fields just like a GC trace callback; it does
+/// not need to recreate the collector's transitive mark walk.
 pub(crate) fn walk_prebuilt_code_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     let Some(roots) = PREBUILT_CODE_ROOTS.get() else {
         return;
@@ -576,8 +580,8 @@ pub fn _convert_const(_space: PyObjectRef, w_a: PyObjectRef) -> PyObjectRef {
 /// (interp_continuation.py:195)) construct via this entry point.
 ///
 /// # Safety
-/// `code_ptr` must be a valid pointer to a `CodeObject` obtained
-/// via `Box::into_raw`.
+/// `code_ptr` must be a valid pointer to a permanently-live `CodeObject`,
+/// either obtained via `Box::into_raw` or nested inside one such owner.
 ///
 /// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`): the body
 /// boxes the `PyCode` through the prebuilt allocator and its per-name cache
@@ -3107,6 +3111,19 @@ mod tests {
     }
 
     #[test]
+    fn box_code_object_preserves_owned_storage() {
+        let code = compile_exec("answer = 42\n").expect("compile failed");
+        let source_storage = code.source_path.as_ptr();
+        let instruction_storage = code.instructions.as_ptr();
+
+        let w_code = box_code_object(code);
+        let stored = unsafe { &*(w_code_get_ptr(w_code) as *const crate::CodeObject) };
+
+        assert_eq!(stored.source_path.as_ptr(), source_storage);
+        assert_eq!(stored.instructions.as_ptr(), instruction_storage);
+    }
+
+    #[test]
     fn w_code_const_shares_large_integer_and_root_walker_visits_slot() {
         let code =
             compile_exec("x = 123456789012345678901234567890123456789012345678901234567890\n")
@@ -3207,7 +3224,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_code_root_walker_recurses_through_nested_code_constants() {
+    fn raw_code_root_walker_reports_one_gc_edge_at_a_time() {
         let code = compile_exec(
             "def outer():\n\
              \x20   def inner():\n\
@@ -3249,17 +3266,37 @@ mod tests {
         let w_outer = unsafe { w_code_const(w_top, outer_idx) };
         let w_inner = unsafe { w_code_const(w_outer, inner_idx) };
         let w_bigint = unsafe { w_code_const(w_inner, bigint_idx) };
-        let mut visited = false;
+        let mut top_reaches_outer = false;
+        let mut top_reaches_deep_value = false;
         unsafe {
             crate::eval::walk_raw_code_roots(w_top, &mut |root| {
+                if root.0 == w_outer as usize {
+                    top_reaches_outer = true;
+                }
                 if root.0 == w_bigint as usize {
-                    visited = true;
+                    top_reaches_deep_value = true;
                 }
             });
         }
         assert!(
-            visited,
-            "an outer PyCode root must trace realized constants in nested PyCode wrappers"
+            top_reaches_outer,
+            "a PyCode trace must report its directly-held child code"
+        );
+        assert!(
+            !top_reaches_deep_value,
+            "a GC trace callback must leave transitive traversal to the mark worklist"
+        );
+        let mut inner_reaches_bigint = false;
+        unsafe {
+            crate::eval::walk_raw_code_roots(w_inner, &mut |root| {
+                if root.0 == w_bigint as usize {
+                    inner_reaches_bigint = true;
+                }
+            });
+        }
+        assert!(
+            inner_reaches_bigint,
+            "the nested object's direct edge was lost"
         );
     }
 

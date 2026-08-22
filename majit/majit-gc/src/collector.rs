@@ -755,7 +755,11 @@ impl RootSet {
             self.roots.pop();
             return;
         }
-        if let Some(pos) = self.roots.iter().position(|r| *r == root) {
+        // `shadowstack.py` has no by-value removal: `push_stack`/`pop_stack`
+        // move one `root_stack_top`, so the newest registration is the one
+        // retired.  Either copy leaves the same roots here, but taking the
+        // front one breaks that shape and rescans on every following removal.
+        if let Some(pos) = self.roots.iter().rposition(|r| *r == root) {
             self.roots.swap_remove(pos);
         }
     }
@@ -7681,6 +7685,28 @@ mod tests {
         roots.remove(a);
         assert_eq!(roots.roots, vec![b]);
         roots.remove(b);
+        assert!(roots.is_empty());
+    }
+
+    #[test]
+    fn root_set_out_of_order_remove_prefers_the_newest_duplicate() {
+        let mut roots = RootSet::new();
+        let mut a = GcRef(1);
+        let mut b = GcRef(2);
+        let (a, b) = (&mut a as *mut GcRef, &mut b as *mut GcRef);
+        unsafe {
+            roots.add(a);
+            roots.add(b);
+            roots.add(a);
+            roots.add(b);
+        }
+
+        roots.remove(a);
+        assert_eq!(roots.roots, vec![a, b, b]);
+        roots.remove(b);
+        assert_eq!(roots.roots, vec![a, b]);
+        roots.remove(b);
+        roots.remove(a);
         assert!(roots.is_empty());
     }
 
