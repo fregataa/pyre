@@ -2515,6 +2515,21 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
         )
 
         print(f"=== extracting {crate} -> {dest} ===")
+        # Skip used `include_closure=False`. The window check below compares
+        # closure=/external= from before Charon to after; a placeholder
+        # `closure=-` against the real digest would look like the tree moved.
+        stamp = stamp_for(
+            eng,
+            crate=crate,
+            platform_key=platform_key,
+            charon_stamp=charon_stamp,
+            cargo_features=cargo_features,
+            flags=flags,
+            charon_flags=charon_flags,
+            layout_targets=crate_layout_targets(eng, spec),
+            layout_flags=layout_flags,
+            artefacts=artefacts_fingerprint(eng, spec, dest_dir),
+        )
         # Once the fingerprint skip above is past, the artefact is known
         # absent or stale and must be (re)generated, so this unit must reach
         # rustc whatever cargo's cache says; see `invalidate_cargo_unit`.
