@@ -9967,6 +9967,140 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
+/// Shared `I`/`R`/`d` tail of the canonical cond/record layouts
+/// (`iiIRd` / `riIRd` after the leading value + funcptr registers).
+fn read_cond_record_ir_tail<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Result<(Vec<OpRef>, Vec<Type>, DescrRef, usize), DispatchError> {
+    let (i_args, i_width) = read_int_var_list(code, op, 2, ctx)?;
+    let (r_args, r_width) = read_ref_var_list(code, op, 2 + i_width, ctx)?;
+    let descr_offset = 2 + i_width + r_width;
+    let descr = read_descr(code, op, descr_offset, ctx)?;
+    let mut argboxes: Vec<OpRef> = Vec::with_capacity(i_args.len() + r_args.len());
+    let mut argbox_types: Vec<Type> = Vec::with_capacity(i_args.len() + r_args.len());
+    argboxes.extend_from_slice(&i_args);
+    argbox_types.extend(std::iter::repeat(Type::Int).take(i_args.len()));
+    argboxes.extend_from_slice(&r_args);
+    argbox_types.extend(std::iter::repeat(Type::Ref).take(r_args.len()));
+    Ok((argboxes, argbox_types, descr, descr_offset))
+}
+
+fn cond_record_call_descr<'a>(
+    descr: &'a DescrRef,
+    code: &[u8],
+    op: &DecodedOp,
+    descr_offset: usize,
+) -> Result<&'a dyn majit_ir::CallDescr, DispatchError> {
+    descr
+        .as_call_descr()
+        .ok_or(DispatchError::ResidualCallDescrNotCallDescr {
+            pc: op.pc,
+            descr_index: decode_descr_index(code, op, descr_offset),
+        })
+}
+
+fn cond_record_concrete_args<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    allboxes: &[OpRef],
+) -> Option<Vec<i64>> {
+    let mut concrete_args = Vec::with_capacity(allboxes.len().saturating_sub(2));
+    for boxref in allboxes.iter().skip(2) {
+        match ctx.trace_ctx.box_value(*boxref) {
+            Some(majit_ir::Value::Int(n)) => concrete_args.push(n),
+            Some(majit_ir::Value::Ref(majit_ir::GcRef(p))) => concrete_args.push(p as i64),
+            _ => return None,
+        }
+    }
+    Some(concrete_args)
+}
+
+fn cond_record_arg_values<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    allboxes: &[OpRef],
+) -> Option<Vec<majit_ir::Value>> {
+    let mut values = Vec::with_capacity(allboxes.len());
+    for &boxref in allboxes {
+        values.push(ctx.trace_ctx.box_value(boxref)?);
+    }
+    Some(values)
+}
+
+fn cond_record_pure_result(concrete: ConcreteValue) -> Option<majit_ir::Value> {
+    match concrete {
+        ConcreteValue::Int(n) => Some(majit_ir::Value::Int(n)),
+        ConcreteValue::Ref(p) => Some(majit_ir::Value::Ref(majit_ir::GcRef(p as usize))),
+        ConcreteValue::Null => None,
+        _ => None,
+    }
+}
+
+/// `MIFrame.execute_varargs` exception bookkeeping after a recorded
+/// `COND_CALL` / `COND_CALL_VALUE`. Consumes `BH_LAST_EXC_VALUE` the way
+/// `try_execute_residual_call_via_executor` does, then emits
+/// `GUARD_EXCEPTION` + `SubRaise` or `GUARD_NO_EXCEPTION`.
+fn cond_record_handle_exception<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    ei: &majit_ir::descr::EffectInfo,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    let can_raise = ei.check_can_raise(false);
+    let bh_exc = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| {
+        let v = c.get();
+        c.set(0);
+        v
+    });
+    if bh_exc != 0 {
+        let bh_exc_box = ctx.trace_ctx.const_ref(bh_exc);
+        ctx.set_last_exc_value(
+            bh_exc_box,
+            ConcreteValue::Ref(bh_exc as usize as pyre_object::PyObjectRef),
+        );
+        ctx.fbw_mode.class_of_last_exc_is_const = false;
+        if let Some(cb) = crate::callbacks::try_get() {
+            (cb.drain_backend_jit_exc)();
+        }
+        debug_assert!(
+            can_raise,
+            "conditional_call helper raised on a !can_raise EffectInfo"
+        );
+        if can_raise {
+            walker_record_guard_exception(ctx, op.pc);
+            let exc = ctx
+                .last_exc_value()
+                .expect("cond_record_handle_exception seeded last_exc_value");
+            let exc_concrete = ctx.last_exc_value_concrete();
+            return Ok(Some((
+                DispatchOutcome::SubRaise { exc, exc_concrete },
+                op.next_pc,
+            )));
+        }
+    } else if can_raise {
+        ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    }
+    Ok(None)
+}
+
+fn concrete_from_box_value(value: Option<majit_ir::Value>) -> ConcreteValue {
+    match value {
+        Some(majit_ir::Value::Int(n)) => ConcreteValue::Int(n),
+        Some(majit_ir::Value::Ref(majit_ir::GcRef(p))) => {
+            ConcreteValue::Ref(p as pyre_object::PyObjectRef)
+        }
+        _ => ConcreteValue::Null,
+    }
+}
+
+fn concrete_ref_is_null(value: ConcreteValue) -> bool {
+    match value {
+        ConcreteValue::Null => true,
+        ConcreteValue::Ref(p) => p.is_null() || p == pyre_object::PY_NULL,
+        _ => false,
+    }
+}
+
 /// `pyjitpl.py opimpl_conditional_call_ir_v` / `do_conditional_call`.
 ///
 /// Operand layout `iiIRd`: condition, funcptr, I-list, R-list, descr.
@@ -9979,16 +10113,8 @@ pub(crate) fn dispatch_conditional_call_ir_v<Sym: WalkSym>(
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let cond = read_int_reg(code, op, 0, ctx)?;
     let funcptr = read_int_reg(code, op, 1, ctx)?;
-    let (i_args, i_width) = read_int_var_list(code, op, 2, ctx)?;
-    let (r_args, r_width) = read_ref_var_list(code, op, 2 + i_width, ctx)?;
-    let descr_offset = 2 + i_width + r_width;
-    let descr = read_descr(code, op, descr_offset, ctx)?;
-    let call_descr = descr
-        .as_call_descr()
-        .ok_or(DispatchError::ResidualCallDescrNotCallDescr {
-            pc: op.pc,
-            descr_index: decode_descr_index(code, op, descr_offset),
-        })?;
+    let (argboxes, argbox_types, descr, descr_offset) = read_cond_record_ir_tail(code, op, ctx)?;
+    let call_descr = cond_record_call_descr(&descr, code, op, descr_offset)?;
     // pyjitpl.py `opimpl_conditional_call_ir_v`: ConstInt(0) returns without recording.
     if cond.is_constant() {
         let zero = matches!(ctx.trace_ctx.box_value(cond), Some(majit_ir::Value::Int(0)));
@@ -9996,12 +10122,6 @@ pub(crate) fn dispatch_conditional_call_ir_v<Sym: WalkSym>(
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
     }
-    let mut argboxes: Vec<OpRef> = Vec::with_capacity(i_args.len() + r_args.len());
-    let mut argbox_types: Vec<Type> = Vec::with_capacity(i_args.len() + r_args.len());
-    argboxes.extend_from_slice(&i_args);
-    argbox_types.extend(std::iter::repeat(Type::Int).take(i_args.len()));
-    argboxes.extend_from_slice(&r_args);
-    argbox_types.extend(std::iter::repeat(Type::Ref).take(r_args.len()));
     let allboxes = build_allboxes(
         funcptr,
         &argboxes,
@@ -10009,10 +10129,9 @@ pub(crate) fn dispatch_conditional_call_ir_v<Sym: WalkSym>(
         call_descr.arg_types(),
         Some(cond),
     );
+    let ei = call_descr.get_extra_info().clone();
     assert!(
-        !call_descr
-            .get_extra_info()
-            .check_forces_virtual_or_virtualizable(),
+        !ei.check_forces_virtual_or_virtualizable(),
         "conditional_call target must not force virtualizable"
     );
     ctx.trace_ctx
@@ -10024,6 +10143,11 @@ pub(crate) fn dispatch_conditional_call_ir_v<Sym: WalkSym>(
     let _recorded = ctx
         .trace_ctx
         .record_op_with_descr(OpCode::CondCallN, &allboxes, descr);
+    // `_record_helper_varargs` runs `heapcache.invalidate_caches_varargs`
+    // before it appends. `record_op_with_descr` does not, so do it here
+    // the same way residual_call does.
+    ctx.trace_ctx
+        .heapcache_invalidate_caches_varargs(OpCode::CondCallN, Some(&ei), &allboxes);
     let cond_true = match ctx.trace_ctx.box_value(cond) {
         Some(majit_ir::Value::Int(n)) => n != 0,
         _ => match read_int_reg_concrete(code, op, 0, ctx) {
@@ -10032,19 +10156,235 @@ pub(crate) fn dispatch_conditional_call_ir_v<Sym: WalkSym>(
             _ => false,
         },
     };
-    if cond_true {
-        let Some(majit_ir::Value::Int(func_addr)) = ctx.trace_ctx.box_value(funcptr) else {
-            return Ok((DispatchOutcome::Continue, op.next_pc));
-        };
-        let mut concrete_args = Vec::with_capacity(allboxes.len().saturating_sub(2));
-        for boxref in allboxes.iter().skip(2) {
-            match ctx.trace_ctx.box_value(*boxref) {
-                Some(majit_ir::Value::Int(n)) => concrete_args.push(n),
-                Some(majit_ir::Value::Ref(majit_ir::GcRef(p))) => concrete_args.push(p as i64),
-                _ => return Ok((DispatchOutcome::Continue, op.next_pc)),
-            }
+    ctx.clear_last_exc_value();
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    if cond_true && ctx.is_authoritative_executor {
+        if let Some(majit_ir::Value::Int(func_addr)) = ctx.trace_ctx.box_value(funcptr)
+            && func_addr != 0
+            && !majit_translate::codewriter::call::is_symbolic_fnaddr(func_addr)
+            && let Some(concrete_args) = cond_record_concrete_args(ctx, &allboxes)
+        {
+            majit_metainterp::call_void_function(func_addr as *const (), &concrete_args);
         }
-        majit_metainterp::call_void_function(func_addr as *const (), &concrete_args);
+    }
+    if let Some(out) = cond_record_handle_exception(ctx, op, &ei)? {
+        return Ok(out);
     }
     Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
+/// `pyjitpl.py _opimpl_conditional_call_value` / `do_conditional_call(is_value=True)`.
+///
+/// `iiIRd>i`: value, funcptr, I-list, R-list, descr, dst.
+fn dispatch_conditional_call_value_ir<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    first: OpRef,
+    opcode: OpCode,
+    dst_bank: char,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let funcptr = read_int_reg(code, op, 1, ctx)?;
+    let (argboxes, argbox_types, descr, descr_offset) = read_cond_record_ir_tail(code, op, ctx)?;
+    let call_descr = cond_record_call_descr(&descr, code, op, descr_offset)?;
+    let dst = code[op.pc + 1 + descr_offset + 2] as usize;
+    // `_opimpl_conditional_call_value`: Const nonnull returns the value
+    // box without recording, so the heapcache can keep args virtual.
+    if first.is_constant() {
+        let nonnull = match ctx.trace_ctx.box_value(first) {
+            Some(majit_ir::Value::Int(n)) => n != 0,
+            Some(majit_ir::Value::Ref(majit_ir::GcRef(p))) => p != 0,
+            _ => false,
+        };
+        if nonnull {
+            let concrete = concrete_from_box_value(ctx.trace_ctx.box_value(first));
+            match dst_bank {
+                'i' => write_int_reg(ctx, op.pc, dst, first, concrete)?,
+                'r' => write_ref_reg(ctx, op.pc, dst, first, concrete)?,
+                _ => unreachable!("cond_call_value dst bank is i or r"),
+            }
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
+    }
+    let allboxes = build_allboxes(
+        funcptr,
+        &argboxes,
+        &argbox_types,
+        call_descr.arg_types(),
+        Some(first),
+    );
+    let ei = call_descr.get_extra_info().clone();
+    assert!(
+        !ei.check_forces_virtual_or_virtualizable(),
+        "conditional_call_value target must not force virtualizable"
+    );
+    ctx.trace_ctx
+        .profiler()
+        .count_ops(opcode, majit_metainterp::counters::OPS);
+    ctx.trace_ctx
+        .profiler()
+        .count_ops(opcode, majit_metainterp::counters::RECORDED_OPS);
+    // `do_conditional_call(is_value=True)` → `execute_varargs(..., pure=True)`:
+    // snapshot the recorder so `record_result_of_call_pure` can cut an
+    // all-constant COND_CALL_VALUE back out.
+    let patch_pos = ctx.trace_ctx.get_trace_position();
+    let descr_for_pure = descr.clone();
+    let recorded = ctx.trace_ctx.record_op_with_descr(opcode, &allboxes, descr);
+    ctx.trace_ctx
+        .heapcache_invalidate_caches_varargs(opcode, Some(&ei), &allboxes);
+    let should_call = match ctx.trace_ctx.box_value(first) {
+        Some(majit_ir::Value::Int(n)) => n == 0,
+        Some(majit_ir::Value::Ref(majit_ir::GcRef(p))) => p == 0,
+        _ => match dst_bank {
+            'i' => matches!(
+                read_int_reg_concrete(code, op, 0, ctx),
+                ConcreteValue::Int(0)
+            ),
+            'r' => concrete_ref_is_null(read_ref_reg_concrete(code, op, 0, ctx)),
+            _ => false,
+        },
+    };
+    ctx.clear_last_exc_value();
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    let (result, concrete) = if should_call && ctx.is_authoritative_executor {
+        if let Some(majit_ir::Value::Int(func_addr)) = ctx.trace_ctx.box_value(funcptr)
+            && func_addr != 0
+            && !majit_translate::codewriter::call::is_symbolic_fnaddr(func_addr)
+            && let Some(concrete_args) = cond_record_concrete_args(ctx, &allboxes)
+        {
+            match dst_bank {
+                'i' => {
+                    let n =
+                        majit_metainterp::call_int_function(func_addr as *const (), &concrete_args);
+                    (recorded, ConcreteValue::Int(n))
+                }
+                'r' => {
+                    let p =
+                        majit_metainterp::call_ref_function(func_addr as *const (), &concrete_args);
+                    (
+                        recorded,
+                        ConcreteValue::Ref(p as usize as pyre_object::PyObjectRef),
+                    )
+                }
+                _ => (recorded, ConcreteValue::Null),
+            }
+        } else {
+            (recorded, ConcreteValue::Null)
+        }
+    } else if should_call {
+        (recorded, ConcreteValue::Null)
+    } else {
+        (
+            first,
+            concrete_from_box_value(ctx.trace_ctx.box_value(first)),
+        )
+    };
+    // `execute_varargs(..., pure=True)` then `record_result_of_call_pure`.
+    // Skip when the walk had no concrete result (non-authoritative /
+    // symbolic target): folding a Null would invent a constant.
+    // Also skip when the helper raised (`not last_exc_value`).
+    let raised = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get()) != 0;
+    let result = if raised {
+        result
+    } else {
+        match cond_record_pure_result(concrete) {
+            Some(result_value) => {
+                if let Some(arg_values) = cond_record_arg_values(ctx, &allboxes) {
+                    ctx.trace_ctx.record_result_of_call_pure(
+                        recorded,
+                        &allboxes,
+                        &arg_values,
+                        descr_for_pure,
+                        patch_pos,
+                        opcode,
+                        result_value,
+                    )
+                } else {
+                    result
+                }
+            }
+            None => result,
+        }
+    };
+    match dst_bank {
+        'i' => write_int_reg(ctx, op.pc, dst, result, concrete)?,
+        'r' => write_ref_reg(ctx, op.pc, dst, result, concrete)?,
+        _ => unreachable!("cond_call_value dst bank is i or r"),
+    }
+    if let Some(out) = cond_record_handle_exception(ctx, op, &ei)? {
+        return Ok(out);
+    }
+    Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
+pub(crate) fn dispatch_conditional_call_value_ir_i<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_, Sym>,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let first = read_int_reg(code, op, 0, ctx)?;
+    dispatch_conditional_call_value_ir(code, op, ctx, first, OpCode::CondCallValueI, 'i')
+}
+
+pub(crate) fn dispatch_conditional_call_value_ir_r<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_, Sym>,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let first = read_ref_reg(code, op, 0, ctx)?;
+    dispatch_conditional_call_value_ir(code, op, ctx, first, OpCode::CondCallValueR, 'r')
+}
+
+/// `pyjitpl.py opimpl_record_known_result_i_ir_v` / `blackhole.py
+/// bhimpl_record_known_result_{i,r}_ir_v`. Record only; the body is `pass`.
+fn dispatch_record_known_result_ir<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    first: OpRef,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let funcptr = read_int_reg(code, op, 1, ctx)?;
+    let (argboxes, argbox_types, descr, descr_offset) = read_cond_record_ir_tail(code, op, ctx)?;
+    let call_descr = cond_record_call_descr(&descr, code, op, descr_offset)?;
+    let allboxes = build_allboxes(
+        funcptr,
+        &argboxes,
+        &argbox_types,
+        call_descr.arg_types(),
+        Some(first),
+    );
+    let ei = call_descr.get_extra_info().clone();
+    // `opimpl_record_known_result_i_ir_v` records via
+    // `_record_helper_varargs` and increments only RECORDED_OPS.
+    ctx.trace_ctx.profiler().count_ops(
+        OpCode::RecordKnownResult,
+        majit_metainterp::counters::RECORDED_OPS,
+    );
+    let _recorded = ctx
+        .trace_ctx
+        .record_op_with_descr(OpCode::RecordKnownResult, &allboxes, descr);
+    ctx.trace_ctx.heapcache_invalidate_caches_varargs(
+        OpCode::RecordKnownResult,
+        Some(&ei),
+        &allboxes,
+    );
+    Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
+pub(crate) fn dispatch_record_known_result_i_ir_v<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_, Sym>,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let first = read_int_reg(code, op, 0, ctx)?;
+    dispatch_record_known_result_ir(code, op, ctx, first)
+}
+
+pub(crate) fn dispatch_record_known_result_r_ir_v<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_, Sym>,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let first = read_ref_reg(code, op, 0, ctx)?;
+    dispatch_record_known_result_ir(code, op, ctx, first)
 }
