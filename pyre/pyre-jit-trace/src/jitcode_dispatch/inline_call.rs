@@ -6106,13 +6106,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // the guard failed forever while the code object it stands for is
         // loop-invariant.
         //
-        // Keep GETFIELD+GUARD_VALUE even on a ConstPtr callable. The
-        // `code?` marker matches `function.py getcode()` but is the
-        // Linux `test_uuid` SIGSEGV with the marker restored: after
-        // `test_UUID` warms the JIT, `jit_bigint_int_eq` still sees a
-        // small int as `*const BigInt` even when GuardClass(LONG) is
-        // recorded. The live field read stays until that residual is
-        // sound under the marker on every backend.
+        // Keep GETFIELD+GUARD_VALUE even on a ConstPtr callable.
+        // `code?` matches `function.py getcode()` but Linux `test_uuid`
+        // SIGSEGV's with the marker: after `test_UUID` warms the JIT,
+        // `jit_bigint_int_eq` treats a small int as `*const BigInt`.
+        // Comparing known class before skipping GuardClass was not
+        // enough; the live field read stays.
         walker_guard_function_field(
             ctx,
             op.pc,
