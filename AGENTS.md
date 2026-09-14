@@ -53,7 +53,7 @@ constant.
 
 The annotator/rtyper prepass and the `PYRE_RTYPER_VERBOSE` census read
 **pre-extracted `.ullbc` under `build/llbc/`, not the Rust source**. A change to
-`pyre-interpreter` / `pyre-object` / `pyre-jit` is invisible until re-extraction;
+`pyre-interpreter` / `pyre-object` / `pyre-module` / `pyre-jit` is invisible until re-extraction;
 `majit-translate` changes take effect immediately, because the translator runs
 live over the frozen bodies.
 
@@ -63,7 +63,7 @@ does not mean it is missing.
 
 ```bash
 python3 scripts/install-charon.py    # idempotent, usually a no-op
-python3 scripts/extract-llbc.py      # pyre-object pyre-interpreter pyre-jit
+python3 scripts/extract-llbc.py      # pyre-object pyre-interpreter pyre-module pyre-jit
 touch pyre/pyre-jit-trace/build.rs
 PYRE_RTYPER_VERBOSE=1 cargo build --release -p pyre-jit-trace   # runs the prepass
 # census: target/release/build/pyre-jit-trace-*/stderr, rg -c 'PREPASS phaseA fail'

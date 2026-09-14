@@ -498,6 +498,17 @@ static SYS_PATH_0_PENDING: LazyLock<Mutex<Option<std::ffi::OsString>>> =
 pub(crate) static BUILTIN_MODULES: LazyLock<Mutex<HashMap<&'static str, BuiltinModuleDef>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Optional modules live in `pyre-module` so this crate does not depend on
+/// them. The final binary links both and installs the hook before
+/// [`install_builtin_modules`].
+static OPTIONAL_BUILTIN_MODULES: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Install the `pyre-module` registry. Call once from the binary before
+/// [`init_sys_path`] / [`install_builtin_modules`].
+pub fn set_optional_builtin_modules(install: fn()) {
+    let _ = OPTIONAL_BUILTIN_MODULES.set(install);
+}
+
 thread_local! {
     static IMPORT_ROOT_AREA: ImportRootArea = ImportRootArea {
         argv_pending: SYS_ARGV_PENDING.with(|p| p as *const _),
@@ -678,11 +689,6 @@ pub fn install_builtin_modules() {
     // COM and is therefore present only on an unsandboxed Windows host.
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     pyre_install_module!(_wmi);
-    // `_uuidmodule.c` is built from rpcrt4 on Windows and libuuid elsewhere;
-    // only the Windows half is ported, and it reads the host's network card,
-    // so it belongs with the other host-access modules.
-    #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-    pyre_install_module!(_uuid);
     // PyPy's `lib_pypy/_overlapped.py`: asyncio's proactor backend owns one
     // OVERLAPPED record per operation and reaches the Win32/WinSock calls
     // through this Windows-only builtin.
@@ -703,6 +709,7 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_abc);
     pyre_install_module!(_bisect);
     pyre_install_module!(_heapq);
+
     // Frozen importlib imports `_stat` while bootstrapping a sandbox that
     // deliberately mounts no stdlib files, so it must stay a builtin.
     pyre_install_module!(_stat);
@@ -789,8 +796,7 @@ pub fn install_builtin_modules() {
         // and take a fallback when it is missing.
         #[cfg(all(unix, feature = "host_env"))]
         pyre_install_module!(pwd);
-        #[cfg(all(unix, feature = "host_env"))]
-        pyre_install_module!(grp);
+
         // `host_env` as well as `unix`: both are wholly gated on that pair, so
         // without it `sys.builtin_module_names` would advertise a module whose
         // every call raises.
@@ -798,8 +804,6 @@ pub fn install_builtin_modules() {
         pyre_install_module!(resource);
         #[cfg(all(unix, feature = "host_env"))]
         pyre_install_module!(fcntl);
-        #[cfg(unix)]
-        pyre_install_module!(syslog);
         pyre_install_module!(select);
         #[cfg(unix)]
         pyre_install_module!(termios);
@@ -829,8 +833,6 @@ pub fn install_builtin_modules() {
         // probes such as `test_audit`'s `import_module("_posixsubprocess")`
         // from skip to run.
         #[cfg(unix)]
-        pyre_install_module!(_posixshmem);
-        #[cfg(unix)]
         pyre_install_module!(_posixsubprocess);
         pyre_install_module!(_multiprocessing);
     }
@@ -848,7 +850,6 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_typing);
     pyre_install_module!(_template);
     pyre_install_module!(_hashlib);
-    pyre_install_module!(_blake2);
     pyre_install_module!(gc);
     pyre_install_module!(unicodedata);
     pyre_install_module!(pyexpat);
@@ -884,6 +885,9 @@ pub fn install_builtin_modules() {
     // `_init_non_posix` and never names this module.
     #[cfg(not(windows))]
     register_builtin_module("_sysconfigdata", init_sysconfigdata);
+    if let Some(install) = OPTIONAL_BUILTIN_MODULES.get() {
+        install();
+    }
 }
 
 fn require_string_module_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
