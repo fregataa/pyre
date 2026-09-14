@@ -157,6 +157,7 @@ pub mod recorder;
 pub mod resoperation;
 pub mod resume;
 pub mod resume_box_reader;
+pub mod rjitlog;
 // The rule DSL is an offline generator: `real.rules` is compiled to the
 // checked-in `optimizeopt/autogenintrules.rs`, so nothing in a normal build
 // calls the parser, prover or codegen. It is a file-for-file port of
@@ -392,8 +393,8 @@ pub mod loop_census {
     ///
     /// *kind* is which compile arm minted it, because `loops_compiled` counts
     /// all of them alike and they are not all loops: `finish_and_compile`
-    /// attaches a root trace that ends in FINISH with no LABEL, and says so in
-    /// its own comment. A census that hid the arm would reproduce exactly the
+    /// attaches a FINISH-only entry bridge, and says so in its own comment.
+    /// A census that hid the arm would reproduce exactly the
     /// conflation it exists to undo, so the arm is part of the line and the
     /// reader decides what a given fixture is entitled to.
     ///
