@@ -297,6 +297,13 @@ pub fn skip_python_trivia_forward(code: &pyre_interpreter::CodeObject, mut py_pc
 /// a fold reached only from another fold — the outer fold whose `fired` count
 /// already contains it.
 ///
+/// `site` names every `jitcode_dispatch` file whose `spec_gate` call sites
+/// drive this row, without the `.rs`; a row gated from more than one file
+/// joins them with `,` (no space — the census prints the column as the value
+/// of a `site=` field on a space-separated line).  It is a reader's pointer
+/// to where the gate lives, not something the census parses: `check.py`'s
+/// `SPEC_CENSUS_FOLD_RE` reads only `fold=` and `fired=`.
+///
 /// Declared beside the counters so that a fold added next to an existing gated
 /// one is hard to leave unnamed.  It is NOT a complete census, and cannot
 /// become one by adding rows: this table names a fold by its function, and
@@ -368,11 +375,11 @@ spec_folds! {
     // variant                    label                       site             parent
     TruthInt             => ("truth_int",                "residual_call", "-"),
     TruthBool            => ("truth_bool",               "residual_call", "-"),
-    UnaryPositiveInt     => ("unary_positive_int",       "residual_call", "-"),
-    UnaryPositiveDescent => ("unary_positive_descent",   "residual_call", "-"),
-    UnaryInvertDescent   => ("unary_invert_descent",     "residual_call", "-"),
-    UnaryNegativeDescent => ("unary_negative_descent",   "residual_call", "-"),
-    UnaryNegativeInt     => ("unary_negative_int",       "residual_call", "-"),
+    NewboolCall          => ("newbool_call",             "residual_call", "-"),
+    UnaryNot             => ("unary_not",                "residual_call", "-"),
+    UnaryNeg             => ("unary_neg",                "residual_call,inline_call", "-"),
+    BinaryOpDescent      => ("binary_op_descent",        "residual_call,inline_call", "-"),
+    CompareOpDescent     => ("compare_op_descent",       "residual_call", "-"),
     StoreSubscr          => ("store_subscr",             "residual_call", "-"),
     Setslice             => ("setslice",                 "residual_call", "-"),
     GetIter              => ("get_iter",                 "residual_call", "-"),
@@ -382,7 +389,7 @@ spec_folds! {
     Newtuple             => ("newtuple",                 "residual_call", "-"),
     NewtupleObject       => ("newtuple_object",          "residual_call", "-"),
     Newlist              => ("newlist",                  "residual_call", "-"),
-    BuiltinLen           => ("builtin_len",              "residual_call", "-"),
+    BuiltinLenDescent    => ("builtin_len_descent",      "inline_call",   "-"),
     BuiltinIsinstance    => ("builtin_isinstance",       "residual_call", "-"),
     BuiltinDictGet       => ("builtin_dict_get",         "residual_call", "-"),
     BuiltinTypeGetattr   => ("builtin_type_getattr",     "residual_call", "-"),
@@ -410,6 +417,7 @@ spec_folds! {
     FloatCall            => ("float_call",               "residual_call", "-"),
     StrCall              => ("str_call",                 "residual_call", "-"),
     FormatSimple         => ("format_simple",            "residual_call", "-"),
+    FormatWithSpec       => ("format_with_spec",         "residual_call", "-"),
     StrStartswith        => ("str_startswith",           "residual_call", "-"),
     StrEndswith          => ("str_endswith",             "residual_call", "-"),
     ImportCached         => ("import_cached",            "residual_call", "-"),
@@ -426,15 +434,15 @@ spec_folds! {
     LoadMethodAttr       => ("load_method_attr",         "residual_call", "-"),
     LoadClassmethodAttr  => ("load_classmethod_attr",    "residual_call", "-"),
     LoadBoundMethodAttr  => ("load_bound_method_attr",   "residual_call", "-"),
-    Subscr               => ("subscr",                   "residual_call", "-"),
-    BinaryOpInt          => ("binary_op_int",            "residual_call", "-"),
+    Subscr               => ("subscr",                   "residual_call,inline_call", "-"),
     BinaryOpLongInt      => ("binary_op_long_int",       "residual_call", "-"),
     BinaryOpLongIntShift => ("binary_op_long_int_shift", "residual_call", "-"),
     BinaryOpLongIntDiv   => ("binary_op_long_int_div",   "residual_call", "-"),
+    BinaryOpIntZeroDiv   => ("binary_op_int_zero_div",   "residual_call,inline_call", "-"),
     BinaryOpLongIntPow   => ("binary_op_long_int_pow",   "residual_call", "-"),
     BinaryOpLong         => ("binary_op_long",           "residual_call", "-"),
     TruedivOpLong        => ("truediv_op_long",          "residual_call", "-"),
-    BinaryOpFloat        => ("binary_op_float",          "residual_call", "-"),
+    BinaryOpFloat        => ("binary_op_float",          "residual_call,inline_call", "-"),
     BinaryOpStr          => ("binary_op_str",            "residual_call", "-"),
     CompareOpInt         => ("compare_op_int",           "residual_call", "-"),
     CompareOpLongInt     => ("compare_op_long_int",      "residual_call", "-"),
@@ -844,8 +852,10 @@ pub fn spec_census_summary() -> String {
     } else {
         spec_suppress_unknown().join(",")
     };
+    let (direct_resume, call_replay) = super::inline_call::subwalk_resume_counts();
+    let heap_clones = super::inline_call::subwalk_heap_clone_count();
     let mut summary = format!(
-        "[spec-census] folds={} consulted_total={consulted_total} fired_total={fired_total} suppressed_total={suppressed_total} suppressed_names={suppressed_names} suppress_unknown={suppress_unknown}\n",
+        "[spec-census] folds={} consulted_total={consulted_total} fired_total={fired_total} suppressed_total={suppressed_total} suppressed_names={suppressed_names} suppress_unknown={suppress_unknown} subwalk_direct_resume={direct_resume} subwalk_call_replay={call_replay} subwalk_heap_clones={heap_clones}\n",
         rows.len(),
     );
     summary.push_str(&format!(

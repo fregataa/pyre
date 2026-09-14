@@ -5669,8 +5669,17 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // recorded `arg_types`/`result_type` were written against that signature,
     // and naming it here is the vouching the backend cannot do for itself --
     // a raw callee taking `&T` is `(i32)` on wasm32 whatever its descr says.
+    //
+    // Word mode treats every Int/Ref residual as `(i64×n) -> i64`. That
+    // `call_indirect` type-checks the callee, so an unvouched pointer-ABI
+    // helper traps (`indirect call type mismatch`) instead of reaching
+    // `jit_call`. Vouched mode is the list below plus every target the
+    // assembler marked word-spelled; everything else stays on the trampoline.
     #[cfg(target_arch = "wasm32")]
     {
+        majit_backend_wasm::codegen::set_residual_call_abi(
+            majit_backend_wasm::codegen::ResidualCallAbi::Vouched,
+        );
         let mut faithful = vec![
             // (f64) -> i64
             pyre_interpreter::module::math::interp_math::jit_math_frexp_exponent as *const ()
@@ -5700,7 +5709,141 @@ fn build_jit_driver_pair() -> JitDriverPair {
         ];
         // (i64) -> f64, one per float-result builtin fold.
         faithful.extend(pyre_interpreter::jit_builtin_folds::float_fold_helper_addrs());
+        faithful
+            .extend(pyre_interpreter::module::math::interp_math::math_float_fold_helper_addrs());
+        faithful.extend(pyre_jit_trace::walker_float_helper_addrs());
         majit_backend_wasm::set_faithful_residual_call_addrs(&faithful);
+        for addr in pyre_interpreter::jit_builtin_folds::word_fold_helper_addrs() {
+            majit_backend_wasm::vouch_residual_call_addr_returning_word(addr);
+        }
+        for addr in pyre_jit_trace::helpers::walker_word_helper_addrs() {
+            majit_backend_wasm::vouch_residual_call_addr_returning_word(addr);
+        }
+        for addr in pyre_jit_trace::helpers::walker_void_word_helper_addrs() {
+            majit_backend_wasm::vouch_residual_call_addr(addr);
+        }
+        for addr in [
+            list::jit_drain_list_append as *const () as usize as i64,
+            pyre_object::object_array::jit_ll_arraymove as *const () as usize as i64,
+            crate::call_jit::bh_set_current_exception as *const () as usize as i64,
+            crate::call_jit::bh_clear_in_flight_exception as *const () as usize as i64,
+            pyre_interpreter::jit_setitem as *const () as usize as i64,
+        ] {
+            majit_backend_wasm::vouch_residual_call_addr(addr);
+        }
+        use pyre_interpreter::module::math::interp_math as math;
+        use pyre_interpreter::objspace::descroperation as desc;
+        use pyre_object::floatobject as flt;
+        use pyre_object::intobject as intobj;
+        use pyre_object::listobject as list;
+        use pyre_object::longobject as long;
+        use pyre_object::tupleobject as tup;
+        use pyre_object::unicodeobject as uni;
+        for addr in [
+            desc::jit_bigint_add_int_int as *const () as usize as i64,
+            desc::jit_bigint_sub_int_int as *const () as usize as i64,
+            desc::jit_bigint_mul_int_int as *const () as usize as i64,
+            desc::jit_bigint_int_add as *const () as usize as i64,
+            desc::jit_bigint_int_sub as *const () as usize as i64,
+            desc::jit_bigint_int_mul as *const () as usize as i64,
+            desc::jit_bigint_add as *const () as usize as i64,
+            desc::jit_bigint_sub as *const () as usize as i64,
+            desc::jit_bigint_mul as *const () as usize as i64,
+            desc::jit_bigint_and as *const () as usize as i64,
+            desc::jit_bigint_or as *const () as usize as i64,
+            desc::jit_bigint_xor as *const () as usize as i64,
+            desc::jit_bigint_neg as *const () as usize as i64,
+            desc::jit_bigint_invert as *const () as usize as i64,
+            desc::jit_bigint_div as *const () as usize as i64,
+            desc::jit_bigint_rem as *const () as usize as i64,
+            desc::jit_bigint_div_floor as *const () as usize as i64,
+            desc::jit_bigint_mod_floor as *const () as usize as i64,
+            desc::jit_bigint_int_div_floor as *const () as usize as i64,
+            desc::jit_bigint_int_mod_int_result as *const () as usize as i64,
+            desc::jit_bigint_int_divmod as *const () as usize as i64,
+            desc::jit_bigint_int_pow_nomod as *const () as usize as i64,
+            desc::jit_bigint_pow_nomod as *const () as usize as i64,
+            desc::jit_bigint_lshift_count as *const () as usize as i64,
+            desc::jit_bigint_lshift_int_int_result as *const () as usize as i64,
+            desc::jit_bigint_shl as *const () as usize as i64,
+            desc::jit_bigint_shr as *const () as usize as i64,
+            desc::jit_bigint_floordiv as *const () as usize as i64,
+            desc::jit_bigint_mod as *const () as usize as i64,
+            desc::jit_bigint_lshift as *const () as usize as i64,
+            desc::jit_bigint_rshift as *const () as usize as i64,
+            desc::jit_w_long_floordiv_raw as *const () as usize as i64,
+            desc::jit_w_long_mod_raw as *const () as usize as i64,
+            desc::jit_w_long_lshift_raw as *const () as usize as i64,
+            desc::jit_w_long_rshift_raw as *const () as usize as i64,
+            math::jit_math_isqrt_i64 as *const () as usize as i64,
+            long::jit_bigint_fits_int as *const () as usize as i64,
+            long::jit_bigint_cmp as *const () as usize as i64,
+            long::jit_bigint_from_i64 as *const () as usize as i64,
+            long::jit_bigint_from_u64 as *const () as usize as i64,
+            long::jit_bigint_clone as *const () as usize as i64,
+            long::jit_bigint_add as *const () as usize as i64,
+            long::jit_bigint_sub as *const () as usize as i64,
+            long::jit_bigint_mul as *const () as usize as i64,
+            long::jit_bigint_and as *const () as usize as i64,
+            long::jit_bigint_or as *const () as usize as i64,
+            long::jit_bigint_xor as *const () as usize as i64,
+            long::jit_w_long_add_raw as *const () as usize as i64,
+            long::jit_w_long_sub_raw as *const () as usize as i64,
+            long::jit_w_long_mul_raw as *const () as usize as i64,
+            long::jit_w_long_and_raw as *const () as usize as i64,
+            long::jit_w_long_or_raw as *const () as usize as i64,
+            long::jit_w_long_xor_raw as *const () as usize as i64,
+            long::jit_w_long_fits_int as *const () as usize as i64,
+            long::jit_w_long_toint as *const () as usize as i64,
+            list::jit_list_append as *const () as usize as i64,
+            list::jit_list_getitem as *const () as usize as i64,
+            list::jit_list_setitem as *const () as usize as i64,
+            list::jit_list_reverse as *const () as usize as i64,
+            tup::jit_tuple_getitem as *const () as usize as i64,
+            intobj::jit_w_int_new as *const () as usize as i64,
+            flt::jit_w_float_new as *const () as usize as i64,
+            pyre_object::functional::jit_range_iter_new as *const () as usize as i64,
+            uni::jit_str_concat as *const () as usize as i64,
+            uni::jit_str_compare as *const () as usize as i64,
+            uni::jit_str_startswith as *const () as usize as i64,
+            uni::jit_str_endswith as *const () as usize as i64,
+            uni::jit_str_repeat as *const () as usize as i64,
+            uni::jit_str_is_true as *const () as usize as i64,
+            uni::jit_int_str as *const () as usize as i64,
+            uni::jit_str_getitem as *const () as usize as i64,
+            majit_metainterp::blackhole::ll_int_py_div as *const () as usize as i64,
+            majit_metainterp::blackhole::ll_int_py_mod as *const () as usize as i64,
+            crate::call_jit::bh_load_global_fn as *const () as usize as i64,
+            crate::call_jit::bh_reraise_varargs_zero as *const () as usize as i64,
+            crate::call_jit::bh_get_current_exception as *const () as usize as i64,
+            pyre_interpreter::jit_load_name_from_namespace as *const () as usize as i64,
+            pyre_interpreter::jit_store_name_to_namespace as *const () as usize as i64,
+            pyre_interpreter::jit_binary_value_from_tag as *const () as usize as i64,
+            pyre_interpreter::jit_compare_value_from_tag as *const () as usize as i64,
+            pyre_interpreter::jit_unary_negative_value as *const () as usize as i64,
+            pyre_interpreter::jit_unary_invert_value as *const () as usize as i64,
+            pyre_interpreter::jit_unary_positive_value as *const () as usize as i64,
+            pyre_interpreter::jit_truth_value as *const () as usize as i64,
+            pyre_interpreter::jit_bool_value_from_truth as *const () as usize as i64,
+            pyre_interpreter::jit_getitem as *const () as usize as i64,
+            pyre_interpreter::jit_sequence_getitem as *const () as usize as i64,
+            pyre_interpreter::jit_range_iter_next_or_null as *const () as usize as i64,
+            pyre_interpreter::jit_exception_match as *const () as usize as i64,
+            pyre_interpreter::bh_w_exception_get_kind as *const () as usize as i64,
+            pyre_interpreter::bh_exception_object_matches_stop_iteration as *const () as usize
+                as i64,
+            pyre_interpreter::jit_call_callable_0 as *const () as usize as i64,
+            pyre_interpreter::jit_call_callable_1 as *const () as usize as i64,
+            pyre_interpreter::jit_call_callable_2 as *const () as usize as i64,
+            pyre_interpreter::jit_call_callable_3 as *const () as usize as i64,
+            pyre_interpreter::jit_build_list_0 as *const () as usize as i64,
+            pyre_interpreter::jit_build_list_1 as *const () as usize as i64,
+            pyre_interpreter::jit_build_list_2 as *const () as usize as i64,
+            pyre_interpreter::jit_build_list_3 as *const () as usize as i64,
+            pyre_interpreter::jit_build_list_4 as *const () as usize as i64,
+        ] {
+            majit_backend_wasm::vouch_residual_call_addr_returning_word(addr);
+        }
     }
     pyre_interpreter::executioncontext::register_force_frame_hook(force_pyframe);
     pyre_interpreter::executioncontext::register_force_vref_hook(force_pyframe_vref);
@@ -10575,6 +10718,11 @@ fn maybe_compile_and_run(
     if *NO_JIT.get_or_init(|| std::env::var_os("PYRE_NO_JIT").is_some()) {
         return None;
     }
+    // Compiled `GUARD_NO_EXCEPTION` reads the backend `_store_exception`
+    // cells, while blackhole propagation reads `BH_LAST_EXC_VALUE`.  A raise
+    // caught in the interpreter (or left by a previous trace) must not still
+    // sit in either carrier when this loop starts.
+    crate::call_jit::clear_residual_call_exception();
     // The gates below and the decision at the end answer `None` for a green
     // key whose cell has latched at the abort ceiling, and go on answering it
     // for every back edge of a loop that can no longer trace. Take the cached

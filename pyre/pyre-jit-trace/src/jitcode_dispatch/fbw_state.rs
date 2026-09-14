@@ -1545,6 +1545,9 @@ fn census_report_pending(outcome: super::ForiterInflightOutcome) {
 /// Report that the item the take handed out was pushed and the frame
 /// repositioned to its body pc — the one outcome that costs no iteration.
 pub fn fbw_foriter_report_delivered() {
+    // The delivered item owns the advanced cursor.  Drop the pre-advance
+    // snapshot so a later refuse cannot roll this consume back.
+    fbw_bridge_iter_journal_clear();
     census_report_pending(super::ForiterInflightOutcome::Delivered);
 }
 
@@ -1555,10 +1558,10 @@ pub fn fbw_foriter_report_refused_header() {
     // The frame is parked at the pc the walk entered from, which is before
     // everything the walk executed, so the resume re-reaches this FOR_ITER.
     // Restoring the cursor makes it re-consume the item the walk took; without
-    // it the resume reads the NEXT one and the iteration is lost.  Only this
-    // refusal may do it: the R1 body-effect refusal below means an effect
-    // already committed for this iteration, and re-running that body would
-    // double it.
+    // it the resume reads the NEXT one and the iteration is lost.  The R1
+    // refusal below restores the cursor on the same reasoning, but only on its
+    // no-committed-effect half: re-consuming re-runs the body, which would
+    // double an effect that already stands on the live heap.
     fbw_bridge_iter_journal_rollback();
     crate::trace::fbw_diag::record_foriter_item_dropped();
     census_report_pending(super::ForiterInflightOutcome::RefusedHeader);
@@ -1646,12 +1649,24 @@ pub fn fbw_foriter_inflight_take(
     // reposition runs the FOR_ITER body, not the region ahead of it, so a
     // binding written before the consume would stay undone.
     let namespace_rolled_back = fbw_namespace_store_rolled_back();
-    if body_effect
-        || store_len != 0
-        || append_len != 0
-        || cell_store_len != 0
-        || namespace_rolled_back
-    {
+    let committed_effect = body_effect || store_len != 0 || append_len != 0 || cell_store_len != 0;
+    if committed_effect || namespace_rolled_back {
+        // Same cursor restore as `fbw_foriter_report_refused_header`, and only
+        // on the half that has committed nothing.  A root walk's non-commit
+        // epilogue leaves the journal in place so a delivery can push the
+        // consumed item; refusing here without putting the cursor back loses
+        // that iteration (`fbw_foriter_item_dropped`).  That is the shape the
+        // rollback was added for: a `GotoIfNotValueNotConcrete` abort on the
+        // first body opcode, whose only standing signal is a namespace binding
+        // that was itself rolled back, so re-consuming replays a body that has
+        // run to none of its stores.
+        //
+        // `committed_effect` is the opposite case and keeps drop-on-abort: an
+        // effect already stands on the live heap for this iteration, and a
+        // rewound cursor would re-run the body and double it.
+        if !committed_effect {
+            fbw_bridge_iter_journal_rollback();
+        }
         crate::trace::fbw_diag::record_foriter_item_dropped();
         if let Some((code_ptr, body_pc)) = key {
             super::census_record_foriter_inflight(
@@ -1666,7 +1681,7 @@ pub fn fbw_foriter_inflight_take(
                  body_effect={body_effect} store_journal_len={store_len} \
                  append_journal_len={append_len} unjournaled={unjournaled} \
                  namespace_rolled_back={namespace_rolled_back} \
-                 — keeping legacy drop-on-abort to avoid a double-apply (R1)",
+                 — restored the iterator cursor so resume re-consumes",
                 body_pc
             );
         }
@@ -2427,8 +2442,7 @@ thread_local! {
     /// trace executes that residual once on later iterations, so the generic
     /// nested-replay decline does not apply to this resolved descriptor path.
     pub(crate) static EXCEPTION_STRING_INLINE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Code keys of the callees [`fbw_inline_callee_hazardous`] named when the
-    /// hazard arm of [`fbw_abort_nested_unjournaled_residual`] fired.  The
+    /// Code keys of the callees [`fbw_decline_inline_callee`] named.  The
     /// inline callsite declines them from then on, so the call residualizes
     /// and the enclosing trace never re-enters the identical abort.
     ///
@@ -2490,74 +2504,6 @@ fn fbw_deny_hazardous_inline(callee_code_key: usize) {
     }
 }
 
-/// Whether the active inline sub-walk is the remaining hazard class the blanket
-/// nested-residual decline was masking, as opposed to an ordinary nested
-/// callee (the #73 depth-≥2 payoff, which inlines).
-///
-/// * **Self-recursive** — the callee calls itself.  A hot self-recursion
-///   forms a `CALL_ASSEMBLER` bridge whose moving-nursery callee frame cannot
-///   survive the residual trampoline retaining a pre-call frame pointer (the
-///   `wasm_ca_trampoline_decline` witness).  Detected both dynamically (the
-///   same `w_code` already nested in
-///   the framestack — mutual/deep recursion) and statically
-///   (`code_is_self_recursive`), since the recursive call residualizes to a
-///   `CALL_ASSEMBLER` rather than nesting the framestack, so it is already a
-///   hazard at inline depth 1.
-///
-/// The `w_code` field is the `jitcode_for` code key, resolved to the raw
-/// `CodeObject` via `state::ensure_jitcode_index` followed by
-/// `state::raw_code_for_jitcode_index`.
-///
-/// Returns the code key of the offending callee, which is the entity the
-/// decline is a property of and therefore the one to deny — the same
-/// attribution `find_biggest_function` (`pyjitpl.py`) performs before
-/// `disable_noninlinable_function`.  Declining it at its own callsite makes
-/// the next attempt residualize that call, so the surviving nest is
-/// hazard-free and the enclosing loop can compile.
-///
-/// The second element names which of the two clauses fired.
-///
-/// A third clause used to sit here: any framestack callee whose `CodeObject`
-/// contained a `FOR_ITER` anywhere, on the grounds that a re-run would
-/// re-execute the `for` consume and double-advance the iterator (the two
-/// `foriter_exempt_*` witnesses).  The re-run it was describing was
-/// `emit_walker_loop_callee_call_assembler` re-executing the caller's whole
-/// CALL to stamp `ca_result`, which replayed the callee prologue the sub-walk
-/// had already run concretely.  That emit now performs `do_recursive_call`'s
-/// portal resume on the frame the sub-walk advanced, so nothing is replayed
-/// and both witnesses agree with the `PYRE_NO_JIT=1` and CPython oracles with
-/// the clause gone.
-///
-/// The clause was expensive: it is a STATIC test, so a `while` loop calling a
-/// loop-bearing helper declined every inline and the JIT bought nothing.
-/// Measured on a same-binary pair over `foriter_exempt_nested_foriter` and
-/// `foriter_exempt_shared_generator` at N=600000, plus a plain-list variant of
-/// the first at N=300000, JIT-on against `PYRE_JIT=0` went 1.133x -> 0.745x,
-/// 1.084x -> 0.672x and 1.000x -> 0.514x.
-fn fbw_inline_callee_hazardous<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-) -> Option<(usize, &'static str)> {
-    let session = ctx.session.borrow();
-    let mut seen: Vec<usize> = Vec::with_capacity(session.framestack.len());
-    for frame in session.framestack.iter() {
-        if seen.contains(&frame.w_code) {
-            return Some((frame.w_code, "repeat"));
-        }
-        seen.push(frame.w_code);
-        if let Some(idx) = crate::state::ensure_jitcode_index(frame.w_code as *const ()) {
-            if let Some(raw_code) = crate::state::raw_code_for_jitcode_index(idx) {
-                let code = unsafe { raw_code.as_ref() };
-                if let Some(code) = code {
-                    if pyre_interpreter::code_is_self_recursive(code) {
-                        return Some((frame.w_code, "self-recursive"));
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
 pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     pc: usize,
@@ -2574,72 +2520,31 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
     if matches!(cause, Some(ResidualDecline::PureUnfolded)) {
         return Ok(());
     }
-    // The narrowing the rest of this function carries rests on an abort
-    // resuming FORWARD past the inlined frame, which a `BINARY_OP` /
-    // `COMPARE_OP` dunder answering `NotImplemented` has no form of.  That
-    // region refuses every unjournaled commit instead, this one included.
-    fbw_binop_rewind_refuse_commit(ctx, pc, None)?;
-    // RPython `do_residual_call` runs the residual executor at any framestack
-    // depth (`pyjitpl.py`). Exempt only the self-recursive
-    // `CALL_ASSEMBLER` fold's concrete-stamp executor from this pyre-local
-    // nested-decline guard, which is for FOREIGN unjournaled residuals.
-    let in_selfrec_fold = selfrec_ca_fold_active();
-    let in_exception_string_inline = EXCEPTION_STRING_INLINE_ACTIVE.with(|c| c.get());
-    // A FOR_ITER-body inline admitted under `CalleeReplaySafety::DeferredCall`
-    // does not abort before the first nested residual.  Aborting there guarded
-    // an entry-replay hazard: an unseeded inline frame could only resume at its
-    // caller's CALL, so executing the residual before a later abort risked
-    // applying it twice.  The inline frame is a real red frame in the captured
-    // chain and aborts resume forward, so execute and record the residual
-    // exactly as RPython's `do_residual_call` does instead of manufacturing one
-    // `loops_aborted` per callee.
-    // Narrowed decline: under the current portal-runner ABI the general
-    // depth-≥2 nested residual inline is sound — a straight-line mutating
-    // callee inlines bit-exact.  One callee shape still miscompiles and is
-    // captured by [`fbw_inline_callee_hazardous`]: a SELF-RECURSIVE callee
-    // whose hot `CALL_ASSEMBLER` recursion-bridge frame the residual
-    // trampoline cannot retain (the `wasm_ca_trampoline_decline` witness).
-    // Every other nested residual inlines.  The hazard scan is last so the
-    // cheap checks short-circuit it.
-    // A carrier-resume sub-walk starts at the failed guard; it does not replay
-    // an enclosing CALL. RPython resumes residual calls at every rebuilt
-    // framestack depth, so this forward-capture hazard excludes the carrier.
-    let nested = !ctx.fbw_mode.carrier_resume
-        && !in_selfrec_fold
-        && !in_exception_string_inline
-        && !ctx.session.borrow().framestack.is_empty();
-    let hazardous_callee = if nested {
-        fbw_inline_callee_hazardous(ctx)
-    } else {
-        None
-    };
-    if nested && hazardous_callee.is_some() {
-        if std::env::var_os("PYRE_LB_SITE").is_some() {
-            // Report the decline cause too: the arm flags say which promise
-            // broke, not what broke it, and once a callee body is traced
-            // through, the candidates are its whole helper set.
-            eprintln!(
-                "[lb-arm] pc={pc} cause={cause:?} hazard={}",
-                hazardous_callee.map(|(_, why)| why).unwrap_or("false"),
-            );
-        }
-        return Err(fbw_decline_inline_callee(
-            ctx,
-            pc,
-            hazardous_callee.map(|(callee_code_key, _)| callee_code_key),
-        ));
-    }
-    Ok(())
+    // A nested unjournaled residual used to be declined outright, on the
+    // grounds that an abort could only resume at the caller's CALL and would
+    // re-apply it.  Under the current portal-runner ABI the inline frame is a
+    // real red frame in the captured chain and aborts resume forward, so the
+    // residual is executed and recorded exactly as `do_residual_call` does.
+    // The one remaining miscompile, a self-recursive callee whose hot
+    // `CALL_ASSEMBLER` recursion-bridge frame the residual trampoline cannot
+    // retain, is the `CALL_ASSEMBLER` fold itself and is exempted by
+    // `SELFREC_CA_FOLD_ACTIVE` where it is folded.
+    //
+    // What is left is the rewind region, which has no forward resume of its
+    // own: the abort of a `BINARY_OP` / `COMPARE_OP` dunder answering
+    // `NotImplemented` rewinds to the operator, so that region refuses every
+    // unjournaled commit, this one included.
+    fbw_binop_rewind_refuse_commit(ctx, pc, None)
 }
 
 /// Refuse the innermost inline callee: deny it for the rest of this thread's
 /// tracing, latch the outer caller's CALL coordinate, and build the decline the
 /// walk returns.
 ///
-/// Shared by the hazard arm of [`fbw_abort_nested_unjournaled_residual`] and
-/// the poisoned-pc refusal in [`crate::jitcode_dispatch::walk`], which answer
-/// the same question — this callee must not be inlined HERE — from a static
-/// framestack property and from an op the walk actually reached.
+/// Shared by the poisoned-pc refusal in [`crate::jitcode_dispatch::walk`] and
+/// the declined `locals()` expansion in `specialize.rs`, which answer the same
+/// question — this callee must not be inlined HERE — from an op the walk
+/// actually reached and from a frame-payload gate.
 ///
 /// Denying is what stops the decline being a property of the framestack, which
 /// the next attempt rebuilds identically: without it the abort recurs
@@ -4005,6 +3910,7 @@ pub(crate) fn fbw_callee_body_replay_scan(
                 let defer_truth_or_method_self = match ei.runtime_helper {
                     majit_ir::RuntimeHelperKind::LoadMethodSelf => method_form_deferred_helpers,
                     majit_ir::RuntimeHelperKind::Truth => true,
+                    majit_ir::RuntimeHelperKind::UnaryNot => true,
                     _ => false,
                 };
                 let defer_helper = defer_truth_or_method_self
@@ -4127,11 +4033,37 @@ pub(crate) fn fbw_callee_body_replay_scan(
             if !target_fresh {
                 replay_poison!(poison, "SetarrayitemGcTargetNotFresh", d.pc, d.opname);
             }
+        } else if d.opname.starts_with("inline_call") {
+            // Flatten lowered BINARY_OP is `inline_call_ir_r`, not
+            // `residual_call`.  The residual exemption above never
+            // fires, so admit the same proven-numeric tags here.
+            match crate::jitcode_dispatch::residual_call::inline_call_specialized_plain_numeric_binop(
+                body_code,
+                &numeric_ref_regs,
+                &plain_int_ref_regs,
+                &d,
+                num_regs_i,
+                constants_i,
+                callee_descr_refs,
+            ) {
+                Some(SpecializedBinop::Numeric) => {
+                    dst_exact_numeric = true;
+                }
+                Some(SpecializedBinop::PlainInt) => {
+                    dst_exact_numeric = true;
+                    dst_exact_plain_int = true;
+                }
+                Some(SpecializedBinop::Compare) => {
+                    dst_exact_bool = true;
+                }
+                None => {
+                    replay_poison!(poison, "UnprovableStoreOrCallForm", d.pc, d.opname);
+                }
+            }
         } else if d.opname.starts_with("setinteriorfield_gc")
             || d.opname.starts_with("raw_store")
             || d.opname.starts_with("cond_call")
             || d.opname.starts_with("call_assembler")
-            || d.opname.starts_with("inline_call")
         {
             // Interior/raw stores and non-residual call forms cannot be proven
             // replay-safe from this single callee body.
@@ -4274,6 +4206,18 @@ pub(crate) fn fbw_callee_body_has_binary_op_residual(
                 })
         {
             return true;
+        }
+        // Flatten lowered BINARY to `inline_call_ir_r` of
+        // `binary_value_from_tag` (tag + two refs).  Without this the
+        // root-bridge self-rec admission (`bridge_rec_root_selfrec`)
+        // never sees a BinaryOp and the nested recursive CALL aborts
+        // the enclosing bridge (`selfrec_bridge_nontail_promote`).
+        if op.opname.starts_with("inline_call_ir_r") {
+            let i_len = body_code.get(op.pc + 3).copied().unwrap_or(0);
+            let r_len_pc = op.pc + 3 + 1 + i_len as usize;
+            if i_len == 1 && body_code.get(r_len_pc) == Some(&2) {
+                return true;
+            }
         }
         pc = op.next_pc;
     }

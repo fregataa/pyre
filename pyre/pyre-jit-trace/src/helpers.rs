@@ -480,6 +480,17 @@ fn publish_leaf_exception(err: &mut pyre_interpreter::PyError) -> i64 {
     0
 }
 
+/// `format_w(value, spec)` as a CanRaise residual.  Exact `int`/`str`
+/// FORMAT_WITH_SPEC records this instead of the MayForce
+/// `bh_format_with_spec_fn` residual, so a compiled `f"{i:05d}"` does not
+/// force virtualizables.
+pub extern "C" fn jit_format_w(value: i64, spec: i64) -> i64 {
+    match pyre_interpreter::type_methods::format_w(value as PyObjectRef, spec as PyObjectRef) {
+        Ok(s) => s as i64,
+        Err(mut err) => publish_leaf_exception(&mut err),
+    }
+}
+
 /// `normalize_hash_digest` as a JIT residual: normalize a boxed `__hash__`
 /// digest to the machine hash, raising for a non-integer.  On error the
 /// exception enters both channels for the trailing `GuardNoException`.
@@ -590,6 +601,38 @@ pub extern "C" fn jit_mapdict_unboxed_write_f(
 /// opcode-default empty write set would let optheap CSE a getfield
 /// across the call: `acc = acc + a; acc = acc + b` at module level then
 /// reuses the pre-store cell value and drops the first term.
+/// i64-in / i64-out walker helpers for `vouch_residual_call_addr_returning_word`.
+/// These are already spelled in machine words; Vouched mode will not
+/// `call_indirect` them unless they are named.
+pub fn walker_word_helper_addrs() -> Vec<i64> {
+    [
+        jit_dict_exact_int_lookup_or_null as *const () as usize as i64,
+        jit_dict_exact_int_lookup_index as *const () as usize as i64,
+        jit_dict_int_value_at as *const () as usize as i64,
+        jit_dict_value_at as *const () as usize as i64,
+        jit_force_vref as *const () as usize as i64,
+        jit_init_kwdefaults_dict as *const () as usize as i64,
+        jit_getexecutioncontext as *const () as usize as i64,
+        jit_dict_exact_unicode_lookup_or_null as *const () as usize as i64,
+        jit_lookup_where_with_method_cache as *const () as usize as i64,
+        jit_instance_getdictvalue as *const () as usize as i64,
+        jit_mapdict_read as *const () as usize as i64,
+        jit_format_w as *const () as usize as i64,
+        jit_hash_normalize_digest as *const () as usize as i64,
+        jit_bare_super_from_frame as *const () as usize as i64,
+    ]
+    .into()
+}
+
+/// Void word-ABI walker helpers (`-> ()` with i64 parameters).
+pub fn walker_void_word_helper_addrs() -> Vec<i64> {
+    [
+        jit_mapdict_boxed_write as *const () as usize as i64,
+        jit_mapdict_unboxed_write_raw as *const () as usize as i64,
+    ]
+    .into()
+}
+
 pub fn emit_trace_call_void_word_abi(
     ctx: &mut TraceCtx,
     helper: *const (),
@@ -666,6 +709,39 @@ pub(crate) fn emit_untag_int(ctx: &mut TraceCtx, obj: OpRef, value: i64) -> OpRe
     raw
 }
 
+/// Teach the heap cache what a `NewWithVtable` determined about `new_op`.
+///
+/// The class is known (`opimpl_new_with_vtable` → `class_now_known`;
+/// `class_now_known` here takes the vtable address, since pyre tracks the
+/// concrete class pointer where upstream only raises `HF_KNOWN_CLASS`), so a
+/// later `guard_class` on `new_op` records nothing.  The class word the
+/// allocation writes from its size descr (`SizeDescr::w_class_obj`, the
+/// same answer `OptVirtualize` folds the header read off a virtual with) is
+/// cached as a recorded `setfield` would be: a later `getfield_gc_r` of
+/// `w_class` on `new_op` yields the class constant and a `promote` of that
+/// read records no guard.  A size descr without a class word, or whose type
+/// has no canonical class, seeds only the class.
+pub fn note_class_word_after_new(
+    ctx: &mut TraceCtx,
+    new_op: OpRef,
+    size_descr: &majit_ir::DescrRef,
+) {
+    let Some(size) = size_descr.as_size_descr() else {
+        return;
+    };
+    ctx.heap_cache_mut()
+        .class_now_known(new_op, size.vtable() as i64);
+    let seed = size
+        .class_word_field()
+        .map(|field| field.index())
+        .zip(size.w_class_obj());
+    let Some((field_index, w_class)) = seed else {
+        return;
+    };
+    let w_class = ctx.const_ref(w_class);
+    ctx.heapcache_getfield_now_known(new_op, field_index, w_class);
+}
+
 /// Emit inline W_Int creation (NewWithVtable + SetfieldGc).
 ///
 /// jtransform.py rewrite_op_setfield: setfield on typeptr is dropped
@@ -680,8 +756,9 @@ pub fn emit_box_int_inline(
     // entirely ("ignore the operation completely -- instead, it's done by
     // 'new'"). rewrite.py handle_malloc_operation emits the vtable
     // setfield via fielddescr_vtable during GC rewrite of NEW_WITH_VTABLE.
-    let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr);
+    let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr.clone());
     ctx.heap_cache_mut().new_object(new_op);
+    note_class_word_after_new(ctx, new_op, &size_descr);
     // Emit: SetfieldGc(v, intval, raw_int)
     let intval_idx = intval_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, raw_int], intval_descr);
@@ -708,8 +785,9 @@ pub fn emit_box_long_inline(
     size_descr: majit_ir::DescrRef,
     value_descr: majit_ir::DescrRef,
 ) -> OpRef {
-    let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr);
+    let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr.clone());
     ctx.heap_cache_mut().new_object(new_op);
+    note_class_word_after_new(ctx, new_op, &size_descr);
     let value_idx = value_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, bigint_ref], value_descr);
     ctx.heapcache_setfield_cached(new_op, value_idx, bigint_ref);

@@ -151,8 +151,7 @@ static HEAP_PROF_ALLOC: heap_prof::CountingAlloc = heap_prof::CountingAlloc;
 // the callee's wasm signature and coerces each positional argument.
 #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
 mod residual_host {
-    /// Direct-call the blackhole helpers whose real wasm ABI is exactly the
-    /// uniform `i64` signature carried by the residual call.
+    /// Direct-call the blackhole helpers whose real wasm ABI is known exactly.
     ///
     /// The generic path below must reflect the callee's wasm type in the host:
     /// an `r` argument may be a real `i32` pointer, a void descriptor may name
@@ -198,8 +197,6 @@ mod residual_host {
             [callable, null_or_self] => pyre_jit::call_jit::bh_call_fn_0,
             [lhs, rhs, op_code] => pyre_interpreter::opcode_ops::jit_binary_value_from_tag,
             [lhs, rhs, op_code] => pyre_interpreter::opcode_ops::jit_compare_value_from_tag,
-            [lhs, rhs, op_code] => pyre_jit::call_jit::bh_binary_op_fn,
-            [lhs, rhs, op_code] => pyre_jit::call_jit::bh_compare_fn,
             [obj, key, value] => pyre_interpreter::opcode_ops::bh_store_subscr_fn,
             [callable, null_or_self, arg0] => pyre_jit::call_jit::bh_call_fn,
             [obj, w_code_ptr, name_idx] => pyre_jit::call_jit::bh_load_attr_fn,

@@ -3697,6 +3697,10 @@ impl TruthOpcodeHandler for PyFrame {
     ) -> Result<Self::Value, PyError> {
         Ok(bool_value_from_truth(if negate { !truth } else { truth }))
     }
+
+    fn unary_not_value(&mut self, value: Self::Value) -> Result<Self::Value, PyError> {
+        crate::opcode_ops::unary_not_value(value)
+    }
 }
 
 impl ControlFlowOpcodeHandler for PyFrame {
@@ -6067,13 +6071,13 @@ mod tests {
     }
 
     // `check_exc_match_against` is called here directly: the residual
-    // `bh_compare_fn` reaches it on a path an `except` clause cannot select.
+    // `compare_value_from_tag` reaches it on a path an `except` clause cannot select.
     #[test]
     fn test_check_exc_match_against_matches_by_actual_type() {
         // pyopcode.py `return space.exception_match(space.type(w_1), w_2)`:
         // the left operand is matched by its *actual* type, never treated as
         // an unconditional success.  Guards the three shapes the residual
-        // `bh_compare_fn` (call_jit.rs) and the BC `check_exc_match` share:
+        // `compare_value_from_tag` (call_jit.rs) and the BC `check_exc_match` share:
         //   * a matching exception instance   -> true
         //   * a non-matching exception class  -> false (an `except` clause
         //     past the first must not spuriously match)

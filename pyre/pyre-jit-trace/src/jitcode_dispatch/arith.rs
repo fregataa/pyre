@@ -186,24 +186,33 @@ pub(crate) fn record_int_ovf<Sym: WalkSym>(
     opcode: OpCode,
     b1: OpRef,
     b2: OpRef,
+    known: Option<(i64, i64)>,
 ) -> Result<(OpRef, bool), DispatchError> {
-    let v1 = match ctx.trace_ctx.concrete_of_opref(b1) {
-        Some(Value::Int(value)) => value,
-        _ => {
-            return Err(DispatchError::IntOvfOperandNotConcrete { pc, value: b1 });
-        }
+    let from_opref = |box_ref: OpRef| match ctx.trace_ctx.concrete_of_opref(box_ref) {
+        Some(Value::Int(value)) => Some(value),
+        _ => match ctx.trace_ctx.box_value(box_ref) {
+            Some(Value::Int(value)) => Some(value),
+            _ => None,
+        },
     };
-    let v2 = match ctx.trace_ctx.concrete_of_opref(b2) {
-        Some(Value::Int(value)) => value,
-        _ => {
-            return Err(DispatchError::IntOvfOperandNotConcrete { pc, value: b2 });
-        }
-    };
-    let (wrapping_result, overflow) = match opcode {
+    let v1 = known.map(|pair| pair.0).or_else(|| from_opref(b1));
+    let v2 = known.map(|pair| pair.1).or_else(|| from_opref(b2));
+    let Some((wrapping_result, overflow)) = v1.zip(v2).map(|(v1, v2)| match opcode {
         OpCode::IntAddOvf => (v1.wrapping_add(v2), v1.checked_add(v2).is_none()),
         OpCode::IntSubOvf => (v1.wrapping_sub(v2), v1.checked_sub(v2).is_none()),
         OpCode::IntMulOvf => (v1.wrapping_mul(v2), v1.checked_mul(v2).is_none()),
         _ => unreachable!("record_int_ovf requires an IntAddOvf/IntSubOvf/IntMulOvf opcode"),
+    }) else {
+        // `pyjitpl.py opimpl_int_add_jump_if_ovf` records `INT_*_OVF`
+        // via `execute` and then `handle_possible_overflow_error`.
+        // Without operand values the overflow flag cannot be decided, so
+        // guessing the no-overflow arm would walk the fallthrough even when
+        // the live inputs overflowed. Recover via `known` (heap objects or
+        // the int-bank shadow) or decline.
+        return Err(DispatchError::UnsupportedOpname {
+            pc,
+            key: "int_*_ovf (operands not concrete)",
+        });
     };
     count_ops_executed(ctx, opcode);
     if b1.is_constant() && b2.is_constant() {

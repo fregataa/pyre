@@ -1967,9 +1967,20 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
     // `_copy_data_from_miframe` (`blackhole.py`) copies the WHOLE
     // bank — `range(num_regs_i/r/f())` — filtering only on "the MIFrame has a
     // box here", never on liveness.  Each bank below therefore runs twice: the
-    // liveness pass, which still DEMANDS a concrete for every color live at
-    // `resume_pc`, and then a sweep that seeds every remaining color the walk
+    // liveness pass, and then a sweep that seeds every remaining color the walk
     // happens to have a concrete for.
+    //
+    // The liveness pass DEMANDS a concrete for every color live at `resume_pc`
+    // that HAS a box, and refuses the whole image when it cannot produce one.
+    // Upstream's bank is allocated to `num_regs_*()` and its only skip is a
+    // `None` / `MissingValue` box, so a color whose box is genuinely absent is
+    // the one case that may go unset here too: a `-live-` set is the union over
+    // the paths INTO its coordinate and this walk took one of them.  Everything
+    // else — a color past the end of the walk's shorter bank, or a real box
+    // whose concrete is the untracked sentinel or the wrong type — is a bank
+    // this walk cannot answer for, and the sweep below re-tests the same
+    // condition, so skipping would leave a live color unset and hand the
+    // interpreter a NULL in a live slot.
     //
     // Seeding only the live subset is unsound the moment the drive leaves the
     // straight line: the blackhole runs on to a `jit_merge_point` whose own
@@ -2001,16 +2012,25 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
             continue;
         }
         let got = ctx.concrete_registers_i.get(color).copied();
-        let Some(ConcreteValue::Int(value)) = got else {
-            report_caller_image_decline(
-                jitcode_index,
-                call_jit_pc,
-                'i',
-                color,
-                ctx.concrete_registers_i.len(),
-                got,
-            );
-            return None;
+        let value = match got {
+            Some(ConcreteValue::Int(value)) => value,
+            // No box at this color: `_copy_data_from_miframe` leaves the
+            // register unset rather than refusing the image.
+            _ if ctx.registers_i.get(color) == Some(OpRef::NONE) => continue,
+            // A real box (or a color past the walk's shorter bank) the shadow
+            // cannot answer for.  The sweep re-tests the same condition, so
+            // skipping would leave this live color NULL.
+            _ => {
+                report_caller_image_decline(
+                    jitcode_index,
+                    call_jit_pc,
+                    'i',
+                    color,
+                    ctx.concrete_registers_i.len(),
+                    got,
+                );
+                return None;
+            }
         };
         int_values.push((color, value));
         if let Some(seeded) = int_seeded.get_mut(color) {
@@ -2078,6 +2098,10 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
                     Some(o) => match ctx.trace_ctx.recover_ref_value(o, 8) {
                         Some(majit_ir::Value::Ref(gc)) => gc.0 as pyre_object::PyObjectRef,
                         _ => {
+                            // A real box whose concrete cannot be recovered
+                            // is not an absent `None`.  `_copy_data_from_miframe`
+                            // skips only missing boxes; `build_single_frame_miframe`
+                            // declines this same unrecoverable live color.
                             report_caller_image_decline(
                                 jitcode_index,
                                 call_jit_pc,
@@ -2091,6 +2115,10 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
                         }
                     },
                     None => {
+                        // Color past the walk's `registers_r` bank, which
+                        // upstream's always-allocated `num_regs_r()` bank has
+                        // no counterpart for.  That is a bank this walk cannot
+                        // answer for, not an absent box, so refuse.
                         report_caller_image_decline(
                             jitcode_index,
                             call_jit_pc,
@@ -2136,16 +2164,23 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
             continue;
         }
         let got = ctx.registers_f.get(color);
-        let Some(opref) = got.filter(|&opref| opref != OpRef::NONE) else {
-            report_caller_image_decline(
-                jitcode_index,
-                call_jit_pc,
-                'f',
-                color,
-                ctx.registers_f.len(),
-                got,
-            );
-            return None;
+        let opref = match got {
+            // `_copy_data_from_miframe` skips a missing float box.
+            Some(opref) if opref == OpRef::NONE => continue,
+            Some(opref) => opref,
+            // Color past the walk's `registers_f` bank: the same refusal as
+            // the two banks above.
+            None => {
+                report_caller_image_decline(
+                    jitcode_index,
+                    call_jit_pc,
+                    'f',
+                    color,
+                    ctx.registers_f.len(),
+                    got,
+                );
+                return None;
+            }
         };
         float_values.push((color, opref));
         if let Some(seeded) = float_seeded.get_mut(color) {
