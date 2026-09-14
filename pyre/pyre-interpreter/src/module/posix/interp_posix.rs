@@ -1120,6 +1120,7 @@ fn wide_result(units: &[u16], as_bytes: bool) -> PyObjectRef {
 mod win_nt {
     use pyre_object::PyObjectRef;
     use rustpython_host_env::nt as host_nt;
+    use rustpython_host_env::winapi as host_winapi;
 
     /// Wrap a host-layer `io::Error` as an OSError carrying the offending path.
     /// These calls are Win32 APIs, so the code they report is a Win32 error and
@@ -1354,27 +1355,20 @@ mod win_nt {
     }
 
     /// os.stat helper for ntpath.samefile — (volume serial, file index high,
-    /// file index low) uniquely identifies a file across handles. host_env has
-    /// no wrapper for GetFileInformationByHandle, so call windows-sys directly.
+    /// file index low) uniquely identifies a file across handles.
     pub fn _getfileinformation(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        use windows_sys::Win32::Storage::FileSystem::{
-            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
-        };
         let Some(&arg) = args.first() else {
             return Err(crate::PyError::type_error(
                 "_getfileinformation() missing required argument 'fd'",
             ));
         };
         let fd = crate::baseobjspace::c_int_w(arg)?;
-        let handle = host_nt::handle_from_fd(fd);
-        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-        if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 {
-            return Err(io_err(&std::io::Error::last_os_error(), ""));
-        }
+        let info = host_nt::get_file_information(host_nt::handle_from_fd(fd))
+            .map_err(|error| io_err(&error, ""))?;
         let mut fields = pyre_object::gc_roots::RootedItems::new();
-        fields.push(pyre_object::w_int_new(info.dwVolumeSerialNumber as i64));
-        fields.push(pyre_object::w_int_new(info.nFileIndexHigh as i64));
-        fields.push(pyre_object::w_int_new(info.nFileIndexLow as i64));
+        fields.push(pyre_object::w_int_new(info.volume_serial_number as i64));
+        fields.push(pyre_object::w_int_new(info.file_index_high as i64));
+        fields.push(pyre_object::w_int_new(info.file_index_low as i64));
         Ok(pyre_object::w_tuple_new(fields.take()))
     }
 
@@ -1513,21 +1507,14 @@ mod win_nt {
 
     /// os._add_dll_directory. `os__add_dll_directory_impl` hands the
     /// `DLL_DIRECTORY_COOKIE` back inside a capsule and os.py only round-trips
-    /// that object into `_remove_dll_directory`. host_env has no
-    /// AddDllDirectory wrapper, so call windows-sys directly.
+    /// that object into `_remove_dll_directory`.
     pub fn _add_dll_directory(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        use windows_sys::Win32::System::LibraryLoader::AddDllDirectory;
         let (path, _, resolved) = arg_path(args, "_add_dll_directory")?;
         // `arg_path` keeps the code units it decoded the path into; going back
         // through a `str` would have no spelling for a lone surrogate and would
         // address a different directory.
-        let cookie = unsafe { AddDllDirectory(path.as_ptr()) };
-        if cookie.is_null() {
-            return Err(io_err_with_filename(
-                &std::io::Error::last_os_error(),
-                resolved.w_path(),
-            ));
-        }
+        let cookie = host_winapi::add_dll_directory(&path)
+            .map_err(|error| io_err_with_filename(&error, resolved.w_path()))?;
         LIVE_DLL_DIRECTORY_COOKIES.lock().push(cookie as usize);
         Ok(dll_cookie_new(cookie as usize))
     }
@@ -1545,7 +1532,6 @@ mod win_nt {
     /// with `space.newbool(...)`, reports a failure as `False` rather than
     /// raising, and has no invalidation at all.
     pub fn _remove_dll_directory(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        use windows_sys::Win32::System::LibraryLoader::RemoveDllDirectory;
         let Some(&arg) = args.first() else {
             return Err(crate::PyError::type_error(
                 "_remove_dll_directory() missing required argument 'cookie'",
@@ -1574,7 +1560,8 @@ mod win_nt {
                 .position(|&issued| issued == cookie)
                 .ok_or_else(not_a_cookie)?;
             live.swap_remove(index);
-            if unsafe { RemoveDllDirectory(cookie as *mut std::ffi::c_void) } != 0 {
+            if host_winapi::remove_dll_directory(cookie as host_winapi::DllDirectoryCookie).is_ok()
+            {
                 None
             } else {
                 // The capsule is renamed only after a successful removal, so a
@@ -2541,13 +2528,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
         {
             use std::os::windows::io::AsRawHandle;
-            use windows_sys::Win32::System::Pipes::{GetNamedPipeHandleStateW, PIPE_NOWAIT};
+            use windows_sys::Win32::System::Pipes::PIPE_NOWAIT;
 
             // CPython 3.14 `_Py_get_blocking`: translate the CRT descriptor
             // through the host seam, then read PIPE_NOWAIT from the pipe's
-            // current mode.  GetNamedPipeHandleStateW is one of the narrow nt
-            // calls host_env does not wrap, like the other windows-sys calls
-            // owned by this crate.
+            // current mode.
             let borrowed = unsafe { rustpython_host_env::crt_fd::Borrowed::try_borrow_raw(fd) }
                 .map_err(|error| {
                     crate::PyError::os_error_syscall(
@@ -2561,25 +2546,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     pyre_object::PY_NULL,
                 )
             })?;
-            let mut mode = 0;
-            let success = unsafe {
-                GetNamedPipeHandleStateW(
-                    handle.as_raw_handle() as _,
-                    &mut mode,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    0,
-                )
-            };
-            if success == 0 {
-                return Err(crate::PyError::os_error_win32_syscall2(
-                    rustpython_host_env::winapi::get_last_error() as i32,
-                    pyre_object::PY_NULL,
-                    pyre_object::PY_NULL,
-                ));
-            }
+            let mode =
+                rustpython_host_env::winapi::get_named_pipe_handle_state(handle.as_raw_handle())
+                    .map_err(|error| {
+                        crate::PyError::os_error_win32_syscall2(
+                            error
+                                .raw_os_error()
+                                .unwrap_or(rustpython_host_env::winapi::get_last_error() as i32),
+                            pyre_object::PY_NULL,
+                            pyre_object::PY_NULL,
+                        )
+                    })?;
             Ok(pyre_object::w_bool_from(mode & PIPE_NOWAIT == 0))
         }
         #[cfg(any(
@@ -2639,7 +2616,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
         {
             use std::os::windows::io::AsRawHandle;
-            use windows_sys::Win32::System::Pipes::{GetNamedPipeHandleStateW, PIPE_NOWAIT};
+            use windows_sys::Win32::System::Pipes::PIPE_NOWAIT;
 
             // CPython 3.14 `_Py_set_blocking` maps a CRT descriptor back to
             // its pipe HANDLE and flips PIPE_NOWAIT with
@@ -2659,25 +2636,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     pyre_object::PY_NULL,
                 )
             })?;
-            let mut mode = 0;
-            let success = unsafe {
-                GetNamedPipeHandleStateW(
-                    handle.as_raw_handle() as _,
-                    &mut mode,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    0,
-                )
-            };
-            if success == 0 {
-                return Err(crate::PyError::os_error_win32_syscall2(
-                    rustpython_host_env::winapi::get_last_error() as i32,
-                    pyre_object::PY_NULL,
-                    pyre_object::PY_NULL,
-                ));
-            }
+            let mut mode =
+                rustpython_host_env::winapi::get_named_pipe_handle_state(handle.as_raw_handle())
+                    .map_err(|error| {
+                        crate::PyError::os_error_win32_syscall2(
+                            error
+                                .raw_os_error()
+                                .unwrap_or(rustpython_host_env::winapi::get_last_error() as i32),
+                            pyre_object::PY_NULL,
+                            pyre_object::PY_NULL,
+                        )
+                    })?;
             if blocking {
                 mode &= !PIPE_NOWAIT;
             } else {
@@ -4687,14 +4656,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     .map_err(|e| errno_err(e.raw_os_error().unwrap_or(0), ""))?;
                 Ok(make_terminal_size(columns as i64, lines as i64))
             }
-            #[cfg(all(unix, not(feature = "host_env")))]
-            {
-                let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-                if crate::builtins::crt_call!(libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws)) != 0 {
-                    return Err(errno_err(crate::builtins::crt_errno(), ""));
-                }
-                Ok(make_terminal_size(ws.ws_col as i64, ws.ws_row as i64))
-            }
             #[cfg(all(windows, feature = "host_env"))]
             {
                 let handle = rustpython_host_env::nt::handle_from_fd(fd);
@@ -4703,7 +4664,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 Ok(make_terminal_size(columns as i64, lines as i64))
             }
             // A target with neither call has no terminal to measure.
-            #[cfg(not(any(unix, all(windows, feature = "host_env"))))]
+            #[cfg(not(any(all(unix, feature = "host_env"), all(windows, feature = "host_env"))))]
             {
                 let _ = fd;
                 Ok(make_terminal_size(80, 24))
@@ -8693,25 +8654,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         //
         // Which filename the caller then reports is its own: `os.ftruncate` was
         // given no name to report, while `os.truncate` names the one it opened.
-        #[cfg(all(unix, not(feature = "sandbox")))]
+        #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
         fn ftruncate_retry(
             fd: libc::c_int,
             length: libc::off_t,
             wrap: impl Fn(i32) -> crate::PyError,
         ) -> Result<(), crate::PyError> {
             loop {
-                #[cfg(feature = "host_env")]
                 let result = {
                     let fd = unsafe { rustpython_host_env::crt_fd::Borrowed::borrow_raw(fd) };
                     rustpython_host_env::crt_fd::ftruncate(fd, length)
-                };
-                #[cfg(not(feature = "host_env"))]
-                let result = if crate::builtins::crt_call!(libc::ftruncate(fd, length)) == 0 {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::from_raw_os_error(
-                        crate::builtins::crt_errno(),
-                    ))
                 };
                 if result.is_ok() {
                     return Ok(());
@@ -8729,7 +8681,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // name write-only, truncates whichever it ended up with, and closes
         // only the one it opened itself. The descriptor form is what
         // HAVE_FTRUNCATE advertises through `os.py:149`.
-        #[cfg(all(unix, not(feature = "sandbox")))]
+        #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
         crate::module_ns_store(
             ns,
             "truncate",
@@ -8800,7 +8752,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // real fd mutation whenever HAVE_FTRUNCATE is advertised.  Shared
         // memory sizes its newly-created object through this call before
         // mapping it.
-        #[cfg(all(unix, not(feature = "sandbox")))]
+        #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
         crate::module_ns_store(
             ns,
             "ftruncate",
@@ -11487,85 +11439,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             ),
         );
 
-        /// The working directory published under `=X:`, the name a drive's
-        /// current directory is kept in. A name beginning `\\` or `//` is on
-        /// no drive and publishes nothing.
-        fn publish_drive_current_directory() -> std::io::Result<()> {
-            use std::os::windows::ffi::OsStrExt;
-            use windows_sys::Win32::System::Environment::SetEnvironmentVariableW;
-
-            let new_path: Vec<u16> = std::env::current_dir()?
-                .as_os_str()
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect();
-            let unc_like = new_path.starts_with(&[b'\\' as u16, b'\\' as u16])
-                || new_path.starts_with(&[b'/' as u16, b'/' as u16]);
-            if unc_like || new_path.len() < 2 {
-                return Ok(());
-            }
-            let name = [b'=' as u16, new_path[0], b':' as u16, 0];
-            if unsafe { SetEnvironmentVariableW(name.as_ptr(), new_path.as_ptr()) } == 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        }
-
         /// `win32_wchdir` -- `SetCurrentDirectoryW`, then the directory read
         /// back and published for the drive it is on.
         fn win32_wchdir(path: &std::path::Path) -> std::io::Result<()> {
-            std::env::set_current_dir(path)?;
-            publish_drive_current_directory()
-        }
-
-        /// The same entry, written before an environment is handed to the
-        /// runtime rather than because the directory changed.
-        ///
-        /// `construct_environment_block`, which `_wspawnve` and `_wexecve`
-        /// both reach, finds the first `=X:` entry by walking the environment
-        /// for one that begins with `=`:
-        ///
-        /// ```text
-        /// while (*it != '=') it += tcslen(it) + 1;
-        /// ```
-        ///
-        /// There is no bound on that walk, so an environment carrying none of
-        /// those entries sends it past the block's terminator and through
-        /// whatever follows until it reaches a page that is not mapped. Only
-        /// the command shell writes them, and a process it did not start --
-        /// one under a build runner, or under a shell of another family --
-        /// holds none. Publishing the working directory gives the walk its
-        /// first entry; `win32_wchdir` is what keeps it current afterwards.
-        fn ensure_drive_current_directory() {
-            use windows_sys::Win32::System::Environment::{
-                FreeEnvironmentStringsW, GetEnvironmentStringsW,
-            };
-
-            let block = unsafe { GetEnvironmentStringsW() };
-            if block.is_null() {
-                return;
-            }
-            let mut present = false;
-            let mut entry = block;
-            unsafe {
-                while *entry != 0 {
-                    if *entry == b'=' as u16 {
-                        present = true;
-                        break;
-                    }
-                    while *entry != 0 {
-                        entry = entry.add(1);
-                    }
-                    entry = entry.add(1);
-                }
-                FreeEnvironmentStringsW(block);
-            }
-            if !present {
-                // A working directory that cannot be read or published leaves
-                // the environment as it was; the call this precedes is the one
-                // that reports, and it has its own errno to report with.
-                let _ = publish_drive_current_directory();
-            }
+            host_os::set_current_dir(path)
         }
 
         // os.chdir(path)
@@ -11711,6 +11588,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     let command_w = wide_path(&path.as_bytes)?;
                     let argv = exec_argv_wide(args[1], "execv")?;
                     let argv_ptrs = exec_pointer_array_wide(&argv);
+                    rustpython_host_env::os::ensure_drive_current_directory();
                     // The runtime's invalid parameter handler is silenced
                     // around the call: an empty path reaches it, and its
                     // default action ends the process where the call is
@@ -11753,7 +11631,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     let env_ptrs = exec_pointer_array_wide(&env);
-                    ensure_drive_current_directory();
+                    rustpython_host_env::os::ensure_drive_current_directory();
                     crate::builtins::crt_call!(libc::wexecve(
                         command_w.as_ptr(),
                         argv_ptrs.as_ptr(),
@@ -11889,7 +11767,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                                 .map_err(|_| crate::PyError::value_error("embedded null character"))
                         })
                         .collect::<Result<Vec<_>, _>>()?;
-                    ensure_drive_current_directory();
+                    rustpython_host_env::os::ensure_drive_current_directory();
                     let spawned = {
                         let _blocked = crate::module::thread::before_external_block();
                         host_nt::spawnve(
@@ -12114,21 +11992,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 let src = crate::gateway::fsencode_path_named_w(args[0], "link", "src")?;
                 let dst = crate::gateway::fsencode_path_named_w(args[1], "link", "dst")?;
                 let (wide_src, wide_dst) = (wide_path(&src.as_bytes)?, wide_path(&dst.as_bytes)?);
-                let ok = unsafe {
-                    windows_sys::Win32::Storage::FileSystem::CreateHardLinkW(
-                        wide_dst.as_ptr(),
-                        wide_src.as_ptr(),
-                        std::ptr::null(),
-                    )
-                };
-                if ok == 0 {
-                    return Err(fs_err_with_filename2(
-                        std::io::Error::last_os_error(),
-                        0,
-                        src.w_path(),
-                        dst.w_path(),
-                    ));
-                }
+                rustpython_host_env::winapi::create_hard_link(&wide_dst, &wide_src)
+                    .map_err(|error| fs_err_with_filename2(error, 0, src.w_path(), dst.w_path()))?;
                 Ok(pyre_object::w_none())
             }),
         );
@@ -12357,9 +12222,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             ns,
             "startfile",
             crate::make_builtin_function("startfile", |args| {
-                use windows_sys::Win32::UI::Shell::ShellExecuteW;
-                use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-
                 // Every optional argument is positional-or-keyword, so the
                 // four of them are looked up either way round.
                 //
@@ -12408,27 +12270,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 };
                 let show_cmd = match given(4, "show_cmd") {
                     Some(w) => crate::baseobjspace::c_int_w(w)?,
-                    None => SW_SHOWNORMAL as i32,
+                    None => rustpython_host_env::winapi::SW_SHOWNORMAL,
                 };
-                let as_ptr = |wide: &Option<widestring::WideCString>| {
-                    wide.as_ref().map_or(std::ptr::null(), |w| w.as_ptr())
-                };
-                let rc = unsafe {
-                    ShellExecuteW(
-                        std::ptr::null_mut(),
-                        as_ptr(&operation),
-                        wide_file.as_ptr(),
-                        as_ptr(&arguments),
-                        as_ptr(&cwd),
-                        show_cmd,
-                    )
-                };
-                if rc as isize <= 32 {
-                    return Err(fs_err_with_filename(
-                        std::io::Error::last_os_error(),
-                        path.w_path(),
-                    ));
-                }
+                rustpython_host_env::winapi::shell_execute_w(
+                    &wide_file,
+                    operation.as_deref(),
+                    arguments.as_deref(),
+                    cwd.as_deref(),
+                    show_cmd,
+                )
+                .map_err(|error| fs_err_with_filename(error, path.w_path()))?;
                 Ok(pyre_object::w_none())
             }),
         );

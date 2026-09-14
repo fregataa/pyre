@@ -1710,18 +1710,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     let name = crate::gateway::fsencode_bytes_w(args[0])?;
                     let c_name = std::ffi::CString::new(name)
                         .map_err(|_| crate::PyError::value_error("embedded null in name"))?;
-                    #[cfg(feature = "host_env")]
-                    let idx = rustpython_host_env::socket::if_nametoindex_checked(&c_name)
-                        .map_err(socket_io_err)?;
                     #[cfg(not(feature = "host_env"))]
-                    let idx = {
-                        let idx = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
-                        if idx == 0 {
-                            return Err(socket_last_error());
-                        }
-                        idx
-                    };
-                    Ok(pyre_object::w_int_new(idx as i64))
+                    {
+                        let _ = c_name;
+                        return Err(crate::PyError::not_implemented(
+                            "socket.if_nametoindex requires host_env",
+                        ));
+                    }
+                    #[cfg(feature = "host_env")]
+                    {
+                        let idx = rustpython_host_env::socket::if_nametoindex_checked(&c_name)
+                            .map_err(socket_io_err)?;
+                        Ok(pyre_object::w_int_new(idx as i64))
+                    }
                 },
                 1,
             ),
@@ -1748,20 +1749,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             "Python int too large for C unsigned int",
                         )
                     })?;
-                    #[cfg(feature = "host_env")]
-                    let name = rustpython_host_env::socket::if_indextoname_checked(idx)
-                        .map_err(socket_io_err)?
-                        .into_bytes();
                     #[cfg(not(feature = "host_env"))]
-                    let name = {
-                        let mut buf = [0u8; libc::IF_NAMESIZE];
-                        let p = unsafe { libc::if_indextoname(idx, buf.as_mut_ptr().cast()) };
-                        if p.is_null() {
-                            return Err(socket_last_error());
-                        }
-                        unsafe { std::ffi::CStr::from_ptr(p).to_bytes().to_vec() }
-                    };
-                    Ok(crate::gateway::fsdecode_filename_bytes(&name))
+                    {
+                        let _ = idx;
+                        return Err(crate::PyError::not_implemented(
+                            "socket.if_indextoname requires host_env",
+                        ));
+                    }
+                    #[cfg(feature = "host_env")]
+                    {
+                        let name = rustpython_host_env::socket::if_indextoname_checked(idx)
+                            .map_err(socket_io_err)?
+                            .into_bytes();
+                        Ok(crate::gateway::fsdecode_filename_bytes(&name))
+                    }
                 },
                 1,
             ),
@@ -5814,29 +5815,34 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let returned = match cmd {
                 ws::SIO_RCVALL | ws::SIO_LOOPBACK_FAST_PATH => {
                     let value = masked_ulong_w(args[2])?;
-                    unsafe {
-                        rffi::wsa_ioctl(
-                            fd,
-                            cmd,
-                            (&raw const value).cast(),
-                            core::mem::size_of::<u32>() as u32,
-                        )
+                    #[cfg(feature = "host_env")]
+                    {
+                        rustpython_host_env::socket::ioctl_u32(fd as _, cmd, value).ok()
+                    }
+                    #[cfg(not(feature = "host_env"))]
+                    {
+                        let _ = value;
+                        None
                     }
                 }
                 ws::SIO_KEEPALIVE_VALS => {
                     let [onoff, keepalivetime, keepaliveinterval] = ioctl_keepalive_w(args[2])?;
-                    let keepalive = ws::tcp_keepalive {
-                        onoff,
-                        keepalivetime,
-                        keepaliveinterval,
-                    };
-                    unsafe {
-                        rffi::wsa_ioctl(
-                            fd,
-                            cmd,
-                            (&raw const keepalive).cast(),
-                            core::mem::size_of::<ws::tcp_keepalive>() as u32,
+                    #[cfg(feature = "host_env")]
+                    {
+                        rustpython_host_env::socket::ioctl_keepalive(
+                            fd as _,
+                            rustpython_host_env::socket::TcpKeepalive {
+                                onoff,
+                                keepalivetime,
+                                keepaliveinterval,
+                            },
                         )
+                        .ok()
+                    }
+                    #[cfg(not(feature = "host_env"))]
+                    {
+                        let _ = (onoff, keepalivetime, keepaliveinterval);
+                        None
                     }
                 }
                 _ => {

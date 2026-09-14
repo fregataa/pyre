@@ -145,6 +145,7 @@ pub mod host_seam {
     }
 }
 pub mod async_operation;
+pub mod codec_engine;
 pub mod jit_builtin_folds;
 pub mod jit_fnaddr;
 pub mod launch_env;
@@ -162,7 +163,7 @@ pub mod stack_check;
 pub mod syntax_warnings;
 pub mod type_methods;
 pub mod typedef;
-#[cfg(windows)]
+#[cfg(all(windows, feature = "host_env"))]
 pub mod unicodehelper_win32;
 pub mod warn;
 
