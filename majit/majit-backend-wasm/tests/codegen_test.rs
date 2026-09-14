@@ -7222,6 +7222,147 @@ fn guard_value_parks_its_operand_past_every_exits_fail_args() {
     );
 }
 
+#[test]
+fn sparse_resume_positions_use_compact_exit_and_force_locations() {
+    #[derive(Debug)]
+    struct SparseDescr {
+        locs: Vec<u16>,
+        types: Vec<Type>,
+        counter: std::sync::atomic::AtomicU32,
+    }
+    impl majit_ir::Descr for SparseDescr {
+        fn as_fail_descr(&self) -> Option<&dyn majit_ir::FailDescr> {
+            Some(self)
+        }
+    }
+    impl majit_ir::FailDescr for SparseDescr {
+        fn make_a_counter_per_value(&self, index: u32, _type_tag: u64) {
+            self.counter
+                .store(index, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn fail_index(&self) -> u32 {
+            0
+        }
+        fn rd_locs(&self) -> &[u16] {
+            &self.locs
+        }
+        fn fail_arg_types(&self) -> &[Type] {
+            &self.types
+        }
+    }
+
+    // ResumeDataLoopMemo can leave a wide logical numbering with just two
+    // live boxes. Neither normal exits nor force brackets may reserve the
+    // intervening holes in the source token's physical frame.
+    // A compared operand may be absent, present only in a logical hole, or
+    // present both in an earlier hole and a later live position.
+    for (force, counter_position) in [
+        (false, None),
+        (false, Some(3)),
+        (false, Some(17)),
+        (true, None),
+    ] {
+        let inputargs: Vec<_> = (0..3).map(|i| InputArg::from_type(Type::Int, i)).collect();
+        let mut failargs = vec![OpRef::NONE; 100];
+        failargs[17] = OpRef::input_arg_int(2);
+        failargs[99] = OpRef::input_arg_int(1);
+        if let Some(position) = counter_position {
+            failargs[3] = OpRef::input_arg_int(0);
+            failargs[position] = OpRef::input_arg_int(0);
+        }
+        let mut locs = vec![0xFFFF; 100];
+        locs[17] = 17;
+        locs[99] = 99;
+        let guard = if force {
+            make_guard(OpCode::GuardNotForced2, &[], &failargs)
+        } else {
+            make_guard(
+                OpCode::GuardValue,
+                &[OpRef::input_arg_int(0), OpRef::const_int(0)],
+                &failargs,
+            )
+        };
+        let descr = std::sync::Arc::new(SparseDescr {
+            locs,
+            types: vec![Type::Int; 100],
+            counter: std::sync::atomic::AtomicU32::new(u32::MAX),
+        });
+        guard.setdescr(descr.clone());
+        let ops = vec![
+            guard,
+            Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(1))]),
+        ];
+        assert_eq!(codegen::frame_value_slots(&inputargs, &ops), 5);
+        let frame = codegen::FrameGeometry::compact(5, 0, 0);
+        let (bytes, guards) = build_module_with_frame(
+            &inputargs,
+            &ops,
+            &indexmap::IndexMap::new(),
+            Some(0),
+            &codegen::GuardGcTypeInfo::default(),
+            frame,
+        );
+        assert_eq!(guards[0].fail_locs[17], Some(0));
+        assert_eq!(guards[0].fail_locs[99], Some(1));
+        assert!(guards[0].fail_locs[..17].iter().all(Option::is_none));
+        let parked = !force && counter_position != Some(17);
+        if !force {
+            assert_eq!(
+                descr.counter.load(std::sync::atomic::Ordering::Relaxed),
+                if parked { 100 } else { 17 }
+            );
+        }
+        if parked {
+            assert_eq!(
+                guards[0].fail_locs[100],
+                Some(3),
+                "counter coordinate remains logical"
+            );
+        }
+        validate_wasm(&bytes);
+        let engine = Engine::default();
+        let module = Module::new(&engine, &bytes).unwrap();
+        let mut store = Store::new(&engine, ());
+        let memory = Memory::new(&mut store, MemoryType::new(2, None)).unwrap();
+        let mut linker = Linker::new(&engine);
+        linker.define("env", "memory", memory).unwrap();
+        let instance = linker.instantiate_and_start(&mut store, &module).unwrap();
+        let base = 4096usize;
+        for (i, value) in [5i64, 42, 7].iter().enumerate() {
+            memory
+                .write(&mut store, base + 8 + i * 8, &value.to_le_bytes())
+                .unwrap();
+        }
+        instance
+            .get_typed_func::<i32, i32>(&store, "trace")
+            .unwrap()
+            .call(&mut store, base as i32)
+            .unwrap();
+        let read = |offset: usize| {
+            let mut bytes = [0u8; 8];
+            memory.read(&store, base + offset, &mut bytes).unwrap();
+            i64::from_le_bytes(bytes)
+        };
+        let offset = if force {
+            frame.force_slot_base as usize
+        } else {
+            8
+        };
+        assert_eq!(
+            read(offset),
+            if counter_position == Some(17) { 5 } else { 7 }
+        );
+        assert_eq!(read(offset + 8), 42);
+        if parked {
+            assert_eq!(
+                read(8 + 3 * 8),
+                5,
+                "counter operand survives compact spilling"
+            );
+        }
+    }
+}
+
 /// A bridge executes in its source token's frame, whose offsets froze when that
 /// token was compiled, and `compile_bridge` refuses a bridge whose
 /// `frame_value_slots` exceeds `source_frame.value_slots` — a refusal
