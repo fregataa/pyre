@@ -846,7 +846,9 @@ impl std::fmt::Display for DescentDecline {
 /// executes, so what this switch measures is mostly the price of a static
 /// answer to a dynamic question. It is a diagnostic, not a tuning knob:
 /// the scan is on unless it is explicitly turned off, because the rewind it
-/// prevents is a wrong answer and not a slow one.
+/// prevents is a wrong answer and not a slow one. The attempted rollback
+/// compiles `test_pickle` writes to an empty payload and changes
+/// `test_hashlib`'s bytes argument into a string.
 fn descent_unlowered_helper_scan_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_DESCENT_SCAN_OFF").is_none())
@@ -1147,6 +1149,18 @@ struct DescentPoint {
     fresh_r: Vec<bool>,
 }
 
+/// True when a funcbox constant names a residual
+/// `do_residual_call`'s `provably_side_effect_free` already spares by
+/// address: a re-runnable bookkeeping helper or a root-bracket one.
+///
+/// The scan asks this of a constant where the walk asks it of an executed
+/// call.  They have to agree — a body the scan calls effectful and the walk
+/// does not is a descent refused for an effect that never happens.
+fn effect_free_residual_fnaddr(fnaddr: i64) -> bool {
+    pyre_interpreter::is_rewindable_root_bracket_residual_i64(fnaddr)
+        || pyre_interpreter::is_rerunnable_bookkeeping_residual(fnaddr as usize)
+}
+
 /// Whether stepping `opname` applies an effect the walk would have to undo.
 ///
 /// The walk's own odometer (`fbw_bump_executed_effect`) counts an executed
@@ -1156,6 +1170,12 @@ struct DescentPoint {
 /// and add the direct heap writes, which the odometer reaches only through a
 /// journal.  Both directions are conservative: the scan may call a body
 /// effectful where the walk would not, never the reverse.
+///
+/// Two of those the caller spares, because the odometer spares them too: a
+/// residual the walk would not count ([`effect_free_residual_fnaddr`], or
+/// [`residual_call_is_effect_free`]) and a store into an object this same body
+/// allocated.  Calling either effectful here refuses a descent for an effect
+/// that never happens.
 fn descent_op_applies_effect(opname: &str) -> bool {
     opname.starts_with("residual_call")
         || opname.starts_with("setfield_gc")
@@ -1219,14 +1239,20 @@ fn heap_write_into_fresh_object(
 /// register of a `switch/id`.
 fn descr_operand_index(code: &[u8], op: &crate::jitcode_runtime::DecodedOp) -> Option<usize> {
     let mut cursor = op.pc + 1;
-    for c in op.argcodes.chars() {
+    let mut chars = op.argcodes.chars();
+    while let Some(c) = chars.next() {
         match c {
             'i' | 'c' | 'r' | 'f' => cursor += 1,
+            'j' => cursor += 2,
             'I' | 'R' | 'F' => cursor += 1 + *code.get(cursor)? as usize,
             'd' => {
                 return Some(
                     *code.get(cursor)? as usize | ((*code.get(cursor + 1)? as usize) << 8),
                 );
+            }
+            '>' => {
+                chars.next()?;
+                cursor += 1;
             }
             _ => return None,
         }
@@ -1732,11 +1758,58 @@ pub(crate) fn summarize_body_blockers_with(
                 summary.first_effect_pc.get_or_insert(d.pc);
             }
         }
-        if descent_op_applies_effect(d.opname)
-            && !(d.opname.starts_with("residual_call")
-                && descr_operand_index(code, &d).is_some_and(|index| call_effect_free(index)))
-            && !heap_write_into_fresh_object(code, &d, &fresh_r)
-        {
+        // A store into an object this body allocated is not an effect: the
+        // allocation goes with the trace, so a rewind leaves nothing that could
+        // read what the store wrote.  The three `_gc` store families all put
+        // the written object in their first operand.  A residual is spared
+        // when its calldescr reports no undoable effect (`rlib/jit.py
+        // elidable` / `not_in_trace`), or when its funcbox names a helper
+        // the walk's `provably_side_effect_free` already spares by address.
+        let residual_odometer_exempt = d.opname.starts_with("residual_call")
+            && (descr_operand_index(code, &d).is_some_and(|index| call_effect_free(index))
+                || code
+                    .get(d.pc + 1)
+                    .and_then(|&slot| known_i.get(slot as usize).copied().flatten())
+                    .is_some_and(effect_free_residual_fnaddr));
+        let applies_effect = descent_op_applies_effect(d.opname)
+            && !residual_odometer_exempt
+            && !heap_write_into_fresh_object(code, &d, &fresh_r);
+        // Every blocker a body reports reads as `after_effect` once one early
+        // op arms the flag, so the reachable set alone does not say what to
+        // repair.  Name each op that arms it — with the helper a residual's
+        // funcbox resolves to, and the field a store writes — so the first one
+        // on the entry path is readable.
+        if !effect && applies_effect && fbw_inline_diag_enabled() {
+            let funcbox = d
+                .opname
+                .starts_with("residual_call")
+                .then(|| code.get(d.pc + 1).copied())
+                .flatten()
+                .and_then(|slot| known_i.get(slot as usize).copied())
+                .flatten();
+            let field = descr_operand_index(code, &d).and_then(|index| {
+                crate::jitcode_runtime::descr_ref_table()
+                    .at(index)
+                    .and_then(|descr| descr.as_field_descr().map(|f| f.field_name().to_string()))
+            });
+            // A bare address names nothing on its own, and the registry that
+            // resolves it is the same one the funcbox constant came from.
+            let helper = funcbox.and_then(|addr| {
+                pyre_interpreter::jit_trace_fnaddrs()
+                    .iter()
+                    .find(|(_, registered)| *registered == addr)
+                    .map(|(path, _)| (*path).to_string())
+            });
+            eprintln!(
+                "[descent-effect-origin] pc={} op={} funcbox={} field={} helper={}",
+                d.pc,
+                d.opname,
+                funcbox.map_or_else(|| "-".to_string(), |addr| format!("{addr:#x}")),
+                field.as_deref().unwrap_or("-"),
+                helper.as_deref().unwrap_or("-"),
+            );
+        }
+        if applies_effect {
             effect = true;
             summary.first_effect_pc.get_or_insert(d.pc);
         }
@@ -1765,11 +1838,17 @@ pub(crate) fn summarize_body_blockers_with(
             .is_some_and(|(_, dst)| dst == "r")
             && let Some(&dst) = code.get(d.next_pc.wrapping_sub(1))
         {
-            // A Ref-bank write is fresh only when a `new*` op produced it; any
-            // other producer -- a field read, a call result, a copy -- may name
+            // A Ref-bank write is fresh when a `new*` op produced it or a
+            // `ref_copy` carried that ownership; any other producer may name
             // live heap.
+            let fresh = d.opname.starts_with("new")
+                || (d.key == "ref_copy/r>r"
+                    && code
+                        .get(d.pc + 1)
+                        .and_then(|&src| fresh_r.get(src as usize).copied())
+                        .unwrap_or(false));
             if let Some(slot) = fresh_r.get_mut(dst as usize) {
-                *slot = d.opname.starts_with("new");
+                *slot = fresh;
             }
             // The wrapper-argument array can move between Ref colors before its
             // length check.  Only a plain ref copy preserves that entry fact.
@@ -4484,8 +4563,9 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // member, so print it.
     //
     // Every bail between here and the descent below names itself for the same
-    // reason.  With the tail of this function silent, a `PYRE_FBW_DESCENT_SCAN_OFF=1`
-    // run of `abc_instancecheck_weak_cache` printed no builtin-inline line at
+    // reason.  With the tail of this function silent, a run of
+    // `abc_instancecheck_weak_cache` with the scan's decline withdrawn printed
+    // no builtin-inline line at
     // all and recorded the same 69 ops as the gated run, which reads as "the
     // descent scan is the wall" when the scan had already been switched off and
     // something downstream refused instead.
@@ -4961,6 +5041,10 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
             return Ok(None);
         }
         Err(error) => {
+            // The arm above withdrew its descent and returned the call to the
+            // ordinary residual, so it is not an abort and leaves the body
+            // eligible.  Reaching here does not: the walk stops, and the next
+            // attempt would rebuild the same shape and stop again.
             if let DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic } = &error {
                 if fbw_inline_diag_enabled() {
                     eprintln!(

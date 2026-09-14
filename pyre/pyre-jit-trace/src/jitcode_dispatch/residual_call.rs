@@ -3474,6 +3474,13 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // piece has to carry the exemption the whole used to.
     let is_rerunnable_bookkeeping =
         pyre_interpreter::is_rerunnable_bookkeeping_residual(func_ptr as usize);
+    // Same re-runnability question as `stack_check`: `dont_look_inside`
+    // (`rlib/jit.py dont_look_inside`) residualises the call but does not
+    // license the optimizer to drop it (`elidable`).  A rewind re-pins from
+    // the save point it finds, so the odometer must not count the bracket
+    // the way the descent scan already does not.
+    let is_rewindable_root_bracket =
+        pyre_interpreter::is_rewindable_root_bracket_residual(func_ptr as usize);
     if allboxes.len() - 1 > majit_translate::codewriter::insns::MAX_HOST_CALL_ARITY {
         return Ok(declined_symbolic(call_opcode));
     }
@@ -4000,6 +4007,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     );
     let provably_side_effect_free = reentrant_residual
         || is_rerunnable_bookkeeping
+        || is_rewindable_root_bracket
         || helper == majit_ir::RuntimeHelperKind::ForIterNext
         || observed_exact_scalar_str
         || observed_exact_str_iter
@@ -8473,6 +8481,11 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     } else {
         code[op.pc + 1 + descr_offset + 2] as usize
     };
+
+    // RootScope::get remains a residual unless the translator proves its
+    // slot/value pairing. `shadowcolor.expand_one_pop_roots` reconstructs a
+    // specific live value from its root slot; equality of an input-dependent
+    // index with a slot observed while tracing is not that proof.
 
     // Flat argboxes = i_args ++ r_args (`boxes2` argcode order).
     // Parallel argbox_types stamps each entry with its source bank so

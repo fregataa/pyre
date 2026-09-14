@@ -667,7 +667,9 @@ fn lower_result_exc_returns_inner(
         // be dropped and the JIT would raise earlier than the interpreter.
         // Require the strict pure-forwarder property (empty, unconditional
         // intervening blocks only) for `Err` shells; decline to a residual
-        // call otherwise. RootScope closes are preserved on the rewritten edge.
+        // call otherwise. RootScope closes (`drop_in_place` or the named
+        // `root_scope_close` residual) are re-emitted at the raise site rather
+        // than left in a tail the rewrite bypasses.
         let (forward_err, root_scope_closes): (Option<String>, Vec<OpKind>) = if is_err {
             match root_scope_closes_to_returnblock(graph, bi, &ctor_var) {
                 Ok(closes) => (None, closes),
@@ -762,6 +764,8 @@ fn lower_result_exc_returns_inner(
             // value — a single owned word — so the payload is forwarded
             // into the raise unchanged and no call is emitted at all.
             let v_exc = materialize_error_to_exc_object(graph, block_id, payload, spec);
+            // After the exception object exists and before the raise: the
+            // order the guard's destructor runs in.
             for close in root_scope_closes {
                 graph.push_op_var(block_id, close, true);
             }
@@ -2201,10 +2205,14 @@ fn verify_drain_reraise_returns_err_payload(
         "reraise",
         name,
     )?;
-    root_scope_closes_to_returnblock(graph, reraise_target, &outer).map_err(|_| {
+    // A root-bracket close is the one operation such a block may carry: the
+    // rewind has to run before the function leaves either way, so it is handed
+    // back for the caller to re-emit at the substituted raise rather than left
+    // in a tail nothing reaches.  Anything else still fails here.
+    root_scope_closes_to_returnblock(graph, reraise_target, &outer).map_err(|e| {
         format!(
             "{name}: reraise arm block {reraise_target} does not forward the Err shell \
-             unconditionally to returnblock"
+             unconditionally to returnblock: {e}"
         )
     })
 }
@@ -2457,6 +2465,8 @@ fn try_fuse_drain_match(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Re
         .ok_or_else(|| format!("{name}: drain fuse: bool-switch drops the Err payload"))?;
     let e_reraise = forward_alias(graph, &e_bswitch, &reraise_link)
         .ok_or_else(|| format!("{name}: drain fuse: reraise link drops the Err payload"))?;
+    // The bracket closes the reraise tail runs, remapped into A's namespace.
+    // Block `R` replaces the tail, so `R` re-emits them before its raise.
     let reraise_closes =
         verify_drain_reraise_returns_err_payload(graph, reraise_target, &e_reraise, &name)?;
     let a_to_b = graph.blocks[a].exits[0].clone();
@@ -2787,6 +2797,8 @@ fn try_fuse_drain_match(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Re
     // than the int-kinded `va` — the raise operand must be the ref-kinded
     // exception value, and a second ref-kinded producer would only add a dead
     // residual to the arm a guard-failure resume walks.
+    // The rewind the substituted tail would have run, re-emitted before the
+    // raise: the order the guard's destructor ran in.
     for close in reraise_closes_a {
         let OpKind::Call {
             target,
@@ -3099,6 +3111,17 @@ fn forwards_to_returnblock_inner(
         current = target;
     }
     Err("forwarding chain is longer than the block count".to_string())
+}
+
+/// True for the root bracket's close, the one operation an `Err` shell's
+/// forwarding chain may carry.
+///
+/// The close is a leaf: one argument, no result anything reads, and no
+/// dependence on where in the chain it sits. That is what lets the `Err`
+/// rewrite re-emit it at the raise site instead of declining the callee.
+fn is_root_bracket_close(kind: &OpKind) -> bool {
+    matches!(kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+        if segments.last().is_some_and(|s| s == super::mir::ROOT_SCOPE_CLOSE))
 }
 
 /// A bounded rendering of an op kind, for diagnostics that name the
@@ -3589,10 +3612,20 @@ pub(crate) fn fuse_kind_ctor_raise(graph: &mut FunctionGraph) {
     for si in 0..graph.blocks.len() {
         let succ = &graph.blocks[si];
         // `succ` holds the materialisation, optionally followed by
-        // `op.type(evalue)` (`exc_from_raise`), and raises.
-        let (op, type_result) = match succ.operations.as_slice() {
-            [op] => (op, None),
-            [op, type_op] => {
+        // `op.type(evalue)` (`exc_from_raise`), plus any root-bracket closes,
+        // and raises. Closes commute with both ops, so they are stripped
+        // before the shape check and left in the block.
+        let non_close: Vec<usize> = succ
+            .operations
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| !is_root_bracket_close(&op.kind))
+            .map(|(i, _)| i)
+            .collect();
+        let (op, type_result) = match non_close.as_slice() {
+            &[i] => (&succ.operations[i], None),
+            &[i, j] => {
+                let type_op = &succ.operations[j];
                 let OpKind::Call {
                     target: CallTarget::FunctionPath { segments },
                     args: type_args,
@@ -3604,7 +3637,10 @@ pub(crate) fn fuse_kind_ctor_raise(graph: &mut FunctionGraph) {
                 if segments.as_slice() != ["type"] {
                     continue;
                 }
-                (op, Some((type_op.result.as_ref(), type_args.as_slice())))
+                (
+                    &succ.operations[i],
+                    Some((type_op.result.as_ref(), type_args.as_slice())),
+                )
             }
             _ => continue,
         };
@@ -3706,7 +3742,12 @@ pub(crate) fn fuse_kind_ctor_raise(graph: &mut FunctionGraph) {
         // Re-close with `op.type(payload)` so exceptblock slot 0 stays
         // class-shaped (`flowcontext.py exc_from_raise`).
         let payload = graph.blocks[si].inputargs[pos].clone();
-        graph.blocks[si].operations.clear();
+        // Drop the materialisation the constructor now performs, keep the
+        // bracket closes, then close with `op.type(payload)` so exceptblock
+        // slot 0 stays class-shaped (`flowcontext.py exc_from_raise`).
+        graph.blocks[si]
+            .operations
+            .retain(|op| is_root_bracket_close(&op.kind));
         crate::front::exc_from_raise::set_raise_from_instance(graph, graph.blocks[si].id, payload);
     }
 }
