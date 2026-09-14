@@ -838,6 +838,8 @@ fn snapshot_inputarg_for_stack_ptr(
     })
 }
 
+/// Recorder snapshot tag to a resume box. A stack-resident Const Ref
+/// remaps to the InputArg that already carries those bits.
 fn snapshot_tagged_to_box(
     tagged: &crate::recorder::SnapshotTagged,
     inputargs: &[majit_ir::InputArgRc],
@@ -1303,6 +1305,8 @@ fn assert_prepared_cache_bank(where_: &str, opref: OpRef, found_ty: Option<Type>
     }
 }
 
+/// The reminted InputArg that occupies the assembled loop Vm slot
+/// (`InputArg(1)`). `None` when that slot was not a Ref.
 fn reminted_loop_vm_red(original: &[InputArg], reminted: &[InputArg]) -> Option<OpRef> {
     let assembled = OpRef::input_arg_typed(1, Type::Ref);
     original.iter().zip(reminted.iter()).find_map(|(old, new)| {
@@ -14929,6 +14933,9 @@ impl<M: Clone> MetaInterp<M> {
             .is_some_and(|var| var.name == "vm")
     }
 
+    /// Prefer the hole-filtered failarg index of the parent guard's
+    /// assembled Vm; fall back to the reminted loop slot when the
+    /// compiled trace has no such index.
     fn reminted_vm_red_for_bridge(
         &self,
         origin_key: u64,
@@ -15041,6 +15048,22 @@ impl<M: Clone> MetaInterp<M> {
         // RPython unroll.py: Optimizer.optimize_bridge()
         // compile.py: isinstance(resumekey, ResumeAtPositionDescr)
         let inline_short_preamble = !fail_descr.is_resume_at_position();
+        // A Grain inner-`for` exhaust JUMP onto the outer loop is the
+        // orthodox close (`compile.py` compile_trace JUMP). The dest
+        // LABEL is the rotated outer *body* until the walk stores the
+        // next item at the outer `IterNext` header (`FOR_ITER`). A
+        // published close that re-enters the body with a stale `p`
+        // disagrees (5000: 638 vs 669). Decline until dest is that
+        // header (`unroll.py:196-200`).
+        if cell_token_key != green_key && self.second_portal_red_is_grain_vm() {
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit] compile_bridge: decline Grain cross-loop close \
+                     origin={green_key} dest={cell_token_key}"
+                );
+            }
+            return false;
+        }
         // RPython warmspot.py:93 retrace_limit=5: allow bridge to create
         // new target_token specializations when existing body token doesn't
         // match. Without this, bridges fall back to preamble (causing
@@ -15314,6 +15337,14 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             None
         };
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[jit] compile_bridge origin={green_key} dest={jump_target_key} \
+                 cell={cell_token_key} crossed={} dest_n={}",
+                crossed_target_tokens.is_some(),
+                crossed_target_tokens.as_ref().map(|t| t.len()).unwrap_or(0),
+            );
+        }
         // compile.py compile_trace: ends_with_jump selects BridgeCompileData
         // (UnrollOptimizer.optimize_bridge) vs SimpleCompileData
         // (Optimizer.optimize_loop). A DoneWithThisFrame FINISH has no JUMP
