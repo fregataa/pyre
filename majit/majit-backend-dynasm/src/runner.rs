@@ -27,6 +27,7 @@ use crate::aarch64::cpu_ext::Aarch64CpuExt as ArchCpuExt;
 use crate::arch;
 use crate::codebuf;
 use crate::jitframe::JitFrame;
+use crate::regloc::Loc;
 #[cfg(target_arch = "x86_64")]
 use crate::x86::assembler::{Assembler386 as Asm, CompiledCode};
 #[cfg(target_arch = "x86_64")]
@@ -2729,6 +2730,7 @@ impl Backend for DynasmBackend {
         let trace_id = self.next_trace_id;
         self.next_trace_id += 1;
 
+        let arglocs = Asm::rebuild_faillocs_from_descr(fail_descr, inputargs);
         let (prepared_ops, gcrefs) = self.prepare_ops_for_compile(inputargs, ops);
         // format_trace reads raw `i64` values; the assembler stores the
         // typed `Const` pool directly (type rides on `Const::get_type`).
@@ -2787,7 +2789,7 @@ impl Backend for DynasmBackend {
             malloc_slowpath_fixed,
             #[cfg(target_arch = "x86_64")]
             malloc_slowpath_headerless,
-            inputargs,
+            &inputargs,
             &prepared_ops,
         );
         // `assembler.py assemble_bridge`: `reserve_gcref_table(allgcrefs)`
@@ -2810,7 +2812,6 @@ impl Backend for DynasmBackend {
         // locations — and every inputarg past the shorter list then bound
         // nothing at all (`RegisterManager.loc: box InputArgInt(1844) not
         // found`).
-        let arglocs = Asm::rebuild_faillocs_from_descr(fail_descr, inputargs);
         let compiled = asm.assemble_bridge(fail_descr, &arglocs)?;
         // `llsupport/assembler.py assemble_bridge` keeps `self.current_clt =
         // original_loop_token.compiled_loop_token` for the whole emission, so a
@@ -4108,6 +4109,7 @@ impl Backend for DynasmBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn reference_value_read_does_not_become_a_substructure_address() {
         let referent = 123usize;

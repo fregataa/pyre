@@ -159,7 +159,8 @@ pub struct LowererConfig {
     /// Array name → (array_index, item_type).
     /// RPython: `vinfo.array_field_counter[fieldname]` → index.
     pub(super) vable_arrays: HashMap<String, (usize, ValueKind)>,
-    /// State field scalars: field_name → global_field_index.
+    /// Scalar declarations: field_name → legacy state-slot index. Fields also
+    /// present in `vable_fields` use that object's field index instead.
     pub(super) state_scalars: HashMap<String, usize>,
     /// State field arrays (flattened): field_name → global_array_index.
     pub(super) state_arrays: HashMap<String, usize>,
@@ -168,8 +169,8 @@ pub struct LowererConfig {
     pub(super) state_virt_arrays: HashMap<String, (usize, ValueKind)>,
     /// State field ref scalars: field_name → (ref_scalar_index, struct Path).
     /// The index is 0-based in its own space (separate from `state_scalars`);
-    /// these lower to load_state_field_ref/store_state_field_ref in the ref
-    /// register bank.  The `ref(T)` struct Path `T` is retained so a field
+    /// fields in `vable_fields` use the live object's field instead of a
+    /// legacy state slot. The `ref(T)` struct Path `T` is retained so a field
     /// read/write through the ref (`state.<ref_scalar>.<member>`) can emit
     /// `getfield_gc_*`/`setfield_gc_*` with `offset_of!(T, member)` + the
     /// matching `struct_type_id(T)`.
@@ -332,11 +333,16 @@ impl LowererConfig {
 
     /// One past the last float-bank identity slot.
     pub(super) fn float_identity_end(&self) -> u16 {
-        if self.state_float_scalars.is_empty() {
-            0
-        } else {
-            self.float_identity_base() + self.state_float_scalars.len() as u16
-        }
+        self.state_float_scalars
+            .iter()
+            .filter(|(name, _)| !self.is_state_vable_field(name))
+            .map(|(_, index)| self.float_identity_base() + *index as u16 + 1)
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn is_state_vable_field(&self, name: &str) -> bool {
+        self.vable_var.as_deref() == Some("state") && self.vable_fields.contains_key(name)
     }
 
     /// Exclusive end of the int-bank and ref-bank identity-slot ranges
@@ -353,13 +359,30 @@ impl LowererConfig {
     /// path re-derives at deopt. Returns `0` for a bank with no identity
     /// slots so the caller's `.max()` floor is inert there.
     pub(super) fn split_identity_reg_ends(&self) -> (u16, u16) {
-        let int_end = self.int_identity_base()
-            + self.state_scalars.len() as u16
-            + u16::from(!self.state_virt_arrays.is_empty());
-        let ref_end = if self.state_ref_scalars.is_empty() {
+        // Scalars redirected onto the virtualizable (`vable_fields`) are
+        // not independent identity slots. Counting them here would
+        // reserve registers the split arm never uses and can overflow
+        // the 256-register JitCode ceiling.
+        let int_scalars = self
+            .state_scalars
+            .iter()
+            .filter(|(name, _)| !self.is_state_vable_field(name))
+            .map(|(_, index)| *index as u16 + 1)
+            .max()
+            .unwrap_or(0);
+        let int_end =
+            self.int_identity_base() + int_scalars + u16::from(!self.state_virt_arrays.is_empty());
+        let ref_scalars = self
+            .state_ref_scalars
+            .iter()
+            .filter(|(name, _)| !self.is_state_vable_field(name))
+            .map(|(_, (index, _))| *index as u16 + 1)
+            .max()
+            .unwrap_or(0);
+        let ref_end = if ref_scalars == 0 {
             0
         } else {
-            self.ref_identity_base() + self.state_ref_scalars.len() as u16
+            self.ref_identity_base() + ref_scalars
         };
         (int_end, ref_end)
     }
@@ -1104,7 +1127,7 @@ impl LowererConfig {
                 (canonical_path_segments(&entry.path), spec)
             })
             .collect();
-        let (mut vable_var, mut vable_input_ref_reg, vable_fields, mut vable_arrays) =
+        let (mut vable_var, mut vable_input_ref_reg, mut vable_fields, mut vable_arrays) =
             if let Some(decl) = vable_decl {
                 let var = Some(decl.var_name.to_string());
                 let fields = decl
@@ -1204,6 +1227,19 @@ impl LowererConfig {
             vable_input_ref_reg = Some(1);
             for (name, &(idx, kind)) in &state_virt_arrays {
                 vable_arrays.insert(name.clone(), (idx, kind));
+            }
+            // jtransform.py rewrite_op_getfield: all redirected fields use
+            // the live virtualizable argument, including in inline callees.
+            for f in &state_fields_cfg.unwrap().fields {
+                let kind = match &f.kind {
+                    crate::jit_interp::StateFieldKind::Scalar { ir_type, .. } => {
+                        ValueKind::from_ident(ir_type)
+                    }
+                    crate::jit_interp::StateFieldKind::Ref(_) => ValueKind::Ref,
+                    _ => continue,
+                };
+                let index = vable_fields.len();
+                vable_fields.insert(f.name.to_string(), (index, kind));
             }
         }
         // Fail closed: a `residual_writes` ref_scalar or a `pool_arrays` name
@@ -2107,6 +2143,105 @@ impl LoweredSequence {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pointer_cast_temporaries_are_colored_with_their_builder_operands() {
+        for expr in [
+            syn::parse_quote!(arg as isize),
+            syn::parse_quote!(arg as usize),
+        ] {
+            let mut lowerer = Lowerer::new(None);
+            lowerer
+                .bindings
+                .insert("arg".into(), binding(0, BindingKind::Int));
+            lowerer.next_reg = 200;
+            let result = lowerer.lower_value_expr(&expr).unwrap();
+            let (_, result) = regalloc::compact_registers(
+                &mut lowerer,
+                regalloc::RegisterCounts {
+                    ints: 1,
+                    ..Default::default()
+                },
+                Some(Register::int(result.reg)),
+            );
+            assert!(result.unwrap().index < 8);
+            let statements = &lowerer.statements;
+            let body = quote!(#(#statements)*).to_string();
+            for old in 200..205 {
+                assert!(
+                    !body.contains(&format!("{old}u16")),
+                    "uncolored register in {body}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn another_virtualizable_does_not_hide_state_field_reads_or_writes() {
+        let mut config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
+        config.vable_var = Some("frame".into());
+        config
+            .vable_fields
+            .insert("value".into(), (0, ValueKind::Int));
+        config.state_scalars.insert("value".into(), 0);
+        let mut lowerer = Lowerer::new(Some(&config));
+        assert!(
+            lowerer
+                .lower_value_expr(&syn::parse_quote!(state.value))
+                .is_some()
+        );
+        assert!(
+            lowerer
+                .lower_stmt(&syn::parse_quote!(state.value = 7;))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn identity_ranges_preserve_sparse_indices_and_exclude_state_vable_fields() {
+        let mut config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
+        config.vable_var = Some("state".into());
+        config.state_scalars.insert("redirected".into(), 0);
+        config.state_scalars.insert("kept".into(), 3);
+        config
+            .state_ref_scalars
+            .insert("redirected".into(), (0, syn::parse_quote!(Object)));
+        config
+            .state_ref_scalars
+            .insert("kept".into(), (2, syn::parse_quote!(Object)));
+        config.state_float_scalars.insert("redirected".into(), 250);
+        config.state_float_scalars.insert("kept".into(), 1);
+        config
+            .vable_fields
+            .insert("redirected".into(), (0, ValueKind::Int));
+        assert_eq!(
+            config.split_identity_reg_ends(),
+            (
+                config.int_identity_base() + 4,
+                config.ref_identity_base() + 3
+            )
+        );
+        assert_eq!(
+            config.float_identity_end(),
+            config.float_identity_base() + 2
+        );
+        config
+            .vable_fields
+            .insert("kept".into(), (1, ValueKind::Int));
+        assert_eq!(config.float_identity_end(), 0);
+        config.vable_var = Some("frame".into());
+        assert_eq!(
+            config.split_identity_reg_ends(),
+            (
+                config.int_identity_base() + 4,
+                config.ref_identity_base() + 3
+            )
+        );
+        assert_eq!(
+            config.float_identity_end(),
+            config.float_identity_base() + 251
+        );
+    }
 
     #[test]
     fn liveness_records_alive_at_marker_after_use() {
