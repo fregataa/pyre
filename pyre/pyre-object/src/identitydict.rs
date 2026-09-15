@@ -219,6 +219,7 @@ pub static IDENTITY_DICT_STRATEGY: IdentityDictStrategy = IdentityDictStrategy;
 /// slot points at.
 pub static IDENTITY_DICT_STRATEGY_REF: crate::dictmultiobject::DictStrategyRef =
     crate::dictmultiobject::DictStrategyRef {
+        kind: crate::dictmultiobject::StrategyKind::Identity,
         imp: &IDENTITY_DICT_STRATEGY,
         owner: std::ptr::null_mut(),
     };
@@ -329,14 +330,19 @@ impl DictStrategy for IdentityDictStrategy {
     }
 
     unsafe fn values(&self, w_dict: PyObjectRef) -> Vec<PyObjectRef> {
-        identity_storage(w_dict).values().copied().collect()
+        let mut out = Vec::new();
+        for &v in identity_storage(w_dict).values() {
+            out.push(v);
+        }
+        out
     }
 
     unsafe fn items(&self, w_dict: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
-        identity_storage(w_dict)
-            .iter()
-            .map(|(k, &v)| (k.0, v))
-            .collect()
+        let mut out = Vec::new();
+        for (k, &v) in identity_storage(w_dict).iter() {
+            out.push((k.0, v));
+        }
+        out
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.getitem` reads one

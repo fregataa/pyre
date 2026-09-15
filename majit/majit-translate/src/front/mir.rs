@@ -162,6 +162,7 @@ pub fn build_semantic_program_from_llbcs_with_static_addrs(
         &jitdriver_receiver_roots,
         None,
         None,
+        true,
     )
 }
 
@@ -193,6 +194,27 @@ pub(crate) fn build_semantic_program_from_llbcs_with_static_addrs_module_paths_a
         jitdriver_receiver_roots,
         module_filter.as_ref(),
         None,
+        true,
+    )
+}
+
+/// Lower one already-linked artefact. The caller applied
+/// [`discover_transparent_scalar_kinds`] across the whole set first so
+/// this crate can be dropped before the next file is parsed.
+pub(crate) fn build_semantic_program_from_prelinked_llbc(
+    llbc: &Llbc,
+    static_addrs: crate::HostStaticAddrs<'_>,
+    module_paths: &[&str],
+    jitdriver_receiver_roots: &[String],
+) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
+    let module_filter = normalize_module_filter(module_paths);
+    build_semantic_program_from_llbcs_with_static_addrs_filtered(
+        std::slice::from_ref(llbc),
+        static_addrs,
+        jitdriver_receiver_roots,
+        module_filter.as_ref(),
+        None,
+        false,
     )
 }
 
@@ -226,7 +248,88 @@ pub fn build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         &jitdriver_receiver_roots,
         module_filter.as_ref(),
         function_filter.as_ref(),
+        true,
     )
+}
+
+pub(crate) fn semantic_function_dedup_key(f: &crate::front::semantic::SemanticFunction) -> String {
+    let path = if f.module_path.is_empty() {
+        f.name.clone()
+    } else {
+        format!("{}::{}", f.module_path, f.name)
+    };
+    match f.self_ty_root.as_deref() {
+        Some(owner) => format!("{path}@{owner}"),
+        None => path,
+    }
+}
+
+pub(crate) fn absorb_semantic_program(
+    merged: &mut Option<crate::front::semantic::SemanticProgram>,
+    prog: crate::front::semantic::SemanticProgram,
+    seen_function_keys: &mut std::collections::HashSet<String>,
+    seen_struct_names: &mut std::collections::HashSet<String>,
+    seen_trait_names: &mut std::collections::HashSet<String>,
+    dedup_key: &dyn Fn(&crate::front::semantic::SemanticFunction) -> String,
+) {
+    match merged {
+        None => {
+            for f in &prog.functions {
+                seen_function_keys.insert(dedup_key(f));
+            }
+            for n in &prog.known_struct_names {
+                seen_struct_names.insert(n.clone());
+            }
+            for n in &prog.known_trait_names {
+                seen_trait_names.insert(n.clone());
+            }
+            *merged = Some(prog);
+        }
+        Some(acc) => {
+            for f in prog.functions {
+                if seen_function_keys.insert(dedup_key(&f)) {
+                    acc.functions.push(f);
+                }
+            }
+            for n in prog.known_struct_names {
+                if seen_struct_names.insert(n.clone()) {
+                    acc.known_struct_names.insert(n);
+                }
+            }
+            for n in prog.known_trait_names {
+                if seen_trait_names.insert(n.clone()) {
+                    acc.known_trait_names.insert(n);
+                }
+            }
+            for (key, fields) in prog.struct_fields.fields {
+                acc.struct_fields.fields.entry(key).or_insert(fields);
+            }
+            for (enum_key, by_discr) in prog.enum_variant_by_discriminant {
+                acc.enum_variant_by_discriminant
+                    .entry(enum_key)
+                    .or_insert(by_discr);
+            }
+            for (leaf, module) in prog.struct_origins {
+                acc.struct_origins.entry(leaf).or_insert(module);
+            }
+            for (key, rows) in prog.struct_field_attrs {
+                acc.struct_field_attrs.entry(key).or_insert(rows);
+            }
+            for (key, layout) in prog.exact_layouts {
+                acc.exact_layouts.insert(key, layout);
+            }
+            for (key, id) in prog.struct_ids {
+                acc.struct_ids
+                    .entry(key)
+                    .and_modify(|slot| {
+                        if *slot != id {
+                            *slot = None;
+                        }
+                    })
+                    .or_insert(id);
+            }
+        }
+    }
 }
 
 fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
@@ -235,8 +338,11 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
     jitdriver_receiver_roots: &[String],
     module_filter: Option<&std::collections::HashSet<String>>,
     function_filter: Option<&std::collections::HashSet<String>>,
+    link_scalars: bool,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
-    link_transparent_scalar_types(llbcs);
+    if link_scalars {
+        link_transparent_scalar_types(llbcs);
+    }
     let mut merged: Option<crate::front::semantic::SemanticProgram> = None;
     // Dedup key combines `self_ty_root` (the impl owner, when known),
     // `module_path`, and `name`.  Without `self_ty_root`, two distinct
@@ -250,17 +356,7 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
     let mut seen_function_keys = std::collections::HashSet::new();
     let mut seen_struct_names = std::collections::HashSet::new();
     let mut seen_trait_names = std::collections::HashSet::new();
-    let dedup_key = |f: &crate::front::semantic::SemanticFunction| -> String {
-        let path = if f.module_path.is_empty() {
-            f.name.clone()
-        } else {
-            format!("{}::{}", f.module_path, f.name)
-        };
-        match f.self_ty_root.as_deref() {
-            Some(owner) => format!("{path}@{owner}"),
-            None => path,
-        }
-    };
+    let dedup_key = semantic_function_dedup_key;
     for llbc in llbcs {
         let prog = build_semantic_program_from_llbc_with_static_addrs_filtered(
             llbc,
@@ -269,75 +365,14 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
             module_filter,
             function_filter,
         )?;
-        match &mut merged {
-            None => {
-                for f in &prog.functions {
-                    seen_function_keys.insert(dedup_key(f));
-                }
-                for n in &prog.known_struct_names {
-                    seen_struct_names.insert(n.clone());
-                }
-                for n in &prog.known_trait_names {
-                    seen_trait_names.insert(n.clone());
-                }
-                merged = Some(prog);
-            }
-            Some(acc) => {
-                for f in prog.functions {
-                    if seen_function_keys.insert(dedup_key(&f)) {
-                        acc.functions.push(f);
-                    }
-                }
-                for n in prog.known_struct_names {
-                    if seen_struct_names.insert(n.clone()) {
-                        acc.known_struct_names.insert(n);
-                    }
-                }
-                for n in prog.known_trait_names {
-                    if seen_trait_names.insert(n.clone()) {
-                        acc.known_trait_names.insert(n);
-                    }
-                }
-                for (key, fields) in prog.struct_fields.fields {
-                    acc.struct_fields.fields.entry(key).or_insert(fields);
-                }
-                for (enum_key, by_discr) in prog.enum_variant_by_discriminant {
-                    acc.enum_variant_by_discriminant
-                        .entry(enum_key)
-                        .or_insert(by_discr);
-                }
-                for (leaf, module) in prog.struct_origins {
-                    acc.struct_origins.entry(leaf).or_insert(module);
-                }
-                for (key, rows) in prog.struct_field_attrs {
-                    acc.struct_field_attrs.entry(key).or_insert(rows);
-                }
-                // Last-writer-wins, unlike the first-writer merges around it:
-                // a cross-target layout sidecar is appended after the host
-                // artefacts (`auto_discover_workspace_llbc_paths`) precisely so
-                // its target field offsets overwrite the host's here, while its
-                // (body-stripped, so partly unresolvable) per-type-string
-                // tables lose to the host above.  Among the host artefacts this
-                // is a no-op: they describe one target, so a shared struct's
-                // layout is identical in each.
-                for (key, layout) in prog.exact_layouts {
-                    acc.exact_layouts.insert(key, layout);
-                }
-                // Merge the name → StructId resolver, collapsing a key to
-                // `None` when two crates disagree on the identity (a
-                // cross-crate bare-leaf clash).
-                for (key, id) in prog.struct_ids {
-                    acc.struct_ids
-                        .entry(key)
-                        .and_modify(|slot| {
-                            if *slot != id {
-                                *slot = None;
-                            }
-                        })
-                        .or_insert(id);
-                }
-            }
-        }
+        absorb_semantic_program(
+            &mut merged,
+            prog,
+            &mut seen_function_keys,
+            &mut seen_struct_names,
+            &mut seen_trait_names,
+            &dedup_key,
+        );
     }
     // The per-file builder hardened each program individually, but the
     // `or_insert` merges above can re-introduce a bare-leaf alias that
@@ -2175,7 +2210,7 @@ fn derive_program_metadata(
 /// their full/canonical spellings through the existing `StructId` object
 /// identity.  The pass is therefore idempotent and safe to re-run after the
 /// cross-LLBC merge re-introduces a per-crate-unique alias.
-fn harden_duplicate_leaf_metadata(
+pub(crate) fn harden_duplicate_leaf_metadata(
     struct_fields: &mut crate::front::semantic::StructFieldRegistry,
     struct_origins: &mut std::collections::HashMap<String, String>,
     enum_variant_by_discriminant: &mut std::collections::HashMap<
@@ -2418,6 +2453,48 @@ pub(crate) fn dont_look_inside_set_of(llbc: &Llbc) -> std::collections::HashSet<
     crate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(llbc))
         .into_iter()
         .filter(|(_, hints)| hints.iter().any(|h| h == "dont_look_inside"))
+        .map(|(path, _)| path)
+        .collect()
+}
+
+/// Whether the markers in `hints` keep a callee's body out of the JitCode
+/// closure, without consulting its graph.
+///
+/// This is the function-level half of `JitPolicy.look_inside_graph`
+/// (`rpython/jit/codewriter/policy.py`): `_jit_look_inside_` overrides
+/// everything, and otherwise `_reject_function` rejects an
+/// `_elidable_function_` callee unconditionally — "explicitly elidable
+/// functions are always opaque".  `call.py find_all_graphs` then never makes
+/// the rejected graph a candidate, so its call sites stay residual.
+///
+/// The two spellings differ only in how the rejection was written down, so
+/// everything that exists to serve a body-less residual boundary — above all
+/// the declaration-sourced stub in
+/// [`collect_policy_opaque_fn_stubs_from_llbc`] — reads them as one set.
+/// The other half of `look_inside_graph` (loops, unsupported variable types)
+/// needs a graph and therefore cannot be decided here; it can only reject
+/// further, never admit a body this predicate already rejected.
+///
+/// Every elidable spelling the macros accept (`elidable`,
+/// `elidable_cannot_raise`, `elidable_or_memerror`) emits
+/// `_elidable_function_` alongside its own marker, so the single `"elidable"`
+/// token covers all three.
+pub(crate) fn hints_reject_body(hints: &[String]) -> bool {
+    if hints.iter().any(|h| h == "jit_look_inside") {
+        return false;
+    }
+    hints
+        .iter()
+        .any(|h| h == "dont_look_inside" || h == "elidable")
+}
+
+/// The set of paths in this LLBC whose bodies [`hints_reject_body`] keeps out
+/// of the JitCode closure, keyed `strip_crate_prefix(name_path())` — the same
+/// derivation [`dont_look_inside_set_of`] uses for its narrower question.
+fn policy_opaque_fn_set_of(llbc: &Llbc) -> std::collections::HashSet<String> {
+    crate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(llbc))
+        .into_iter()
+        .filter(|(_, hints)| hints_reject_body(hints))
         .map(|(path, _)| path)
         .collect()
 }
@@ -21706,9 +21783,10 @@ pub fn collect_unsafe_fn_stubs_from_llbc(
     collect_fn_stubs_from_llbc_if(llbc, error_carrier, |fd| fd.signature.is_unsafe)
 }
 
-/// Collect signature-only residual stubs for every local function marked
-/// `#[dont_look_inside]`, including functions which the JIT policy correctly
-/// omitted from `CallControl::function_graphs`.
+/// Collect signature-only residual stubs for every local function whose
+/// markers make it opaque to the JIT policy ([`hints_reject_body`]:
+/// `#[dont_look_inside]` and `#[elidable]` alike), including functions which
+/// the JIT policy correctly omitted from `CallControl::function_graphs`.
 ///
 /// RPython creates the `FunctionDesc` from the callable independently of
 /// `find_all_graphs`, then `JitPolicy.look_inside_graph` merely keeps its body
@@ -21716,7 +21794,20 @@ pub fn collect_unsafe_fn_stubs_from_llbc(
 /// annotator-only stub carrier restores that ordering: a caller can annotate
 /// the declared residual call even though there is intentionally no body to
 /// compile.
-pub(crate) fn collect_dont_look_inside_fn_stubs_from_llbc(
+///
+/// Both hint spellings need the same carrier for the same reason, and a
+/// declaration reached only through a caller's lift needs it most: the
+/// `function_graphs` residualize arm in
+/// `cutover::populate_call_registry_from_call_graphs` can only stub a callee
+/// the MIR loop already turned into a `SemanticFunction`, so an opaque callee
+/// whose body never lowered (`build_semantic_program`'s
+/// `declaration-has-no-unstructured-body` and unrecognised-shape drops) held
+/// no registry key at all and every caller that named it failed its own lift
+/// with "not registered in CallRegistry".  Keying off the marker rather than
+/// off the lowered body is what `_reject_function` already implies: the body
+/// was never going to be compiled, so whether it could be lowered must not
+/// decide whether the call site can be annotated.
+pub(crate) fn collect_policy_opaque_fn_stubs_from_llbc(
     llbc: &Llbc,
     error_carrier: crate::ErrorCarrierSpec<'_>,
 ) -> Vec<(
@@ -21724,7 +21815,7 @@ pub(crate) fn collect_dont_look_inside_fn_stubs_from_llbc(
     crate::flowspace::argument::Signature,
     Option<String>,
 )> {
-    let marked = dont_look_inside_set_of(llbc);
+    let marked = policy_opaque_fn_set_of(llbc);
     collect_fn_stubs_from_llbc_if(llbc, error_carrier, |fd| {
         marked.contains(&strip_crate_prefix(&fd.item_meta.name_path()))
     })
@@ -23794,28 +23885,36 @@ fn tyref_transparent_inner_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueTy
 /// both declarations share the same qualified Rust path. RPython translates a
 /// linked type universe, so collect that one register-bank fact before lowering
 /// any body and publish it to every artefact in the same translation input.
+pub(crate) fn discover_transparent_scalar_kinds(
+    llbc: &Llbc,
+) -> Vec<(String, majit_charon_reader::TransparentScalarKind)> {
+    let mut discovered = Vec::new();
+    for decl in llbc.iter_type_decls() {
+        if !decl.is_repr_transparent() {
+            continue;
+        }
+        let TypeDeclKind::Struct(fields) = &decl.kind else {
+            continue;
+        };
+        let [field] = fields.as_slice() else {
+            continue;
+        };
+        let kind = match tyref_to_value_type(&field.ty, llbc) {
+            ValueType::Int => majit_charon_reader::TransparentScalarKind::Signed,
+            ValueType::Unsigned => majit_charon_reader::TransparentScalarKind::Unsigned,
+            ValueType::Bool => majit_charon_reader::TransparentScalarKind::Bool,
+            ValueType::Float => majit_charon_reader::TransparentScalarKind::Float,
+            _ => continue,
+        };
+        discovered.push((decl.item_meta.name_path(), kind));
+    }
+    discovered
+}
+
 fn link_transparent_scalar_types(llbcs: &[Llbc]) {
     let mut discovered = Vec::new();
     for llbc in llbcs {
-        for decl in llbc.iter_type_decls() {
-            if !decl.is_repr_transparent() {
-                continue;
-            }
-            let TypeDeclKind::Struct(fields) = &decl.kind else {
-                continue;
-            };
-            let [field] = fields.as_slice() else {
-                continue;
-            };
-            let kind = match tyref_to_value_type(&field.ty, llbc) {
-                ValueType::Int => majit_charon_reader::TransparentScalarKind::Signed,
-                ValueType::Unsigned => majit_charon_reader::TransparentScalarKind::Unsigned,
-                ValueType::Bool => majit_charon_reader::TransparentScalarKind::Bool,
-                ValueType::Float => majit_charon_reader::TransparentScalarKind::Float,
-                _ => continue,
-            };
-            discovered.push((decl.item_meta.name_path(), kind));
-        }
+        discovered.extend(discover_transparent_scalar_kinds(llbc));
     }
     discovered.sort_by(|a, b| a.0.cmp(&b.0));
     discovered.dedup();
@@ -37347,6 +37446,46 @@ mod tests {
         );
     }
 
+    /// `rlib/jit.py isconstant` / `isvirtual` return `NonConstant(False)`, not
+    /// a bare `False`: the annotator must not read the result as a constant or
+    /// it folds every `if isconstant(x)` in the interpreter and deletes the
+    /// looked-inside arm before `jtransform` rewrites the call to
+    /// `*_isconstant`.  Pin the producer — both bodies must still route their
+    /// literal through `nonconst::non_constant`, which is resolved as a
+    /// registered external rather than a lifted graph.  Loads the majit-rlib
+    /// LLBC, ignored; run with `cargo test -p majit-translate --lib
+    /// jit_constancy_probes_return_non_constant -- --ignored`.
+    #[test]
+    #[ignore]
+    fn jit_constancy_probes_return_non_constant() {
+        use crate::model::{CallTarget, OpKind};
+        let path = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
+        let llbc = Llbc::load(path).expect("load majit-rlib LLBC");
+        for probe in ["isconstant", "isvirtual"] {
+            let graph = super::lower_function(&llbc, probe)
+                .unwrap_or_else(|e| panic!("lower {probe}: {e}"));
+            let non_constant_calls = graph
+                .blocks
+                .iter()
+                .flat_map(|b| b.operations.iter())
+                .filter(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                            if super::fmt_path_ends_with(
+                                segments,
+                                &["nonconst", "non_constant"],
+                            )
+                    )
+                })
+                .count();
+            assert_eq!(
+                non_constant_calls, 1,
+                "{probe} must return its literal through nonconst::non_constant"
+            );
+        }
+    }
+
     /// Regression: `RBigInt::digits` uses `from_raw_parts(base, capacity)` — the
     /// block's own length — so its header alias IS sound and must STILL fold
     /// (the P1 fix removes only the object-list arm). The residual
@@ -39776,6 +39915,64 @@ mod tests {
         );
     }
 
+    /// `policy.py look_inside_graph` reads `_jit_look_inside_` first and
+    /// otherwise lets `_reject_function` reject an `_elidable_function_`
+    /// unconditionally, so both marker spellings name one set of body-less
+    /// residual boundaries.
+    #[test]
+    fn both_opaque_markers_reject_a_body_and_the_override_admits_it() {
+        let hint = |s: &str| vec![s.to_string()];
+        assert!(super::hints_reject_body(&hint("dont_look_inside")));
+        assert!(super::hints_reject_body(&hint("elidable")));
+        assert!(!super::hints_reject_body(&hint("jit_look_inside")));
+        assert!(!super::hints_reject_body(&hint("unroll_safe")));
+        assert!(!super::hints_reject_body(&[]));
+        // `_jit_look_inside_ = True` overrides the elidable rejection.
+        assert!(!super::hints_reject_body(&[
+            "elidable".to_string(),
+            "jit_look_inside".to_string(),
+        ]));
+    }
+
+    /// The elidable half of the same carrier, on the real declarations.
+    /// `interp_exceptions::lookup_exc_class_for_kind` is `#[elidable]` and
+    /// reads a process-global slot the MIR driver cannot lower, so it has no
+    /// `SemanticFunction` at all — exactly the callee whose absent registry
+    /// key failed `typedef::type`'s lift.
+    #[test]
+    #[ignore]
+    fn elidable_declaration_keeps_a_functiondesc_without_a_lowered_body() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let specs = super::collect_policy_opaque_fn_stubs_from_llbc(
+            &llbc,
+            crate::ErrorCarrierSpec::default(),
+        );
+        let expected = [
+            "pyre_object",
+            "interp_exceptions",
+            "lookup_exc_class_for_kind",
+        ];
+        let (_, signature, token) = specs
+            .iter()
+            .find(|(segments, _, _)| {
+                segments
+                    .iter()
+                    .map(String::as_str)
+                    .eq(expected.iter().copied())
+            })
+            .expect("an elidable declaration must have a residual stub");
+        assert_eq!(signature.argnames.len(), 1);
+        assert_eq!(
+            token.as_deref(),
+            Some(crate::translator::rtyper::cutover::OBJECTPTR_RETURN_TYPE),
+            "the declared PyObjectRef return keeps its typed object-pointer shell"
+        );
+    }
+
     #[test]
     #[ignore]
     fn getset_direct_residual_keeps_a_functiondesc_without_a_jitcode_body() {
@@ -39784,7 +39981,7 @@ mod tests {
             "/../../build/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
-        let specs = super::collect_dont_look_inside_fn_stubs_from_llbc(
+        let specs = super::collect_policy_opaque_fn_stubs_from_llbc(
             &llbc,
             crate::ErrorCarrierSpec::default(),
         );

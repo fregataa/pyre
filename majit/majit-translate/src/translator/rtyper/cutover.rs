@@ -320,10 +320,10 @@ pub(crate) fn dual_gate_check_with_registry(
     // are journaled lazily by AddedBlocksGuard only when actually touched.
     let session_at_entry = SubjectSessionSnapshot::capture(call_registry);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        specialize_legacy_graph_with_registry_returning_value_to_var(legacy_graph, call_registry)
+        drive_subject(legacy_graph, call_registry, true)
     }));
-    let (real_value_to_var, real_constants) = match result {
-        Ok(Ok(pair)) => pair,
+    let (graph, real_value_to_var, real_constants) = match result {
+        Ok(Ok((graph, value_to_var, _, constants, _))) => (graph, value_to_var, constants),
         Ok(Err(e)) => {
             unpoison_failed_subject_callees(call_registry, &session_at_entry, lift_sources);
             let msg = format!("{e}");
@@ -356,9 +356,15 @@ pub(crate) fn dual_gate_check_with_registry(
              path's result): {msg}"
         ));
     }
-    if let Some(divergence) =
-        compare_real_against_legacy(&real_value_to_var, &real_constants, legacy_graph)
-    {
+    let followed_legacy = call_registry.session_if_started().map(|(annotator, _)| {
+        annotator_followed_legacy_vars(&annotator, &graph, &real_value_to_var)
+    });
+    if let Some(divergence) = compare_real_against_legacy(
+        &real_value_to_var,
+        &real_constants,
+        legacy_graph,
+        followed_legacy.as_ref(),
+    ) {
         return Ok(DualGateOutcome::Skip(format!(
             "dual-gate divergence: {divergence}"
         )));
@@ -1255,9 +1261,30 @@ fn op_result_can_remove(kind: &crate::model::OpKind) -> bool {
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
 )]
+#[cfg(test)]
 fn collect_divergences(
     real_state: &HashMap<Variable, ConcreteType>,
     legacy_graph: &LegacyGraph,
+) -> Vec<String> {
+    collect_divergences_on(real_state, legacy_graph, None)
+}
+
+/// Same as [`collect_divergences`], optionally restricted to variables the
+/// real annotator actually followed.
+///
+/// `followed_legacy` is the inverse of `value_to_var` over blocks in
+/// `annotator.annotated` for the subject graph — the blocks
+/// `follow_link` / `follow_raise_link` reached
+/// (`annrpython.py` `links_followed`). A structurally reachable
+/// unfollowed arm (the `Result::Ok.__pos_0` extract on an always-`Err`
+/// `__majit_wrap___new__`) is not in this set; comparing it reads
+/// `real=Unknown` because the rtyper never saw the block. Restricting
+/// the compared set is not an Unknown-acceptance widening: a followed
+/// variable that the real path left untyped still diverges.
+fn collect_divergences_on(
+    real_state: &HashMap<Variable, ConcreteType>,
+    legacy_graph: &LegacyGraph,
+    followed_legacy: Option<&HashSet<Variable>>,
 ) -> Vec<String> {
     let reachable_vars = reachable_defined_vars(legacy_graph);
     let colored_operands = colored_operand_vars(legacy_graph);
@@ -1274,6 +1301,11 @@ fn collect_divergences(
         // reads real=Unknown and reports a false divergence; skip it
         // exactly as the real path's `remove_dead_blocks` prune does.
         if !reachable_vars.contains(var) {
+            continue;
+        }
+        if let Some(followed) = followed_legacy
+            && !followed.contains(var)
+        {
             continue;
         }
         let legacy_kind = LegacyGraph::concretetype_of(var);
@@ -1435,11 +1467,61 @@ fn compare_real_against_legacy(
     value_to_var: &LegacyToTyped,
     constants: &HashMap<Variable, LowLevelType>,
     legacy_graph: &LegacyGraph,
+    followed_legacy: Option<&HashSet<Variable>>,
 ) -> Option<String> {
     let real_state = project_value_to_var(value_to_var, constants);
-    collect_divergences(&real_state, legacy_graph)
+    collect_divergences_on(&real_state, legacy_graph, followed_legacy)
         .into_iter()
         .next()
+}
+
+/// Legacy Variables whose typed twins are defined on a block the annotator
+/// recorded in `annotated` for `graph`.
+///
+/// `addpendingblock` writes that map only after `follow_link` /
+/// `follow_raise_link` set `links_followed[link] = True`
+/// (`annrpython.py`). The exceptblock is pre-seeded so always-raising
+/// graphs still compare their exception pair. An unfollowed `Result::Ok`
+/// successor is absent, so its payload extract is not in the compared set.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+fn annotator_followed_legacy_vars(
+    annotator: &crate::annotator::annrpython::RPythonAnnotator,
+    graph: &crate::flowspace::model::GraphRef,
+    value_to_var: &LegacyToTyped,
+) -> HashSet<Variable> {
+    let annotated = annotator.annotated.borrow();
+    let all_blocks = annotator.all_blocks.borrow();
+    let mut typed_live: HashSet<Variable> = HashSet::new();
+    for (bkey, owner) in annotated.iter() {
+        let Some(owner_graph) = owner else {
+            continue;
+        };
+        if !Rc::ptr_eq(owner_graph, graph) {
+            continue;
+        }
+        let Some(block) = all_blocks.get(bkey) else {
+            continue;
+        };
+        let blk = block.borrow();
+        for input in &blk.inputargs {
+            if let Hlvalue::Variable(v) = input {
+                typed_live.insert(v.clone());
+            }
+        }
+        for op in &blk.operations {
+            if let Hlvalue::Variable(v) = &op.result {
+                typed_live.insert(v.clone());
+            }
+        }
+    }
+    value_to_var
+        .iter()
+        .filter(|(_, typed)| typed_live.contains(*typed))
+        .map(|(legacy, _)| legacy.clone())
+        .collect()
 }
 
 /// Return true when `msg` matches one of the known-unported
@@ -2035,6 +2117,22 @@ pub(crate) fn populate_call_registry_from_call_graphs(
             crate::decline::record(
                 REGISTRY_GATE,
                 "skip-malloc-raw-intrinsic",
+                format_args!("{path}"),
+            );
+            continue;
+        }
+        // `rlib/nonconst.py NonConstant` is an `ExtRegistryEntry`, not a
+        // graph: its whole purpose is that the annotator must NOT see the
+        // argument's constancy, and the identity body lifted from
+        // `majit-rlib` would hand that constancy straight back.  With no
+        // registry entry the callsite resolves through
+        // `translate_op` Layer-3b to the `majit_rlib.nonconst` HOST_ENV
+        // callable, whose analyzer answers `not_const(s_arg)` and whose
+        // `rtype_non_constant` returns argument 0.
+        if canonical_strip == ["nonconst", "non_constant"] {
+            crate::decline::record(
+                REGISTRY_GATE,
+                "skip-nonconst-extregistry-entry",
                 format_args!("{path}"),
             );
             continue;
@@ -4441,6 +4539,7 @@ pub(crate) fn dual_gate_outcome_from_cache(
         let tp = call_registry.two_phase();
         match tp.subjects.get(diag_key) {
             Some(subj) if !tp.rtype_skipped.contains(&subj.graph_key) => Ok((
+                subj.graph.clone(),
                 subj.value_to_var.clone(),
                 subj.value_to_var_candidates.clone(),
                 subj.constant_concretetypes.clone(),
@@ -4450,7 +4549,7 @@ pub(crate) fn dual_gate_outcome_from_cache(
             None => Err("two-phase: graph was never a prepass subject"),
         }
     };
-    let (mut value_to_var, value_to_var_candidates, mut constants, mut constant_values) =
+    let (graph, mut value_to_var, value_to_var_candidates, mut constants, mut constant_values) =
         match cached {
             Ok(cached) => cached,
             Err(reason) => return Ok(DualGateOutcome::Skip(reason.to_string())),
@@ -4499,7 +4598,12 @@ pub(crate) fn dual_gate_outcome_from_cache(
             "two-phase baseline panicked (legacy walker crashed before comparison): {msg}"
         ));
     }
-    if let Some(divergence) = compare_real_against_legacy(&value_to_var, &constants, legacy) {
+    let followed_legacy = call_registry
+        .session_if_started()
+        .map(|(annotator, _)| annotator_followed_legacy_vars(&annotator, &graph, &value_to_var));
+    if let Some(divergence) =
+        compare_real_against_legacy(&value_to_var, &constants, legacy, followed_legacy.as_ref())
+    {
         return Ok(DualGateOutcome::Skip(format!(
             "two-phase divergence: {divergence}"
         )));
@@ -5112,6 +5216,24 @@ mod tests {
         let msg = "unexpected rtyper invariant failure";
         assert_eq!(unported_category(msg), None);
         assert!(!is_known_unported(msg));
+    }
+
+    /// Callee-half twin of
+    /// [`an_unclassified_translated_op_fails_the_build_instead_of_skipping`].
+    /// `unported_category` may Skip a recorded call-path class
+    /// (`call-registry-miss`).  A new class string must stay unclassified
+    /// so it cannot hide as a skip.
+    #[test]
+    fn a_new_call_path_class_is_not_skip_classified() {
+        let recorded = unported_category("not registered in CallRegistry");
+        assert_eq!(recorded, Some("call-registry-miss"));
+        let novel = "call-path-class: unexpected-new-taxonomy-entry";
+        assert_eq!(
+            unported_category(novel),
+            None,
+            "a call-path class outside the recorded taxonomy must fail the build"
+        );
+        assert!(!is_known_unported(novel));
     }
 
     /// Graph carrying one `UnaryOp` under `op`, both operand and result
@@ -6094,6 +6216,124 @@ mod tests {
         );
     }
 
+    /// Family C: an always-`Err` wrapper keeps a structurally reachable
+    /// `Result::Ok.__pos_0` extract whose block `follow_link` never
+    /// recorded. The unfiltered compared set reports `real=Unknown`;
+    /// restricting to followed vars does not, and a followed untyped
+    /// var still diverges — this is not an Unknown-acceptance widening.
+    #[test]
+    fn collect_divergences_skips_unfollowed_ok_payload() {
+        let mut graph = LegacyGraph::new("always_err_wrap_new");
+        let vars = mint_vars(&mut graph, 4);
+        let v_ok = vars[3].clone();
+        let ok_id = BlockId(3);
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[0]),
+            operations: vec![],
+            exitswitch: Some(crate::model::ExitSwitch::LastException),
+            exits: vec![
+                crate::model::Link::new_mixed(vec![], ok_id, None),
+                crate::model::Link::new_mixed(
+                    vec![
+                        LinkArg::Value(vars[1].clone()),
+                        LinkArg::Value(vars[2].clone()),
+                    ],
+                    graph.exceptblock,
+                    None,
+                ),
+            ],
+            framestate: None,
+            dead: false,
+        };
+        let ok_block = Block {
+            id: ok_id,
+            inputargs: vec![],
+            operations: vec![
+                crate::model::SpaceOperation {
+                    result: Some(v_ok.clone()),
+                    kind: crate::model::OpKind::FieldRead {
+                        base: vars[0].clone(),
+                        field: crate::model::FieldDescriptor {
+                            name: "__pos_0".to_string(),
+                            owner_root: Some("Result::Ok".to_string()),
+                            owner_id: None,
+                            base_is_deref: Some(false),
+                            taken_by_address: false,
+                        },
+                        ty: ValueType::Ref(None),
+                        pure: false,
+                    },
+                },
+                crate::model::SpaceOperation {
+                    result: None,
+                    kind: crate::model::OpKind::Call {
+                        target: crate::model::CallTarget::Method {
+                            name: "is_null".to_string(),
+                            receiver_root: Some("mut_ptr".to_string()),
+                            resolved_path: None,
+                        },
+                        args: crate::model::call_args(vec![v_ok.clone()]),
+                        result_ty: ValueType::Bool,
+                    },
+                },
+            ],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(v_ok.clone())],
+                graph.returnblock,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: vec![v_ok.clone()],
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        let exceptblock = Block {
+            id: graph.exceptblock,
+            inputargs: block_inputargs(&vars, &[1, 2]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock, exceptblock, ok_block];
+        crate::model::FunctionGraph::set_concretetype_of_inline(&v_ok, ConcreteType::GcRef);
+
+        let unfiltered = collect_divergences(&HashMap::new(), &graph);
+        assert!(
+            unfiltered
+                .iter()
+                .any(|d| d.contains("legacy=GcRef, real=Unknown")),
+            "unfiltered compared set must still see the untyped Ok payload: {unfiltered:?}"
+        );
+
+        let mut followed = HashSet::new();
+        followed.insert(vars[0].clone());
+        followed.insert(vars[1].clone());
+        followed.insert(vars[2].clone());
+        assert!(
+            collect_divergences_on(&HashMap::new(), &graph, Some(&followed)).is_empty(),
+            "an unfollowed Ok payload is outside links_followed, not a kind mismatch"
+        );
+
+        followed.insert(v_ok);
+        let followed_hit = collect_divergences_on(&HashMap::new(), &graph, Some(&followed));
+        assert!(
+            followed_hit
+                .iter()
+                .any(|d| d.contains("legacy=GcRef, real=Unknown")),
+            "a followed untyped var must still diverge: {followed_hit:?}"
+        );
+    }
+
     #[test]
     fn dead_op_result_vars_excludes_the_raising_op() {
         // `canremove(op, block)` also excludes `block.raising_op`
@@ -6712,6 +6952,167 @@ mod tests {
                 "the native/legacy dispatch projection must remain intact"
             );
         }
+    }
+
+    /// Build a one-call caller graph naming `callee_segments`, with no body
+    /// registered for the callee.
+    fn caller_graph_calling(callee_segments: &[&str]) -> LegacyGraph {
+        let mut graph = LegacyGraph::new("caller");
+        let vars = mint_vars(&mut graph, 3);
+        let arg = vars[0].clone();
+        let result = vars[1].clone();
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[0]),
+            operations: vec![crate::model::SpaceOperation {
+                result: Some(result.clone()),
+                kind: crate::model::OpKind::Call {
+                    target: crate::model::CallTarget::FunctionPath {
+                        segments: callee_segments.iter().map(|s| s.to_string()).collect(),
+                    },
+                    args: crate::model::call_args(vec![arg]),
+                    result_ty: ValueType::Ref(None),
+                },
+            }],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(result)],
+                graph.returnblock,
+            )],
+            dead: false,
+            framestate: None,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: block_inputargs(&vars, &[1]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            dead: false,
+            framestate: None,
+        };
+        graph.blocks = vec![startblock, returnblock];
+        graph
+    }
+
+    /// A callee the JIT policy rejects (`policy.py _reject_function`:
+    /// "explicitly elidable functions are always opaque") is reached only
+    /// through its caller's lift, so the `function_graphs` residualize arm in
+    /// [`populate_call_registry_from_call_graphs`] — which walks entries the
+    /// MIR loop already lowered — never sees it.  Its stub therefore has to
+    /// come from the declaration carrier
+    /// (`front::mir::collect_policy_opaque_fn_stubs_from_llbc`), the
+    /// `register_external` analog, or the caller fails its own lift with
+    /// "not registered in CallRegistry" and every subject downstream of that
+    /// caller inherits the failure.
+    #[test]
+    fn a_lazily_reached_opaque_callee_lifts_its_caller_with_the_declared_result() {
+        use crate::annotator::model::SomeValue;
+        use crate::codewriter::call::GraphStore;
+        use crate::parse::CallPath;
+
+        let callee = ["owner_crate", "opaque_leaf", "read_opaque_slot"];
+        let mut graphs = GraphStore::default();
+        graphs.insert(
+            CallPath::from_segments(["owner_crate", "caller_mod", "caller"]),
+            caller_graph_calling(&callee),
+        );
+        let caller_key = FunctionPathKey::from_segments(["owner_crate", "caller_mod", "caller"]);
+        let callee_key = FunctionPathKey::from_segments(callee);
+
+        // Without the declaration stub the caller cannot be annotated past
+        // the call — the baseline this regression pins.
+        let bare = CallRegistry::new(std::rc::Rc::new(
+            crate::annotator::bookkeeper::Bookkeeper::new(),
+        ));
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &bare).unwrap();
+        let bare_error = bare
+            .lookup(&caller_key)
+            .expect("caller registers regardless")
+            .lift_error()
+            .expect("an unregistered callee must fail the caller's lift");
+        assert!(
+            bare_error.contains("not registered in CallRegistry"),
+            "{bare_error}"
+        );
+        assert!(bare.lookup(&callee_key).is_none());
+
+        // The collector yields `(segments, signature, FUNC.RESULT token)` for
+        // an opaque declaration whatever became of its body; the token is the
+        // `*mut PyObject` this callee declares.
+        let stubs = vec![(
+            callee.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            Signature::new(vec!["kind".to_string()], None, None),
+            Some(OBJECTPTR_RETURN_TYPE.to_string()),
+        )];
+        let registry = CallRegistry::new(std::rc::Rc::new(
+            crate::annotator::bookkeeper::Bookkeeper::new(),
+        ));
+        populate_call_registry_from_call_graphs(&graphs, &stubs, &[], &registry).unwrap();
+
+        let caller = registry.lookup(&caller_key).expect("caller entry");
+        assert_eq!(
+            caller.lift_error(),
+            None,
+            "the declared residual must let the caller lift"
+        );
+        let callee_entry = registry.lookup(&callee_key).expect("callee entry");
+        assert!(
+            callee_entry.lift_error().is_none(),
+            "a declaration stub has no body to fail on"
+        );
+
+        // The call stays residual, resolved to the stub's own callable.
+        let caller_pygraph = caller
+            .function_desc
+            .borrow()
+            .cache
+            .borrow()
+            .get(&crate::annotator::description::GraphCacheKey::None)
+            .cloned()
+            .expect("caller body lifted into the default cache");
+        let callable = {
+            let graph = caller_pygraph.graph.borrow();
+            let start = graph.startblock.borrow();
+            let op = start
+                .operations
+                .iter()
+                .find(|op| op.opname == "simple_call")
+                .expect("the opaque callee must remain a residual simple_call");
+            match &op.args[0] {
+                Hlvalue::Constant(c) => match &c.value {
+                    ConstValue::HostObject(host) => host.clone(),
+                    other => panic!("callable must be a HostObject, got {other:?}"),
+                },
+                other => panic!("args[0] must be the callable Constant, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            callable, callee_entry.host_object,
+            "the residual call must bind the stub's own callable"
+        );
+
+        // And it carries the callee's declared result, not a Void shell.
+        let stub = callee_entry
+            .function_desc
+            .borrow()
+            .cache
+            .borrow()
+            .get(&crate::annotator::description::GraphCacheKey::None)
+            .cloned()
+            .expect("the declaration stub is prefilled as the default cache entry");
+        let graph = stub.graph.borrow();
+        let start = graph.startblock.borrow();
+        let link = start.exits[0].borrow();
+        let Some(Hlvalue::Variable(ret)) = link.args[0].as_ref() else {
+            panic!("stub return arg must be a pre-annotated Variable");
+        };
+        let annotation = ret.annotation.borrow();
+        let annotation = annotation.as_ref().expect("stub return is pre-annotated");
+        assert!(
+            matches!(&**annotation, SomeValue::Ptr(_)),
+            "the object-pointer token must annotate as the declared pointer, got {annotation:?}"
+        );
     }
 
     #[test]

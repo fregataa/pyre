@@ -5,7 +5,7 @@
 //! `setdictvalue` / `deldictvalue`.
 
 use crate::PyError;
-use crate::baseobjspace::{ObjSpace, SpaceCacheClass, SpaceCacheInstance};
+use crate::baseobjspace::{SpaceCacheClass, SpaceCacheInstance};
 use pyre_object::dictmultiobject::{DictStrategy, DictStrategyRef, StrategyKind};
 use pyre_object::*;
 use rustpython_wtf8::Wtf8;
@@ -13,12 +13,18 @@ use rustpython_wtf8::Wtf8;
 /// `classdict.py ClassDictStrategy`.
 pub struct ClassDictStrategy {
     #[allow(dead_code)]
-    space: std::sync::Arc<ObjSpace>,
+    space: crate::baseobjspace::SpaceHandle,
+    /// The holder `W_DictObject.dstrategy` points at. A field of the
+    /// fromcache / prebuilt-space instance, not a naked module-static read.
+    pub strategy_ref: &'static DictStrategyRef,
 }
 
 impl ClassDictStrategy {
-    pub fn new(space: std::sync::Arc<ObjSpace>) -> Self {
-        Self { space }
+    pub const fn new(space: crate::baseobjspace::SpaceHandle) -> Self {
+        Self {
+            space,
+            strategy_ref: &CLASS_DICT_STRATEGY_REF,
+        }
     }
 
     pub fn walk_roots(&self, _forward: &mut dyn FnMut(&mut PyObjectRef)) {}
@@ -88,6 +94,7 @@ static CLASS_DICT_SLOT: ClassDictStrategySlot = ClassDictStrategySlot;
 
 /// The [`DictStrategyRef`] holder a class-dict's `dstrategy` slot points at.
 pub static CLASS_DICT_STRATEGY_REF: DictStrategyRef = DictStrategyRef {
+    kind: pyre_object::dictmultiobject::StrategyKind::Class,
     imp: &CLASS_DICT_SLOT,
     owner: std::ptr::null_mut(),
 };
@@ -283,12 +290,7 @@ unsafe fn type_deldictvalue_wtf8(w_type: PyObjectRef, name: &Wtf8) -> Result<boo
 /// `W_DictObject(space, strategy, strategy.erase(self))`.
 pub fn class_dict_for_type(w_type: PyObjectRef) -> PyObjectRef {
     let space = crate::baseobjspace::object_space();
-    let SpaceCacheInstance::ClassDictStrategy(_) =
-        space.fromcache(SpaceCacheClass::ClassDictStrategy)
-    else {
-        unreachable!()
-    };
-    pyre_object::w_dict_new_with(&CLASS_DICT_STRATEGY_REF, w_type as *mut u8)
+    pyre_object::w_dict_new_with(space.class_dict_strategy().strategy_ref, w_type as *mut u8)
 }
 
 #[cfg(test)]
@@ -313,13 +315,17 @@ mod tests {
         else {
             panic!("expected ClassDictStrategy");
         };
-        assert!(std::sync::Arc::ptr_eq(&first, &again));
+        assert!(crate::baseobjspace::RetainedSpaceCache::ptr_eq(
+            &first, &again
+        ));
         let SpaceCacheInstance::ClassDictStrategy(other) =
             b.fromcache(SpaceCacheClass::ClassDictStrategy)
         else {
             panic!("expected ClassDictStrategy");
         };
-        assert!(!std::sync::Arc::ptr_eq(&first, &other));
+        assert!(!crate::baseobjspace::RetainedSpaceCache::ptr_eq(
+            &first, &other
+        ));
     }
 
     #[test]

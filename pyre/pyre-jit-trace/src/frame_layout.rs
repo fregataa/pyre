@@ -192,12 +192,13 @@ mod tests {
     /// A live token is FORCED, not overwritten — overwriting it drops the
     /// compiled activation's write-back.  A clear one calls nothing at all.
     ///
-    /// Both halves share one test because the force hook is a process-wide
-    /// `OnceLock` (`executioncontext.rs register_force_frame_hook`): a second
-    /// test registering its own would be silently ignored.
+    /// Both halves share one test because the force hook is process-wide
+    /// (`executioncontext.rs install_force_frame_hook`).  The guard restores
+    /// the previous hook even if an assertion panics.
     #[test]
     fn clear_vable_token_forces_a_live_token_and_leaves_a_clear_one_alone() {
-        pyre_interpreter::executioncontext::register_force_frame_hook(recording_force_hook);
+        let _hook =
+            pyre_interpreter::executioncontext::install_force_frame_hook(recording_force_hook);
 
         // Only the token slot is read or written, by the helper and by the
         // hook alike, so a buffer that reaches past it stands in for a frame.

@@ -303,20 +303,27 @@ pub const W_CLASS_OFFSET: usize = std::mem::offset_of!(PyObject, w_class);
 /// process-global [`QuasiImmutField`] serves every object — the rtyper would
 /// synthesise a per-object slot, but a write already has to revoke every
 /// loop that folded any instance's class.
-static W_CLASS_WATCHERS: crate::quasiimmut::QuasiImmutField =
-    crate::quasiimmut::QuasiImmutField::new();
+/// Process-wide layout owner for header quasi-immuts. One space, one
+/// watcher set — a field of this prebuilt, not a naked module static.
+struct ObjectLayout {
+    w_class_watchers: crate::quasiimmut::QuasiImmutField,
+}
+
+static OBJECT_LAYOUT: ObjectLayout = ObjectLayout {
+    w_class_watchers: crate::quasiimmut::QuasiImmutField::new(),
+};
 
 /// `quasiimmut.py get_current_qmut_instance` for `PyObject.w_class`.
 pub fn w_class_current_qmut() -> std::sync::Arc<crate::quasiimmut::QuasiImmut> {
-    W_CLASS_WATCHERS.get_current_qmut_instance()
+    OBJECT_LAYOUT.w_class_watchers.get_current_qmut_instance()
 }
 
 /// Invalidate loops that folded a `w_class` read. Call after a published
 /// object's class changes (`descr_set___class__`, exception retag).
 #[inline]
 pub fn notify_w_class_mutated() {
-    if W_CLASS_WATCHERS.is_installed() {
-        W_CLASS_WATCHERS.invalidate();
+    if OBJECT_LAYOUT.w_class_watchers.is_installed() {
+        OBJECT_LAYOUT.w_class_watchers.invalidate();
     }
 }
 
@@ -324,7 +331,7 @@ pub fn notify_w_class_mutated() {
 /// so a tracer cannot fold the old class onto a freshly installed watcher.
 #[inline]
 pub fn notify_w_class_mutated_then(store: impl FnOnce()) {
-    W_CLASS_WATCHERS.invalidate_then_store(store);
+    OBJECT_LAYOUT.w_class_watchers.invalidate_then_store(store);
 }
 
 /// Field offset of `subclassrange_min` within PyType (OBJECT_VTABLE).
@@ -498,9 +505,9 @@ pub const fn subclass_range_alias(type_id: u32, pytype: &'static PyType) -> Subc
 /// payloads ahead of them exist only there, so the group begins three ids
 /// later on Windows than anywhere else.
 #[cfg(all(not(target_arch = "wasm32"), windows))]
-const CFFI_HIERARCHY_FIRST_TYPE_ID: u32 = 196;
+const CFFI_HIERARCHY_FIRST_TYPE_ID: u32 = 199;
 #[cfg(all(not(target_arch = "wasm32"), not(windows)))]
-const CFFI_HIERARCHY_FIRST_TYPE_ID: u32 = 193;
+const CFFI_HIERARCHY_FIRST_TYPE_ID: u32 = 196;
 
 /// Canonical `rclass.OBJECT` inheritance census in GC registration order.
 ///
@@ -715,26 +722,28 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     // the target-gated tail.
     (183, Some(0)),
     (184, Some(0)),
-    // Native-only type IDs 185 and 186 represent `posix.DirEntry` and
+    // 185-187 are `typedef.py` `_getusercls` layouts (int/str/tuple user).
+    // They have no rclass vtable of their own (`object_layout_without_subclass_range`).
+    // Native-only type IDs 188 and 189 represent `posix.DirEntry` and
     // `posix.ScandirIterator`, matching `build_gc`'s registration order.
     #[cfg(not(target_arch = "wasm32"))]
-    (185, Some(0)),
+    (188, Some(0)),
     #[cfg(not(target_arch = "wasm32"))]
-    (186, Some(0)),
+    (189, Some(0)),
     // rustls `_ssl` context, MemoryBIO, and session native payloads.  These
     // extend the append-only native rclass tail; wasm omits the host TLS
     // module and therefore the hierarchy entries as well. Sandbox filtering
     // belongs to pyre-interpreter, which owns that module configuration.
     #[cfg(not(target_arch = "wasm32"))]
-    (187, Some(0)),
-    #[cfg(not(target_arch = "wasm32"))]
-    (188, Some(0)),
-    #[cfg(not(target_arch = "wasm32"))]
-    (189, Some(0)),
-    #[cfg(not(target_arch = "wasm32"))]
     (190, Some(0)),
     #[cfg(not(target_arch = "wasm32"))]
     (191, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (192, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (193, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (194, Some(0)),
     // `mmap.mmap` owns its native mapping payload — the duplicated fd on POSIX
     // and the file handle on Windows — and follows the optional SSL tail
     // wherever the module is compiled.  The gate must match the alias gate in
@@ -743,20 +752,20 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     // A sandbox build has no `mmap` module either, so
     // `active_subclass_range_hierarchy` drops this entry along with SSL's.
     #[cfg(any(unix, windows))]
-    (192, Some(0)),
+    (195, Some(0)),
     // `_overlapped.Overlapped` owns the Windows OVERLAPPED record and its
     // retained Python buffers.  pyre-interpreter supplies the vtable alias;
     // the object layer owns only the append-only hierarchy slot.
     #[cfg(windows)]
-    (193, Some(0)),
+    (196, Some(0)),
     // `_winapi.Overlapped` owns a second Windows OVERLAPPED record, the one
     // waited on through an event of its own rather than a completion port.
     #[cfg(windows)]
-    (194, Some(0)),
+    (197, Some(0)),
     // PEP 528 `_io._WindowsConsoleIO` is a subclassable `_RawIOBase` payload.
     // Its append-only vtable id follows both Windows overlapped owners.
     #[cfg(windows)]
-    (195, Some(0)),
+    (198, Some(0)),
     // `_cffi_backend` is absent on wasm32 and in sandbox builds.  Its thirteen
     // hierarchy slots sit at the tail because the interpreter's sandbox
     // filter can only remove a contiguous trailing slice.
