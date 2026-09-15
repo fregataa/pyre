@@ -10429,8 +10429,27 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `f64::is_nan(x)` is `x != x` (`rfloat.isnan`) — emit the
-                // reflexive `ne` BinOp instead of an unresolved call.
+                // `f64::abs(x)` is `float_abs` (`lloperation.py` /
+                // `rfloat.rtype_abs`).  Opaque in core, so the callsite
+                // would skip as an unregistered FunctionPath.
+                if args.len() == 1 && self.is_f64_abs(&reg) {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::UnaryOp {
+                            op: "abs".to_string(),
+                            operand: args[0].clone(),
+                            result_ty: ValueType::Float,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 if args.len() == 1 && self.is_f64_is_nan(&reg) {
                     let res = self
                         .graph
@@ -10525,6 +10544,30 @@ impl<'a> Lowering<'a> {
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
                             result_ty: ValueType::Float,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `f64::to_bits(x)` is `longlong2float.float2longlong(x)`.
+                if args.len() == 1 && self.is_f64_to_bits(&reg) {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec![
+                                    "longlong2float".to_string(),
+                                    "float2longlong".to_string(),
+                                ],
+                            },
+                            args: crate::model::call_args(vec![args[0].clone()]),
+                            result_ty: ValueType::Int,
                         },
                     });
                     self.local_var[dest_local] = Some(res);
@@ -11003,6 +11046,27 @@ impl<'a> Lowering<'a> {
                 }
                 if self.try_lower_wrapping_binop(
                     mir_bb, &reg.kind, &segments, &args, dest_local, target,
+                )? {
+                    return Ok(());
+                }
+                if self.try_lower_cmp_minmax(
+                    mir_bb,
+                    &segments,
+                    &args,
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
+                if self.try_lower_cmp_binop(
+                    mir_bb,
+                    &segments,
+                    &args,
+                    dest_local,
+                    first_arg_ty.as_ref(),
+                    second_arg_ty.as_ref(),
+                    target,
                 )? {
                     return Ok(());
                 }
@@ -11716,6 +11780,52 @@ impl<'a> Lowering<'a> {
         {
             OpKind::BinOp {
                 op: binop.to_string(),
+                lhs: args[0].clone().into_variable(),
+                rhs: args[1].clone().into_variable(),
+                result_ty: ValueType::Int,
+            }
+        } else {
+            op_kind
+        };
+
+        // Scalar `PartialEq` / `PartialOrd` on the rich spine: the same
+        // `core::cmp::{eq..ge}` FunctionPath the adapter rewrites, or a
+        // `Method` whose receiver is already in a scalar bank.  Twin of
+        // the fieldless-enum fold above; strings stay on the dedicated
+        // arm so they keep `ll_streq`.
+        let op_kind = if let OpKind::Call { target, args, .. } = &op_kind
+            && args.len() == 2
+            && let Some(leaf) = match target {
+                CallTarget::FunctionPath { segments } => {
+                    crate::codewriter::minmax::cmp_binop_leaf(segments)
+                }
+                CallTarget::Method { name, .. } => match name.as_str() {
+                    "eq" | "ne" | "lt" | "le" | "gt" | "ge" => Some(name.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            }
+            && {
+                let lhs = first_arg_ty
+                    .as_ref()
+                    .and_then(|ty| self.scalar_cmp_bank(ty));
+                let rhs = second_arg_ty
+                    .as_ref()
+                    .and_then(|ty| self.scalar_cmp_bank(ty));
+                crate::codewriter::minmax::scalar_cmp_banks_compatible(
+                    lhs.as_ref(),
+                    rhs.as_ref(),
+                    leaf,
+                )
+            } {
+            let lhs = first_arg_ty
+                .as_ref()
+                .and_then(|ty| self.scalar_cmp_bank(ty));
+            let rhs = second_arg_ty
+                .as_ref()
+                .and_then(|ty| self.scalar_cmp_bank(ty));
+            OpKind::BinOp {
+                op: crate::codewriter::minmax::scalar_cmp_opname(leaf, lhs.as_ref(), rhs.as_ref()),
                 lhs: args[0].clone().into_variable(),
                 rhs: args[1].clone().into_variable(),
                 result_ty: ValueType::Int,
@@ -12484,6 +12594,20 @@ impl<'a> Lowering<'a> {
             && fmt_path_ends_with(segments, &["slice", "<Impl>", "first"])
             && let Some(site) = self.recognize_slice_first_site(&call.dest.ty, &result_var)
         {
+            self.slice_first_sites.push(site);
+        }
+        // `<[T]>::last(slice)` is `first` with index `len-1` and the
+        // same non-empty guard.
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 1
+            && fmt_path_ends_with(segments, &["slice", "<Impl>", "last"])
+            && let Some(mut site) = self.recognize_slice_first_site(&call.dest.ty, &result_var)
+        {
+            site.access = crate::front::slice_first::SliceAccess::Last;
             self.slice_first_sites.push(site);
         }
         // Capture `<[T]>::get(slice, i)` sites for the bounds-checked
@@ -14538,6 +14662,17 @@ impl<'a> Lowering<'a> {
             .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::is_nan")
     }
 
+    /// `f64::abs(self)` — `core` has no graph body (Opaque).  `rfloat`
+    /// / `lloperation.py float_abs` is the corresponding foldable llop.
+    fn is_f64_abs(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::abs")
+    }
+
     /// `f64::is_finite(self)` — `core` has no graph body (Opaque), so the
     /// callsite would skip as an unregistered `FunctionPath`.  `is_finite`
     /// is `(x - x) == 0.0`: finite `x` gives `0.0 == 0.0` = true, while ±inf
@@ -14574,6 +14709,16 @@ impl<'a> Lowering<'a> {
         self.llbc
             .fn_by_id(*id)
             .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::from_bits")
+    }
+
+    /// `f64::to_bits(self)` — the reverse of [`is_f64_from_bits`].
+    fn is_f64_to_bits(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::to_bits")
     }
 
     /// `f64::is_sign_negative(self)` — `core` has no graph body (Opaque), so the
@@ -16585,6 +16730,135 @@ impl<'a> Lowering<'a> {
     /// (`binaryop.py:191` UnionError), so annotating a `usize` sum as
     /// `Int` would poison the merge where it meets the unsigned field
     /// read it came from.
+    /// Normalize Opaque `core::cmp::{min,max}` (free function or
+    /// `impls::<Impl>` method) to the `FunctionPath` the adapter already
+    /// turns into `simple_call(min)` / `simple_call(max)`
+    /// (`rtype_builtin_min`).  Left as a `Method`, the call never meets
+    /// that arm and the rich-graph spine residualizes it.
+    fn try_lower_cmp_minmax(
+        &mut self,
+        mir_bb: usize,
+        segments: &[String],
+        args: &[Variable],
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        if args.len() != 2 {
+            return Ok(false);
+        }
+        let [first, family, ..] = segments else {
+            return Ok(false);
+        };
+        if first != "core" || family != "cmp" {
+            return Ok(false);
+        }
+        let Some(leaf) = segments.last() else {
+            return Ok(false);
+        };
+        if !matches!(leaf.as_str(), "min" | "max") {
+            return Ok(false);
+        }
+        let result_ty = tyref_to_value_type(dest_ty, self.llbc);
+        if crate::codewriter::minmax::minmax_value_ty(&result_ty).is_none() {
+            return Ok(false);
+        }
+        let bb_id = self.block_id[mir_bb];
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["core".into(), "cmp".into(), leaf.clone()],
+                },
+                args: crate::model::call_args(args.iter().cloned()),
+                result_ty,
+            },
+        });
+        self.local_var[dest_local] = Some(res);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    /// Opaque `core::cmp::{eq,ne,lt,le,gt,ge}` on a scalar pair is the
+    /// like-named flowspace `BinOp` (`nonraising_core_bridge_opname`).
+    /// The string-family arm above already takes `&Wtf8` / `&str`; this
+    /// one is the integer and float impls that share `impls::<Impl>`
+    /// and were left residual so they would not steal that fold.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
+    fn try_lower_cmp_binop(
+        &mut self,
+        mir_bb: usize,
+        segments: &[String],
+        args: &[Variable],
+        dest_local: usize,
+        first_arg_ty: Option<&TyRef>,
+        second_arg_ty: Option<&TyRef>,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        if args.len() != 2 {
+            return Ok(false);
+        }
+        let Some(leaf) = crate::codewriter::minmax::cmp_binop_leaf(segments) else {
+            return Ok(false);
+        };
+        let lhs = first_arg_ty.and_then(|ty| self.scalar_cmp_bank(ty));
+        let rhs = second_arg_ty.and_then(|ty| self.scalar_cmp_bank(ty));
+        if !crate::codewriter::minmax::scalar_cmp_banks_compatible(lhs.as_ref(), rhs.as_ref(), leaf)
+        {
+            return Ok(false);
+        }
+        let bb_id = self.block_id[mir_bb];
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::BinOp {
+                op: crate::codewriter::minmax::scalar_cmp_opname(leaf, lhs.as_ref(), rhs.as_ref()),
+                lhs: args[0].clone(),
+                rhs: args[1].clone(),
+                result_ty: ValueType::Int,
+            },
+        });
+        self.local_var[dest_local] = Some(res);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    /// Signed / unsigned / float / bool bank of `ty`, peeling one
+    /// reference so `&i64` compares as `Int`.  Strings and ADTs stay
+    /// `None` and keep their own folds.
+    fn scalar_cmp_bank(&self, ty: &TyRef) -> Option<ValueType> {
+        // `tyref_peel_ref_to_pointee` also peels `RawPtr`, so `*mut i64`
+        // would look like `i64`.  Ordered pointer compares need
+        // `cast_ptr_to_int`; there is no `ptr_lt`.
+        if tyref_node(ty, self.llbc)
+            .and_then(|node| strip_ty_wrappers(node, self.llbc))
+            .and_then(|node| node.as_object())
+            .is_some_and(|obj| obj.contains_key("RawPtr"))
+        {
+            return None;
+        }
+        let peeled = self.tyref_peel_ref_to_pointee(ty);
+        let ty = peeled.as_ref().unwrap_or(ty);
+        match tyref_to_value_type(ty, self.llbc) {
+            ty @ (ValueType::Int | ValueType::Unsigned | ValueType::Float | ValueType::Bool) => {
+                Some(ty)
+            }
+            _ => None,
+        }
+    }
+
     fn try_lower_wrapping_binop(
         &mut self,
         mir_bb: usize,
@@ -16788,9 +17062,9 @@ impl<'a> Lowering<'a> {
         Ok(true)
     }
 
-    /// Returns `Ok(false)` when the call is not `checked_neg` (or the
-    /// destination's `Option` decl cannot be resolved) so the generic
-    /// `Call` lowering proceeds.
+    /// Returns `Ok(false)` when the call is not `checked_neg` /
+    /// `checked_abs` (or the destination's `Option` decl cannot be
+    /// resolved) so the generic `Call` lowering proceeds.
     #[expect(
         clippy::too_many_arguments,
         reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
@@ -16808,13 +17082,17 @@ impl<'a> Lowering<'a> {
         let [first, .., module, impl_seg, leaf] = segments else {
             return Ok(false);
         };
-        if first.as_str() != "core"
-            || module.as_str() != "num"
-            || impl_seg.as_str() != "<Impl>"
-            || leaf.as_str() != "checked_neg"
-        {
+        if first.as_str() != "core" || module.as_str() != "num" || impl_seg.as_str() != "<Impl>" {
             return Ok(false);
         }
+        // `checked_abs` overflows at the same `i64::MIN` as `checked_neg`
+        // (`rint.py rtype_abs_ovf` / `ll_int_abs_ovf`).  The Some payload
+        // is wrapping `abs`; the None arm never reads it.
+        let unop = match leaf.as_str() {
+            "checked_neg" => "neg",
+            "checked_abs" => "abs",
+            _ => return Ok(false),
+        };
         let [arg] = args else {
             return Ok(false);
         };
@@ -16870,7 +17148,7 @@ impl<'a> Lowering<'a> {
         let payload = push_op(
             &mut self.graph,
             OpKind::UnaryOp {
-                op: "neg".to_string(),
+                op: unop.to_string(),
                 operand: arg.clone(),
                 result_ty: ValueType::Int,
             },

@@ -3051,6 +3051,53 @@ impl<'a> Transformer<'a> {
                     },
                 }])
             }
+            // `lloperation.py float_abs` / `blackhole.py bhimpl_float_abs`.
+            // The front lowers `f64::abs` to UnaryOp("abs"); stamp the
+            // float bank and emit the same `float_abs/f>f` the assembler
+            // already wires.
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
+            } if unop_name == "abs" && self.get_value_kind_var(operand) == 'i' => {
+                // `rint.py rtype_abs` → `int_abs`.  There is no `int_abs`
+                // opcode; mint `ll_int_abs` (`if x < 0: -x else x`) the
+                // same way `ll_min` is minted for `core::cmp::min`.
+                let Some(cc) = self.callcontrol.as_deref_mut() else {
+                    return RewriteResult::Keep;
+                };
+                let path = crate::codewriter::minmax::int_abs_path(cc);
+                let helper_call = SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::Call {
+                        target: CallTarget::FunctionPath {
+                            segments: path.segments.clone(),
+                        },
+                        args: crate::model::call_args(std::iter::once(operand.clone())),
+                        result_ty: ValueType::Int,
+                    },
+                };
+                return self.rewrite_operation(&helper_call, graph_name, graph);
+            }
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
+            } if unop_name == "abs" && self.get_value_kind_var(operand) == 'f' => {
+                self.stamp_value_kind(
+                    graph,
+                    op.result.clone(),
+                    crate::codewriter::type_state::ConcreteType::Float,
+                );
+                RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::UnaryOp {
+                        op: "float_abs".into(),
+                        operand: operand.clone(),
+                        result_ty: ValueType::Float,
+                    },
+                }])
+            }
             // RPython hits Python-`%` / `//` semantics through TWO
             // distinct routes upstream:
             //
@@ -4777,6 +4824,106 @@ impl<'a> Transformer<'a> {
                 &item_ty,
                 array_type_id.as_deref(),
             );
+            let helper_call = SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: path.segments.clone(),
+                    },
+                    args: crate::model::call_args(args.iter().cloned()),
+                    result_ty: result_ty.clone(),
+                },
+            };
+            return self.rewrite_operation(&helper_call, graph_name, graph);
+        }
+        // `__getslice_minusone(l)` — the front's deferred `l[:-1]`.
+        // `rtype_getslice` turns the lifted `getslice(l, 0, -1)` into
+        // `ll_listslice_minusone`; a graph on
+        // this spine never met the rtyper, so mint that helper here the
+        // same way `__getslice_rangefrom` mints `ll_listslice_startonly`.
+        if crate::codewriter::getslice::is_getslice_minusone(op)
+            && let Some((item_ty, array_type_id)) =
+                crate::codewriter::getslice::array_identity_of_base(graph, &args[0])
+            && let Some(cc) = self.callcontrol.as_deref_mut()
+        {
+            let path = crate::codewriter::getslice::listslice_minusone_path(
+                cc,
+                &item_ty,
+                array_type_id.as_deref(),
+            );
+            let helper_call = SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: path.segments.clone(),
+                    },
+                    args: crate::model::call_args(args.iter().cloned()),
+                    result_ty: result_ty.clone(),
+                },
+            };
+            return self.rewrite_operation(&helper_call, graph_name, graph);
+        }
+        // `__getslice_rangeto(l, end)` — the front's deferred `l[:end]`.
+        // `rtype_getslice` turns `getslice(l, 0, end)` into
+        // `ll_listslice_startstop`; mint the start=0 form here.
+        if crate::codewriter::getslice::is_getslice_rangeto(op)
+            && let Some((item_ty, array_type_id)) =
+                crate::codewriter::getslice::array_identity_of_base(graph, &args[0])
+            && let Some(cc) = self.callcontrol.as_deref_mut()
+        {
+            let path = crate::codewriter::getslice::listslice_rangeto_path(
+                cc,
+                &item_ty,
+                array_type_id.as_deref(),
+            );
+            let helper_call = SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: path.segments.clone(),
+                    },
+                    args: crate::model::call_args(args.iter().cloned()),
+                    result_ty: result_ty.clone(),
+                },
+            };
+            return self.rewrite_operation(&helper_call, graph_name, graph);
+        }
+        // `__getslice_range(l, start, end)` — the front's deferred
+        // `l[start:end]`.  `rtype_getslice` turns `getslice(l, start, end)`
+        // into `ll_listslice_startstop`; mint that helper here.
+        if crate::codewriter::getslice::is_getslice_range(op)
+            && let Some((item_ty, array_type_id)) =
+                crate::codewriter::getslice::array_identity_of_base(graph, &args[0])
+            && let Some(cc) = self.callcontrol.as_deref_mut()
+        {
+            let path = crate::codewriter::getslice::listslice_range_path(
+                cc,
+                &item_ty,
+                array_type_id.as_deref(),
+            );
+            let helper_call = SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: path.segments.clone(),
+                    },
+                    args: crate::model::call_args(args.iter().cloned()),
+                    result_ty: result_ty.clone(),
+                },
+            };
+            return self.rewrite_operation(&helper_call, graph_name, graph);
+        }
+        // `core::cmp::{min,max}` — the front's residual of an Opaque
+        // core call.  `rtype_builtin_min` (`rbuiltin.py`) turns the
+        // lifted `simple_call(min, …)` into `ll_min`; a graph on this
+        // spine never met the rtyper, so mint that helper here
+        // (`codewriter::minmax`).  Without a comparable value bank the
+        // marker stays a residual.
+        if let Some(is_max) = crate::codewriter::minmax::is_cmp_minmax(op)
+            && let Some(value_ty) = crate::codewriter::minmax::minmax_value_ty(result_ty)
+            && let Some(cc) = self.callcontrol.as_deref_mut()
+        {
+            let path = crate::codewriter::minmax::minmax_path(cc, is_max, &value_ty);
             let helper_call = SpaceOperation {
                 result: op.result.clone(),
                 kind: OpKind::Call {
