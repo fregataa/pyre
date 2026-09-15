@@ -9042,11 +9042,29 @@ where
                 let mut args = Vec::with_capacity(arg_regs.len());
                 let mut concrete_args = Vec::with_capacity(arg_regs.len());
                 let mut arg_types = Vec::with_capacity(arg_regs.len());
-                for arg_spec in arg_regs {
-                    let (arg, concrete, arg_type) = self.read_call_arg(arg_spec);
+                let mut raw_i = Vec::new();
+                let mut raw_r = Vec::new();
+                let mut raw_f = Vec::new();
+                let mut arg_classes = String::new();
+                for arg_spec in &arg_regs {
+                    let (arg, concrete, arg_type) = self.read_call_arg(*arg_spec);
                     args.push(arg);
                     concrete_args.push(concrete);
                     arg_types.push(arg_type);
+                    match arg_spec.kind {
+                        JitArgKind::Int => {
+                            raw_i.push(concrete);
+                            arg_classes.push('i');
+                        }
+                        JitArgKind::Ref => {
+                            raw_r.push(concrete);
+                            arg_classes.push('r');
+                        }
+                        JitArgKind::Float => {
+                            raw_f.push(concrete);
+                            arg_classes.push('f');
+                        }
+                    }
                 }
                 let (token_number, concrete_ptr) = self
                     .frames
@@ -9061,8 +9079,41 @@ where
                 //    forced vs untouched; then the virtualizable half.
                 ctx.vrefs_before_residual_call();
                 let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
-                // 3. execute (pyjitpl.py, tp == 'v')
-                call_void_function(concrete_ptr, &concrete_args);
+                // 3. execute (pyjitpl.py, tp == 'v') — `executor.execute_varargs`
+                //    → `cpu.bh_call_v`.
+                if let Some(action) = refuse_walk_local_ref_args(
+                    ctx,
+                    concrete_ptr as usize,
+                    &raw_i,
+                    &raw_r,
+                    &args,
+                    &arg_classes,
+                ) {
+                    return action;
+                }
+                if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+                    return report_symbolic_residual_call_target(
+                        ctx,
+                        concrete_ptr as usize,
+                        Some(&arg_classes),
+                    );
+                }
+                if !concrete_ptr.is_null() {
+                    unsafe {
+                        majit_backend::call_stub::bh_call_v_by_classes(
+                            concrete_ptr as usize,
+                            &arg_classes,
+                            Some(&raw_i),
+                            Some(&raw_r),
+                            Some(&raw_f),
+                        );
+                    }
+                }
+                if let Some(action) =
+                    host_requested_walk_abort(ctx, concrete_ptr as usize, &arg_classes)
+                {
+                    return action;
+                }
                 // 4. `pyjitpl.py vrefs_after_residual_call` —
                 //    fire VIRTUAL_REF_FINISH for any vref forced by the
                 //    callee BEFORE the CALL_ASSEMBLER record below.
@@ -9159,7 +9210,7 @@ where
                     };
                     (first_reg, target, args_i, args_r, calldescr, dst)
                 };
-                let (args, concrete_args, arg_types, raw_i, raw_r, _raw_f) =
+                let (args, concrete_args, arg_types, raw_i, raw_r, raw_f) =
                     self.read_canonical_call_args(&calldescr.arg_classes, &args_i, &args_r, &[]);
                 let trace_ptr = if target.trace_ptr.is_null() {
                     target.concrete_ptr
@@ -9217,7 +9268,18 @@ where
                                         Some(&calldescr.arg_classes),
                                     );
                                 }
-                                call_void_function(concrete_ptr, &concrete_args);
+                                // `do_conditional_call` → `execute_varargs` → `cpu.bh_call_v`.
+                                if !concrete_ptr.is_null() {
+                                    unsafe {
+                                        majit_backend::call_stub::bh_call_v_by_classes(
+                                            concrete_ptr as usize,
+                                            &calldescr.arg_classes,
+                                            Some(&raw_i),
+                                            Some(&raw_r),
+                                            Some(&raw_f),
+                                        );
+                                    }
+                                }
                                 if let Some(action) = host_requested_walk_abort(
                                     ctx,
                                     concrete_ptr as usize,
@@ -9278,7 +9340,20 @@ where
                                         Some(&calldescr.arg_classes),
                                     );
                                 }
-                                let n = call_int_function(concrete_ptr, &concrete_args);
+                                // `do_conditional_call(is_value=True)` → `cpu.bh_call_i`.
+                                let n = if concrete_ptr.is_null() {
+                                    0
+                                } else {
+                                    unsafe {
+                                        majit_backend::call_stub::bh_call_i_by_classes(
+                                            concrete_ptr as usize,
+                                            &calldescr.arg_classes,
+                                            Some(&raw_i),
+                                            Some(&raw_r),
+                                            Some(&raw_f),
+                                        )
+                                    }
+                                };
                                 if let Some(action) = host_requested_walk_abort(
                                     ctx,
                                     concrete_ptr as usize,
@@ -9377,7 +9452,20 @@ where
                                         Some(&calldescr.arg_classes),
                                     );
                                 }
-                                let p = call_ref_function(concrete_ptr, &concrete_args);
+                                // `do_conditional_call(is_value=True)` → `cpu.bh_call_r`.
+                                let p = if concrete_ptr.is_null() {
+                                    0
+                                } else {
+                                    unsafe {
+                                        majit_backend::call_stub::bh_call_i_by_classes(
+                                            concrete_ptr as usize,
+                                            &calldescr.arg_classes,
+                                            Some(&raw_i),
+                                            Some(&raw_r),
+                                            Some(&raw_f),
+                                        )
+                                    }
+                                };
                                 if let Some(action) = host_requested_walk_abort(
                                     ctx,
                                     concrete_ptr as usize,
@@ -9444,7 +9532,7 @@ where
                             &args,
                             &arg_types,
                             majit_ir::Type::Int,
-                            slot,
+                            calldescr.extra_info.clone(),
                         );
                         let mut allboxes =
                             vec![first_box, ctx.const_int(trace_ptr as usize as i64)];
@@ -9465,7 +9553,7 @@ where
                             &args,
                             &arg_types,
                             majit_ir::Type::Ref,
-                            slot,
+                            calldescr.extra_info.clone(),
                         );
                         let mut allboxes =
                             vec![first_box, ctx.const_int(trace_ptr as usize as i64)];
@@ -9534,6 +9622,7 @@ where
                 let extra_info = crate::call_descr::effect_info_for_slot(slot);
                 let mut raw_i = Vec::new();
                 let mut raw_r = Vec::new();
+                let mut raw_f = Vec::new();
                 let mut arg_classes = String::new();
                 for (spec, &concrete) in arg_regs.iter().zip(concrete_args.iter()) {
                     match spec.kind {
@@ -9545,7 +9634,10 @@ where
                             raw_r.push(concrete);
                             arg_classes.push('r');
                         }
-                        JitArgKind::Float => arg_classes.push('f'),
+                        JitArgKind::Float => {
+                            raw_f.push(concrete);
+                            arg_classes.push('f');
+                        }
                     }
                 }
                 match bytecode {
@@ -9586,7 +9678,18 @@ where
                                         Some(&arg_classes),
                                     );
                                 }
-                                call_void_function(concrete_ptr, &concrete_args);
+                                // leftover cond_call_void_ext → `cpu.bh_call_v`.
+                                if !concrete_ptr.is_null() {
+                                    unsafe {
+                                        majit_backend::call_stub::bh_call_v_by_classes(
+                                            concrete_ptr as usize,
+                                            &arg_classes,
+                                            Some(&raw_i),
+                                            Some(&raw_r),
+                                            Some(&raw_f),
+                                        );
+                                    }
+                                }
                                 if let Some(action) = host_requested_walk_abort(
                                     ctx,
                                     concrete_ptr as usize,
@@ -9642,7 +9745,20 @@ where
                                         Some(&arg_classes),
                                     );
                                 }
-                                let n = call_int_function(concrete_ptr, &concrete_args);
+                                // leftover cond_call_value_int_ext → `cpu.bh_call_i`.
+                                let n = if concrete_ptr.is_null() {
+                                    0
+                                } else {
+                                    unsafe {
+                                        majit_backend::call_stub::bh_call_i_by_classes(
+                                            concrete_ptr as usize,
+                                            &arg_classes,
+                                            Some(&raw_i),
+                                            Some(&raw_r),
+                                            Some(&raw_f),
+                                        )
+                                    }
+                                };
                                 if let Some(action) = host_requested_walk_abort(
                                     ctx,
                                     concrete_ptr as usize,
@@ -9740,7 +9856,20 @@ where
                                         Some(&arg_classes),
                                     );
                                 }
-                                let p = call_ref_function(concrete_ptr, &concrete_args);
+                                // leftover cond_call_value_ref_ext → `cpu.bh_call_r`.
+                                let p = if concrete_ptr.is_null() {
+                                    0
+                                } else {
+                                    unsafe {
+                                        majit_backend::call_stub::bh_call_i_by_classes(
+                                            concrete_ptr as usize,
+                                            &arg_classes,
+                                            Some(&raw_i),
+                                            Some(&raw_r),
+                                            Some(&raw_f),
+                                        )
+                                    }
+                                };
                                 if let Some(action) = host_requested_walk_abort(
                                     ctx,
                                     concrete_ptr as usize,
@@ -9813,7 +9942,7 @@ where
                             &args,
                             &arg_types,
                             majit_ir::Type::Int,
-                            slot,
+                            extra_info.clone(),
                         );
                         let mut allboxes =
                             vec![first_box, ctx.const_int(trace_ptr as usize as i64)];
@@ -9838,7 +9967,7 @@ where
                             &args,
                             &arg_types,
                             majit_ir::Type::Ref,
-                            slot,
+                            extra_info.clone(),
                         );
                         let mut allboxes =
                             vec![first_box, ctx.const_int(trace_ptr as usize as i64)];
@@ -9902,11 +10031,29 @@ where
                 let mut args = Vec::with_capacity(arg_regs.len());
                 let mut concrete_args = Vec::with_capacity(arg_regs.len());
                 let mut arg_types = Vec::with_capacity(arg_regs.len());
-                for arg_spec in arg_regs {
-                    let (arg, concrete, arg_type) = self.read_call_arg(arg_spec);
+                let mut raw_i = Vec::new();
+                let mut raw_r = Vec::new();
+                let mut raw_f = Vec::new();
+                let mut arg_classes = String::new();
+                for arg_spec in &arg_regs {
+                    let (arg, concrete, arg_type) = self.read_call_arg(*arg_spec);
                     args.push(arg);
                     concrete_args.push(concrete);
                     arg_types.push(arg_type);
+                    match arg_spec.kind {
+                        JitArgKind::Int => {
+                            raw_i.push(concrete);
+                            arg_classes.push('i');
+                        }
+                        JitArgKind::Ref => {
+                            raw_r.push(concrete);
+                            arg_classes.push('r');
+                        }
+                        JitArgKind::Float => {
+                            raw_f.push(concrete);
+                            arg_classes.push('f');
+                        }
+                    }
                 }
                 let (token_number, concrete_ptr) = self
                     .frames
@@ -9917,12 +10064,46 @@ where
                 // pyjitpl.py:2017 — vrefs walk + vinfo stamp before the call.
                 ctx.vrefs_before_residual_call();
                 let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
-                let concrete = call_int_function(concrete_ptr, &concrete_args);
+                if let Some(action) = refuse_walk_local_ref_args(
+                    ctx,
+                    concrete_ptr as usize,
+                    &raw_i,
+                    &raw_r,
+                    &args,
+                    &arg_classes,
+                ) {
+                    return action;
+                }
+                if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+                    return report_symbolic_residual_call_target(
+                        ctx,
+                        concrete_ptr as usize,
+                        Some(&arg_classes),
+                    );
+                }
+                let concrete = if concrete_ptr.is_null() {
+                    0
+                } else {
+                    unsafe {
+                        majit_backend::call_stub::bh_call_i_by_classes(
+                            concrete_ptr as usize,
+                            &arg_classes,
+                            Some(&raw_i),
+                            Some(&raw_r),
+                            Some(&raw_f),
+                        )
+                    }
+                };
+                if let Some(action) =
+                    host_requested_walk_abort(ctx, concrete_ptr as usize, &arg_classes)
+                {
+                    return action;
+                }
                 // `pyjitpl.py vrefs_after_residual_call`.
                 ctx.vrefs_after_residual_call();
-                let arc = _runtime.jitcell_token_arc_for_number(token_number).expect(
-                    "compile.py:187 — CALL_ASSEMBLER target must resolve to a JitCellToken object",
-                );
+                let Some(arc) = _runtime.jitcell_token_arc_for_number(token_number) else {
+                    return TraceAction::Abort;
+                };
                 let traced = ctx.call_assembler_int_arc_typed(arc, &args, &arg_types);
                 self.set_int_reg(dst, Some(traced), Some(concrete));
                 let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
@@ -9977,11 +10158,29 @@ where
                 let mut args = Vec::with_capacity(arg_regs.len());
                 let mut concrete_args = Vec::with_capacity(arg_regs.len());
                 let mut arg_types = Vec::with_capacity(arg_regs.len());
-                for arg_spec in arg_regs {
-                    let (arg, concrete, arg_type) = self.read_call_arg(arg_spec);
+                let mut raw_i = Vec::new();
+                let mut raw_r = Vec::new();
+                let mut raw_f = Vec::new();
+                let mut arg_classes = String::new();
+                for arg_spec in &arg_regs {
+                    let (arg, concrete, arg_type) = self.read_call_arg(*arg_spec);
                     args.push(arg);
                     concrete_args.push(concrete);
                     arg_types.push(arg_type);
+                    match arg_spec.kind {
+                        JitArgKind::Int => {
+                            raw_i.push(concrete);
+                            arg_classes.push('i');
+                        }
+                        JitArgKind::Ref => {
+                            raw_r.push(concrete);
+                            arg_classes.push('r');
+                        }
+                        JitArgKind::Float => {
+                            raw_f.push(concrete);
+                            arg_classes.push('f');
+                        }
+                    }
                 }
                 let (token_number, concrete_ptr) = self
                     .frames
@@ -9992,12 +10191,48 @@ where
                 // pyjitpl.py:2017 — vrefs walk + vinfo stamp before the call.
                 ctx.vrefs_before_residual_call();
                 let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
-                let concrete = call_int_function(concrete_ptr, &concrete_args);
+                if let Some(action) = refuse_walk_local_ref_args(
+                    ctx,
+                    concrete_ptr as usize,
+                    &raw_i,
+                    &raw_r,
+                    &args,
+                    &arg_classes,
+                ) {
+                    return action;
+                }
+                if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+                    return report_symbolic_residual_call_target(
+                        ctx,
+                        concrete_ptr as usize,
+                        Some(&arg_classes),
+                    );
+                }
+                // 3. execute (pyjitpl.py, tp == 'r') — `executor.execute_varargs`
+                //    → `cpu.bh_call_r` / leftover `bh_call_i_by_classes`.
+                let concrete = if concrete_ptr.is_null() {
+                    0
+                } else {
+                    unsafe {
+                        majit_backend::call_stub::bh_call_i_by_classes(
+                            concrete_ptr as usize,
+                            &arg_classes,
+                            Some(&raw_i),
+                            Some(&raw_r),
+                            Some(&raw_f),
+                        )
+                    }
+                };
+                if let Some(action) =
+                    host_requested_walk_abort(ctx, concrete_ptr as usize, &arg_classes)
+                {
+                    return action;
+                }
                 // `pyjitpl.py vrefs_after_residual_call`.
                 ctx.vrefs_after_residual_call();
-                let arc = _runtime.jitcell_token_arc_for_number(token_number).expect(
-                    "compile.py:187 — CALL_ASSEMBLER target must resolve to a JitCellToken object",
-                );
+                let Some(arc) = _runtime.jitcell_token_arc_for_number(token_number) else {
+                    return TraceAction::Abort;
+                };
                 let traced = ctx.call_assembler_ref_arc_typed(arc, &args, &arg_types);
                 self.set_ref_reg(dst, Some(traced), Some(concrete));
                 let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
@@ -10052,11 +10287,29 @@ where
                 let mut args = Vec::with_capacity(arg_regs.len());
                 let mut concrete_args = Vec::with_capacity(arg_regs.len());
                 let mut arg_types = Vec::with_capacity(arg_regs.len());
-                for arg_spec in arg_regs {
-                    let (arg, concrete, arg_type) = self.read_call_arg(arg_spec);
+                let mut raw_i = Vec::new();
+                let mut raw_r = Vec::new();
+                let mut raw_f = Vec::new();
+                let mut arg_classes = String::new();
+                for arg_spec in &arg_regs {
+                    let (arg, concrete, arg_type) = self.read_call_arg(*arg_spec);
                     args.push(arg);
                     concrete_args.push(concrete);
                     arg_types.push(arg_type);
+                    match arg_spec.kind {
+                        JitArgKind::Int => {
+                            raw_i.push(concrete);
+                            arg_classes.push('i');
+                        }
+                        JitArgKind::Ref => {
+                            raw_r.push(concrete);
+                            arg_classes.push('r');
+                        }
+                        JitArgKind::Float => {
+                            raw_f.push(concrete);
+                            arg_classes.push('f');
+                        }
+                    }
                 }
                 let (token_number, concrete_ptr) = self
                     .frames
@@ -10067,24 +10320,48 @@ where
                 // pyjitpl.py:2017 — vrefs walk + vinfo stamp before the call.
                 ctx.vrefs_before_residual_call();
                 let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
-                // TODO: `pyjitpl.py do_residual_call`
-                // float-result branch): pyre's `call_assembler` wrapper at
-                // `concrete_ptr` is an `extern "C" fn(...) -> i64` whose
-                // result carries the f64 pre-packed via `f64::to_bits()`.
-                // See `handler_call_assembler_float_ext` in `blackhole.rs`
-                // for the wrapper-ABI
-                // analysis — calling through `call_float_function`
-                // (`extern "C" fn(...) -> f64`) here would transmute the
-                // i64-returning wrapper through a float-ABI signature and
-                // break the dynasm/cranelift call convention.  The i64
-                // result is stored directly into `registers_f` via
-                // `set_float_reg` per RPython's `longlong.ZEROF` packing.
-                let concrete = call_int_function(concrete_ptr, &concrete_args);
+                if let Some(action) = refuse_walk_local_ref_args(
+                    ctx,
+                    concrete_ptr as usize,
+                    &raw_i,
+                    &raw_r,
+                    &args,
+                    &arg_classes,
+                ) {
+                    return action;
+                }
+                if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+                    return report_symbolic_residual_call_target(
+                        ctx,
+                        concrete_ptr as usize,
+                        Some(&arg_classes),
+                    );
+                }
+                // 3. execute (pyjitpl.py, tp == 'f') — leftover wrappers
+                //    return packed i64 bits (`f64::to_bits`); `cpu.bh_call_i`.
+                let concrete = if concrete_ptr.is_null() {
+                    0
+                } else {
+                    unsafe {
+                        majit_backend::call_stub::bh_call_i_by_classes(
+                            concrete_ptr as usize,
+                            &arg_classes,
+                            Some(&raw_i),
+                            Some(&raw_r),
+                            Some(&raw_f),
+                        )
+                    }
+                };
+                if let Some(action) =
+                    host_requested_walk_abort(ctx, concrete_ptr as usize, &arg_classes)
+                {
+                    return action;
+                }
                 // `pyjitpl.py vrefs_after_residual_call`.
                 ctx.vrefs_after_residual_call();
-                let arc = _runtime.jitcell_token_arc_for_number(token_number).expect(
-                    "compile.py:187 — CALL_ASSEMBLER target must resolve to a JitCellToken object",
-                );
+                let Some(arc) = _runtime.jitcell_token_arc_for_number(token_number) else {
+                    return TraceAction::Abort;
+                };
                 let traced = ctx.call_assembler_float_arc_typed(arc, &args, &arg_types);
                 self.set_float_reg(dst, Some(traced), Some(concrete));
                 let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);

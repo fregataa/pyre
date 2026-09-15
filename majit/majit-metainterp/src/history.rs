@@ -5,9 +5,10 @@
 /// that forms a loop (ending with JUMP) or an exit (ending with FINISH).
 ///
 /// Reference: rpython/jit/metainterp/history.py TreeLoop
+use majit_backend::JitCellToken;
 use majit_ir::{DescrRef, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, Type, Value};
 use parking_lot::Mutex;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 /// history.py get_const_ptr_for_string(s)
 ///
@@ -125,10 +126,18 @@ impl TargetToken {
         self.minor_scan_pending = true;
     }
 
-    /// `compile.py:237` / `compile.py:289` — bind the freshly-made
-    /// JitCellToken's `number` to this TargetToken's `original_jitcell_token`.
-    /// Walker (`record_loop_or_bridge`, `compile.py`) reads this to
-    /// determine whether a JUMP crosses to a different loop.
+    /// `compile.py compile_simple_loop` / `compile_loop` —
+    /// `target_token.original_jitcell_token = jitcell_token`.
+    /// Stores the token object (Weak on the descr; see
+    /// `LoopTargetDescr::original_jitcell_token_handle`) and caches
+    /// `token.number` for the dense `unroll.rs` compare.
+    pub fn set_original_jitcell_token(&self, token: &Arc<JitCellToken>) {
+        self.jump_target_descr.set_original_jitcell_token(token);
+    }
+
+    /// Number-only backfill for descrs that do not carry a token object
+    /// (`BasicLoopTargetDescr`). Production compile sites use
+    /// [`Self::set_original_jitcell_token`].
     pub fn set_original_jitcell_token_number(&self, num: u64) {
         majit_ir::LoopTargetDescr::set_original_jitcell_token_number(
             self.jump_target_descr.as_ref(),
@@ -140,10 +149,13 @@ impl TargetToken {
 #[derive(Debug, Default)]
 struct LoopTargetDescrState {
     target_arglocs: Vec<majit_ir::TargetArgLoc>,
-    /// `history.py:493 self.original_jitcell_token`. Backfilled once the
-    /// owning JitCellToken is created (`pyjitpl.rs`'s `compile_loop_body`
-    /// calling `set_original_jitcell_token_number`, the
-    /// counterpart to `compile.py:237` / `compile.py:289`).
+    /// `history.py TargetToken.original_jitcell_token`. Weak because
+    /// `JitCellToken.target_tokens` holds this descr; a strong back-ref
+    /// would cycle. `record_loop_or_bridge` upgrades at compile time
+    /// (`compile.py record_loop_or_bridge` `record_jump_to` is the keepalive).
+    original_jitcell_token: Option<Weak<JitCellToken>>,
+    /// Cached `JitCellToken.number` so `unroll.rs` can compare owners
+    /// without upgrading the Weak.
     original_jitcell_token_number: Option<u64>,
 }
 
@@ -179,6 +191,15 @@ impl LoopTargetDescr {
             target_frame_depth: std::sync::atomic::AtomicUsize::new(0),
             state: Mutex::new(LoopTargetDescrState::default()),
         }
+    }
+
+    /// `compile.py compile_simple_loop` / `compile_loop` /
+    /// `propagate_original_jitcell_token`.
+    fn set_original_jitcell_token(&self, token: &Arc<JitCellToken>) {
+        let number = token.number;
+        let mut st = self.state.lock();
+        st.original_jitcell_token_number = Some(number);
+        st.original_jitcell_token = Some(Arc::downgrade(token));
     }
 }
 
@@ -264,6 +285,21 @@ impl majit_ir::LoopTargetDescr for LoopTargetDescr {
 
     fn set_original_jitcell_token_number(&self, num: u64) {
         self.state.lock().original_jitcell_token_number = Some(num);
+    }
+
+    fn original_jitcell_token_handle(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        self.state
+            .lock()
+            .original_jitcell_token
+            .as_ref()
+            .and_then(|w| w.upgrade())
+            .map(|arc| arc as Arc<dyn std::any::Any + Send + Sync>)
+    }
+
+    fn set_original_jitcell_token_handle(&self, handle: Arc<dyn std::any::Any + Send + Sync>) {
+        if let Ok(token) = handle.downcast::<JitCellToken>() {
+            self.set_original_jitcell_token(&token);
+        }
     }
 }
 
@@ -2590,13 +2626,13 @@ mod tests {
 // (`pyjitpl.py:2455+ self.history.record2(...)` call sites).
 
 use crate::call_descr::{
-    EffectInfoSlot, make_call_descr_from_target_slot, make_call_may_force_descr,
+    EffectInfoSlot, make_call_descr_from_target_slot, make_call_descr_with_effect,
+    make_call_may_force_descr,
 };
 use crate::jitdriver::JitDriverStaticData;
 use crate::recorder::{Trace, TracePosition};
 use crate::trace_ctx::TraceCtx;
-
-use majit_backend::JitCellToken;
+use majit_ir::EffectInfo;
 
 impl TraceCtx {
     /// history.py: get_trace_position — current recorder position.
@@ -4130,9 +4166,9 @@ impl TraceCtx {
     /// `getcalldescr` (`codewriter/call.rs`) builds for the
     /// matching `CALL_PURE_*` op.
     ///
-    /// `slot` is the per-callee classification chosen at producer time
-    /// (`call.py getcalldescr`'s `extraeffect` selection); see
-    /// `make_call_descr_from_target_slot` for the resolution rule.
+    /// `extra_info` is the decoded `calldescr` effect
+    /// (`pyjitpl.py opimpl_record_known_result_*` passes `calldescr`
+    /// to `_record_helper_varargs`).
     pub fn record_known_result_typed(
         &mut self,
         result: OpRef,
@@ -4140,14 +4176,15 @@ impl TraceCtx {
         args: &[OpRef],
         arg_types: &[Type],
         result_type: Type,
-        slot: EffectInfoSlot,
+        extra_info: EffectInfo,
     ) {
-        // `opimpl_record_known_result_{i,r}_ir_v` records `resbox` itself.
+        // `opimpl_record_known_result_{i,r}_ir_v` records `resbox` itself
+        // and passes the decoded `calldescr` to `_record_helper_varargs`.
         // `result_type` still selects the calldescr identity
         // (`jtransform.py rewrite_op_jit_record_known_result` uses
         // `op.args[0]`'s concretetype).
         let func_ref = OpRef::const_int(func_ptr as usize as i64);
-        let descr = make_call_descr_from_target_slot(arg_types, result_type, slot);
+        let descr = make_call_descr_with_effect(arg_types, result_type, extra_info);
         let mut call_args = vec![result, func_ref];
         call_args.extend_from_slice(args);
         self.recorder
@@ -5242,6 +5279,13 @@ impl TraceCtx {
         arg_types: &[Type],
         result_type: Type,
     ) -> OpRef {
+        // `pyjitpl.py do_residual_call` step 5 invalidates on
+        // `CALL_MAY_FORCE` with `allboxes` (funcbox + args).
+        let func_ref = OpRef::const_int(
+            target_arc
+                ._ll_function_addr
+                .load(std::sync::atomic::Ordering::Acquire) as i64,
+        );
         let descr =
             crate::call_descr::make_call_assembler_descr(target_arc, arg_types, result_type);
         let opcode = OpCode::call_assembler_for_type(result_type);
@@ -5251,10 +5295,12 @@ impl TraceCtx {
             Some(majit_ir::Value::Int(n)) => Some(n),
             _ => None,
         };
+        let mut allboxes = vec![func_ref];
+        allboxes.extend_from_slice(args);
         self.heap_cache.invalidate_caches_varargs(
             OpCode::call_may_force_for_type(result_type),
             None,
-            args,
+            &allboxes,
             oracle,
             const_value,
         );
