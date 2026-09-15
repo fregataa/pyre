@@ -620,9 +620,7 @@ fn sched_param_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     // published first and each one is read back out of its slot at the point
     // it is stored.
     let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(cls);
-    let _ = pyre_object::gc_roots::pin_root(priority);
+    let base = pyre_object::gc_roots::pin_roots(&[cls, priority]);
     let inner = pyre_object::w_tuple_new(vec![pyre_object::gc_roots::shadow_stack_get(base + 1)]);
     let _ = pyre_object::gc_roots::pin_root(inner);
     Ok(pyre_object::w_tuple_new(vec![
@@ -6872,7 +6870,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             return Ok(crate::gateway::fsdecode_os_str(cwd.as_os_str()));
                         }
                     }
-                    Ok(pyre_object::w_str_new(""))
+                    Ok(pyre_object::w_str_new_managed(""))
                 }
             },
             0,

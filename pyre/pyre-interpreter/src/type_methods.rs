@@ -960,8 +960,13 @@ pub fn list_method_remove(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 pub fn str_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_exact(args, "join", 1)?;
-    let sep = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
-    let iterable = args[1];
+    // `sequence_fast` and the type-error path allocate, so pin the separator
+    // and iterable first and copy the separator payload off the object.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
+    let sep = unsafe { pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(base)) }
+        .to_wtf8_buf();
+    let iterable = pyre_object::gc_roots::shadow_stack_get(base + 1);
     let items: Vec<PyObjectRef> = unsafe {
         if is_list(iterable) {
             let n = w_list_len(iterable);
@@ -979,6 +984,9 @@ pub fn str_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             crate::builtins::sequence_fast(iterable, "can only join an iterable")?
         }
     };
+    let items_base = pyre_object::gc_roots::publish_roots(&items);
+    pyre_object::gc_roots::normalize_roots(items_base, items.len());
+    let item = |i: usize| pyre_object::gc_roots::shadow_stack_get(items_base + i);
     // pypy/objspace/std/unicodeobject.py descr_join — each
     // element must be a str; otherwise TypeError("sequence item N:
     // expected str instance, <T> found"). Silently dropping non-str
@@ -987,7 +995,7 @@ pub fn str_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     // A single-element join returns that element (unicode_result_unchanged):
     // an exact str unchanged, a str subclass copied to a base str.
     if items.len() == 1 {
-        let item = items[0];
+        let item = item(0);
         if unsafe { !is_str(item) } {
             return Err(crate::PyError::type_error(format!(
                 "sequence item 0: expected str instance, {} found",
@@ -996,7 +1004,8 @@ pub fn str_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         }
         return Ok(str_result_unchanged(item));
     }
-    str_join_many_items(sep, &items)
+    let reloaded: Vec<_> = (0..items.len()).map(item).collect();
+    str_join_many_items(&sep, &reloaded)
 }
 
 /// `stringmethods.py _str_join_many_items`:
@@ -1590,27 +1599,42 @@ pub fn str_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             arg_type_name(pos[2])
         )));
     }
-    let s = unsafe { pyre_object::w_str_get_wtf8(pos[0]) };
-    let old = unsafe { pyre_object::w_str_get_wtf8(pos[1]) };
-    let new = unsafe { pyre_object::w_str_get_wtf8(pos[2]) };
-    // Optional `count`: a negative count means "no limit"; 0 leaves the
-    // string untouched. Resolved through `__index__`.
-    let maxcount = match pos
+    // `__index__` on `count` can collect, so pin the three strings and the
+    // optional count together and copy their payloads off the objects first.
+    let w_count = pos
         .get(3)
         .copied()
-        .or_else(|| crate::builtins::kwarg_get(kwargs, "count"))
-    {
-        Some(w_count) => crate::builtins::space_index_w(w_count)?,
+        .or_else(|| crate::builtins::kwarg_get(kwargs, "count"));
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = if let Some(c) = w_count {
+        pyre_object::gc_roots::pin_roots(&[pos[0], pos[1], pos[2], c])
+    } else {
+        pyre_object::gc_roots::pin_roots(&[pos[0], pos[1], pos[2]])
+    };
+    let recv = || pyre_object::gc_roots::shadow_stack_get(base);
+    let s = unsafe { pyre_object::w_str_get_wtf8(recv()) }.to_wtf8_buf();
+    let old =
+        unsafe { pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(base + 1)) }
+            .to_wtf8_buf();
+    let new =
+        unsafe { pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(base + 2)) }
+            .to_wtf8_buf();
+    // Optional `count`: a negative count means "no limit"; 0 leaves the
+    // string untouched. Resolved through `__index__`.
+    let maxcount = match w_count {
+        Some(_) => {
+            crate::builtins::space_index_w(pyre_object::gc_roots::shadow_stack_get(base + 3))?
+        }
         None => -1,
     };
-    let (out, replacements) = wtf8_replace(s, old, new, maxcount);
+    let (out, replacements) = wtf8_replace(&s, &old, &new, maxcount);
     // `descr_replace` (unicodeobject.py) returns `self` when nothing
     // was replaced — keyed on the count, so `s.replace('a', 'a')` still builds
     // a new string.  Exact `str` only: a subclass yields a fresh base `str`,
     // and `is_w` rejects a `user_overridden_class` operand
     // (unicodeobject.py:106).
-    if replacements == 0 && unsafe { pyre_object::is_exact_type(pos[0], &pyre_object::STR_TYPE) } {
-        return Ok(pos[0]);
+    if replacements == 0 && unsafe { pyre_object::is_exact_type(recv(), &pyre_object::STR_TYPE) } {
+        return Ok(recv());
     }
     Ok(w_str_from_wtf8_managed(out))
 }
@@ -5729,26 +5753,37 @@ pub fn str_method_partition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             arg_type_name(args[1])
         )));
     }
-    let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) }.as_bytes();
-    let sep = unsafe { pyre_object::w_str_get_wtf8(args[1]) }.as_bytes();
+    // Cuts allocate, so pin the receiver and separator first and copy
+    // their payloads off the objects before any mint.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
+    let s = unsafe { pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(base)) }
+        .as_bytes()
+        .to_vec();
+    let sep =
+        unsafe { pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(base + 1)) }
+            .as_bytes()
+            .to_vec();
     if sep.is_empty() {
         return Err(crate::PyError::value_error("empty separator"));
     }
-    match wtf8_find_bounded(s, sep, 0, s.len()) {
+    match wtf8_find_bounded(&s, &sep, 0, s.len()) {
         Some(i) => {
-            let mut fields = pyre_object::gc_roots::RootedItems::new();
-            fields.push(wtf8_slice_str(&s[..i]));
-            fields.push(args[1]);
-            fields.push(wtf8_slice_str(&s[i + sep.len()..]));
-            Ok(w_tuple_new(fields.take()))
+            let left_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(wtf8_slice_str(&s[..i]));
+            let right_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(wtf8_slice_str(&s[i + sep.len()..]));
+            Ok(w_tuple_new(vec![
+                pyre_object::gc_roots::shadow_stack_get(left_slot),
+                pyre_object::gc_roots::shadow_stack_get(base + 1),
+                pyre_object::gc_roots::shadow_stack_get(right_slot),
+            ]))
         }
-        None => {
-            let mut fields = pyre_object::gc_roots::RootedItems::new();
-            fields.push(args[0]);
-            fields.push(w_str_new(""));
-            fields.push(w_str_new(""));
-            Ok(w_tuple_new(fields.take()))
-        }
+        None => Ok(w_tuple_new(vec![
+            pyre_object::gc_roots::shadow_stack_get(base),
+            w_str_new(""),
+            w_str_new(""),
+        ])),
     }
 }
 
@@ -5761,26 +5796,35 @@ pub fn str_method_rpartition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
             arg_type_name(args[1])
         )));
     }
-    let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) }.as_bytes();
-    let sep = unsafe { pyre_object::w_str_get_wtf8(args[1]) }.as_bytes();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
+    let s = unsafe { pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(base)) }
+        .as_bytes()
+        .to_vec();
+    let sep =
+        unsafe { pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(base + 1)) }
+            .as_bytes()
+            .to_vec();
     if sep.is_empty() {
         return Err(crate::PyError::value_error("empty separator"));
     }
-    match wtf8_rfind_bounded(s, sep, 0, s.len()) {
+    match wtf8_rfind_bounded(&s, &sep, 0, s.len()) {
         Some(i) => {
-            let mut fields = pyre_object::gc_roots::RootedItems::new();
-            fields.push(wtf8_slice_str(&s[..i]));
-            fields.push(args[1]);
-            fields.push(wtf8_slice_str(&s[i + sep.len()..]));
-            Ok(w_tuple_new(fields.take()))
+            let left_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(wtf8_slice_str(&s[..i]));
+            let right_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(wtf8_slice_str(&s[i + sep.len()..]));
+            Ok(w_tuple_new(vec![
+                pyre_object::gc_roots::shadow_stack_get(left_slot),
+                pyre_object::gc_roots::shadow_stack_get(base + 1),
+                pyre_object::gc_roots::shadow_stack_get(right_slot),
+            ]))
         }
-        None => {
-            let mut fields = pyre_object::gc_roots::RootedItems::new();
-            fields.push(w_str_new(""));
-            fields.push(w_str_new(""));
-            fields.push(args[0]);
-            Ok(w_tuple_new(fields.take()))
-        }
+        None => Ok(w_tuple_new(vec![
+            w_str_new(""),
+            w_str_new(""),
+            pyre_object::gc_roots::shadow_stack_get(base),
+        ])),
     }
 }
 
@@ -5927,22 +5971,29 @@ pub fn str_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     }
     crate::builtins::kwarg_reject_unknown(kwargs, &["tabsize"], "expandtabs")?;
     crate::builtins::kwarg_reject_duplicate(kwargs, "expandtabs", "tabsize", pos.get(1).is_some())?;
-    let s = unsafe { w_str_get_wtf8(pos[0]) };
     // [3.14-spec] PyPy `W_UnicodeObject.descr_expandtabs` unwraps a machine
     // `int`; CPython `unicode_expandtabs` declares an Argument Clinic `int`
     // and therefore calls `PyLong_AsInt` before inspecting even an empty
     // receiver.  Keep PyPy's method body below, but narrow this observable
     // argument boundary to a C int.
-    let tabsize = i64::from(
-        match pos
-            .get(1)
-            .copied()
-            .or_else(|| crate::builtins::kwarg_get(kwargs, "tabsize"))
-        {
-            Some(t) => crate::baseobjspace::index_c_int_w(t)?,
-            None => 8,
-        },
-    );
+    let w_tabsize = pos
+        .get(1)
+        .copied()
+        .or_else(|| crate::builtins::kwarg_get(kwargs, "tabsize"));
+    let _roots = pyre_object::gc_roots::push_roots();
+    let recv_slot = if let Some(t) = w_tabsize {
+        pyre_object::gc_roots::pin_roots(&[pos[0], t])
+    } else {
+        pyre_object::gc_roots::pin_roots(&[pos[0]])
+    };
+    let tabsize = i64::from(match w_tabsize {
+        Some(_) => crate::baseobjspace::index_c_int_w(pyre_object::gc_roots::shadow_stack_get(
+            recv_slot + 1,
+        ))?,
+        None => 8,
+    });
+    let s =
+        unsafe { w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(recv_slot)) }.to_wtf8_buf();
     // Tabs advance to the next multiple of `tabsize` measured from the
     // start of the current line (the column resets on `\n` / `\r`); a
     // non-positive `tabsize` drops tabs entirely. The expanded length is
@@ -6001,8 +6052,12 @@ pub fn str_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 /// ordinals (int), strings (str), or None (delete).
 pub fn str_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_exact(args, "translate", 1)?;
-    let s = unsafe { w_str_get_wtf8(args[0]) };
-    let table = args[1];
+    // Each lookup can collect, so pin the receiver and table and copy the
+    // source payload off the object before the loop.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
+    let s = unsafe { w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(base)) }.to_wtf8_buf();
+    let table = || pyre_object::gc_roots::shadow_stack_get(base + 1);
     let mut result = Wtf8Buf::with_capacity(s.len());
     unsafe {
         for cp in s.code_points() {
@@ -6010,7 +6065,7 @@ pub fn str_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             // `unicode_translate` clears any LookupError the lookup raises
             // and keeps the character, so a table that indexes rather than
             // maps (a str, a list) leaves unmapped code points alone.
-            let found = match crate::baseobjspace::finditem(table, key) {
+            let found = match crate::baseobjspace::finditem(table(), key) {
                 Ok(found) => found,
                 Err(e)
                     if matches!(

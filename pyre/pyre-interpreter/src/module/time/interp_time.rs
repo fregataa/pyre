@@ -2181,17 +2181,23 @@ pub fn strptime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         )));
     }
     let string = positional[0];
-    let format = positional
-        .get(1)
-        .copied()
-        .unwrap_or_else(|| w_str_new("%a %b %d %H:%M:%S %Y"));
-    // `string`/`format` are native locals held across the import, which allocates
-    // and can move young objects; pin and re-read them for the delegated call.
+    // `string` and an explicit `format` are already live; publish them
+    // together.  The omitted-format default is minted after `string` is
+    // published, then pinned onto the same set.
     let _roots = pyre_object::gc_roots::push_roots();
-    let string_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(string);
-    let format_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(format);
+    let (string_slot, format_slot) = match positional.get(1).copied() {
+        Some(format) => {
+            let base = pyre_object::gc_roots::pin_roots(&[string, format]);
+            (base, base + 1)
+        }
+        None => {
+            let string_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(string);
+            let format_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_str_new_managed("%a %b %d %H:%M:%S %Y"));
+            (string_slot, format_slot)
+        }
+    };
     let w_mod = match crate::importing::get_sys_module("_strptime") {
         Some(m) => m,
         None => crate::importing::importhook(

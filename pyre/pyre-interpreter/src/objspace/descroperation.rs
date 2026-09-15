@@ -2128,18 +2128,24 @@ pub(crate) unsafe fn str_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
 }
 
 pub(crate) unsafe fn bytes_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let Some(b_src) = crate::typedef::buffer_as_bytes_like(b)? else {
+    // `buffer_as_bytes_like` can mint a snapshot, so pin both operands
+    // first and copy their payloads off the objects.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[a, b]);
+    let a = || pyre_object::gc_roots::shadow_stack_get(base);
+    let b = || pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let Some(b_src) = crate::typedef::buffer_as_bytes_like(b())? else {
         return Err(PyError::type_error(format!(
             "can't concat {} to {}",
-            crate::baseobjspace::object_functionstr_type_name(b),
-            crate::baseobjspace::object_functionstr_type_name(a)
+            crate::baseobjspace::object_functionstr_type_name(b()),
+            crate::baseobjspace::object_functionstr_type_name(a())
         )));
     };
-    let a_data = pyre_object::bytesobject::bytes_like_data(a);
-    let b_data = pyre_object::bytesobject::bytes_like_data(b_src);
-    let mut result = a_data.to_vec();
-    result.extend_from_slice(b_data);
-    Ok(if pyre_object::bytesobject::is_bytes(a) {
+    let a_data = pyre_object::bytesobject::bytes_like_data(a()).to_vec();
+    let b_data = pyre_object::bytesobject::bytes_like_data(b_src).to_vec();
+    let mut result = a_data;
+    result.extend_from_slice(&b_data);
+    Ok(if pyre_object::bytesobject::is_bytes(a()) {
         pyre_object::bytesobject::w_bytes_from_bytes(&result)
     } else {
         pyre_object::bytearrayobject::w_bytearray_from_bytes(&result)
@@ -2147,13 +2153,19 @@ pub(crate) unsafe fn bytes_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 pub(crate) unsafe fn bytes_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
-    let data = pyre_object::bytesobject::bytes_like_data(s);
-    let count = repeat_count(n)?;
+    // `repeat_count` runs `__index__`, so pin the receiver and count
+    // together and copy the payload after that conversion.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[s, n]);
+    let s = || pyre_object::gc_roots::shadow_stack_get(base);
+    let count = repeat_count(pyre_object::gc_roots::shadow_stack_get(base + 1))?;
+    let data = pyre_object::bytesobject::bytes_like_data(s()).to_vec();
     // A count of 1 on exact `bytes` (immutable) returns the receiver unchanged;
     // a subclass yields a fresh base `bytes`, and mutable `bytearray` copies.
-    if count == 1 && pyre_object::pyobject::is_exact_type(s, &pyre_object::bytesobject::BYTES_TYPE)
+    if count == 1
+        && pyre_object::pyobject::is_exact_type(s(), &pyre_object::bytesobject::BYTES_TYPE)
     {
-        return Ok(s);
+        return Ok(s());
     }
     let cap = data
         .len()
@@ -2172,10 +2184,10 @@ pub(crate) unsafe fn bytes_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
     // walks the count as a trip count.
     if !data.is_empty() {
         for _ in 0..count {
-            buf.extend_from_slice(data);
+            buf.extend_from_slice(&data);
         }
     }
-    Ok(if pyre_object::bytesobject::is_bytes(s) {
+    Ok(if pyre_object::bytesobject::is_bytes(s()) {
         pyre_object::bytesobject::w_bytes_from_bytes(&buf)
     } else {
         pyre_object::bytearrayobject::w_bytearray_from_bytes(&buf)
@@ -5976,9 +5988,7 @@ fn compare_slot_rest(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult 
             // the value stack before this dispatch, so publish the whole set
             // and read each entry back after the comparisons that precede it.
             let _roots = pyre_object::gc_roots::push_roots();
-            let root_base = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(a);
-            let _ = pyre_object::gc_roots::pin_root(b);
+            let root_base = pyre_object::gc_roots::pin_roots(&[a, b]);
             let la = pyre_object::w_dict_len(pyre_object::gc_roots::shadow_stack_get(root_base));
             let lb =
                 pyre_object::w_dict_len(pyre_object::gc_roots::shadow_stack_get(root_base + 1));
@@ -5986,11 +5996,12 @@ fn compare_slot_rest(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult 
             if equal {
                 let items =
                     pyre_object::w_dict_items(pyre_object::gc_roots::shadow_stack_get(root_base));
-                let items_base = pyre_object::gc_roots::shadow_stack_len();
-                for &(k, v) in &items {
-                    let _ = pyre_object::gc_roots::pin_root(k);
-                    let _ = pyre_object::gc_roots::pin_root(v);
+                let mut flat = Vec::with_capacity(items.len() * 2);
+                for (k, v) in &items {
+                    flat.push(*k);
+                    flat.push(*v);
                 }
+                let items_base = pyre_object::gc_roots::pin_roots(&flat);
                 for index in 0..items.len() {
                     let k = pyre_object::gc_roots::shadow_stack_get(items_base + index * 2);
                     let other = pyre_object::dictmultiobject::w_dict_lookup_checked(
@@ -6006,9 +6017,15 @@ fn compare_slot_rest(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult 
                         Some(other_v) => {
                             // dictmultiobject.py:664 `if not space.eq_w(w_val,
                             // w_rightval): return space.w_False`
-                            let v =
-                                pyre_object::gc_roots::shadow_stack_get(items_base + index * 2 + 1);
-                            if !crate::baseobjspace::eq_w(v, other_v)? {
+                            let _val_roots = pyre_object::gc_roots::push_roots();
+                            let pair = pyre_object::gc_roots::pin_roots(&[
+                                pyre_object::gc_roots::shadow_stack_get(items_base + index * 2 + 1),
+                                other_v,
+                            ]);
+                            if !crate::baseobjspace::eq_w(
+                                pyre_object::gc_roots::shadow_stack_get(pair),
+                                pyre_object::gc_roots::shadow_stack_get(pair + 1),
+                            )? {
                                 equal = false;
                                 break;
                             }
@@ -6110,9 +6127,7 @@ fn compare_slot_rest(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult 
             // them back at every loop boundary and length read, which is also
             // what makes the "read the live lists" contract above hold.
             let _roots = pyre_object::gc_roots::push_roots();
-            let root_base = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(a);
-            let _ = pyre_object::gc_roots::pin_root(b);
+            let root_base = pyre_object::gc_roots::pin_roots(&[a, b]);
             let a = || pyre_object::gc_roots::shadow_stack_get(root_base);
             let b = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
             if matches!(op, CompareOp::Eq | CompareOp::Ne)
@@ -6125,7 +6140,12 @@ fn compare_slot_rest(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult 
             while i < pyre_object::w_list_len(a()) && i < pyre_object::w_list_len(b()) {
                 let ea = pyre_object::w_list_getitem(a(), i as i64).unwrap_or(PY_NULL);
                 let eb = pyre_object::w_list_getitem(b(), i as i64).unwrap_or(PY_NULL);
-                if !crate::baseobjspace::eq_w(ea, eb)? {
+                let _elem_roots = pyre_object::gc_roots::push_roots();
+                let pair = pyre_object::gc_roots::pin_roots(&[ea, eb]);
+                if !crate::baseobjspace::eq_w(
+                    pyre_object::gc_roots::shadow_stack_get(pair),
+                    pyre_object::gc_roots::shadow_stack_get(pair + 1),
+                )? {
                     break;
                 }
                 i += 1;
